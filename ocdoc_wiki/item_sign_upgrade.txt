@@ -1,0 +1,18 @@
+Sign I/O Upgrade
+==============
+{{:items:sign_upgrade.png?nolink&128|}}
+  
+**Provides**: [[component:sign|sign]] component.
+Allows the robot to read and write signs in the world.
+
+The Sign I/O Upgrade is crafted using the following recipe:
+  * 4 x Iron Ingot
+  * 1 x Stick
+  * 1 x Ink Sac
+  * 2 x [[item:materials|Microchip (Tier 1)]]
+  * 1 x Sticky Piston
+{{:recipes:items:signio.png?nolink&200|}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

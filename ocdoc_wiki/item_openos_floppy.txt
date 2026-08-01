@@ -1,0 +1,13 @@
+OpenOS Floppy Disk
+=================
+The OpenOS floppy disk is a craftable [[loot_disks|loot disk]] that allows OpenOS to be run or installed on a [[item:hard_disk_drive|HDD]]
+
+{{recipes:items:openos.png?nolink&150}}
+
+It can be crafted by combining an [[item:manual|OpenComputers Manual]] and a [[item:floppy_disk|Floppy Disk]] in a crafting table.
+
+You can install it to a [[item:hard_disk_drive|HDD]] by typing "install" and following the on screen instructions. [[:openos|Here]] is a more detailed explanation of its install process.
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

@@ -1,0 +1,18 @@
+Remote Terminal
+==============
+{{:items:terminal.png?nolink&128|}}
+
+The Remote Terminal can be bound to a single [[item:terminal_server|terminal server]], to allow controlling it from anywhere within the range configured in the [[block:rack|server rack]] containing the terminal server.
+  
+The Remote Terminal is crafted using the following recipe:
+  * 4 x Iron nugget/oreberry (with Tinker's Construct)
+  * 1 x [[block:screen|Screen (Tier 2)]]
+  * 1 x [[item:wireless_network_card|Wireless Network Card (Tier 2)]]
+  * 1 x [[item:materials|Microchip (Tier 3)]]
+  * 1 x [[block:keyboard|Keyboard]]
+  * 1 x [[item:solar_generator_upgrade|Solar Generator Upgrade]]
+{{:recipes:items:wirelessterminal.png?nolink&200}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

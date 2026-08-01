@@ -1,0 +1,6 @@
+|< 100% 15% 15% >|
+^ Blocks | Computers | [[block:computer_case|Computer Case]] - [[block:server_rack|Server Rack]] - [[block:microcontroller|Microcontrollers]]|
+| ::: | Display | [[block:hologram_projector|Hologram Projector]] - [[block:keyboard|Keyboard]] - [[block:screen|Screen]] |
+| ::: | Power and Networking | [[block:access_point|Access Point]] - [[block:capacitor|Capacitor]] - [[block:net_splitter|Net Splitter]] - [[block:power_converter|Power Converter]] - [[block:power_distributor|Power Distributor]] - [[block:switch|Relay]] |
+| ::: | Extensions | [[block:adapter|Adapter]] - [[block:cable|Cable]] - [[block:disassembler|Disassembler]] - [[block:disk_drive|Disk Drive]] - [[block:geolyzer|Geolyzer]] - [[block:motion_sensor|Motion Sensor]] - [[block:redstone_io|Redstone I/O]] - [[block:transposer|Transposer]] - [[block:3d_printer|3D Printer]] |
+| ::: | Robotics | [[block:assembler|Assembler]] - [[block:charger|Charger]] - [[item:drone|Drone]] - [[block:robot|Robot]] - [[block:waypoint|Waypoint]] |

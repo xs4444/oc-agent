@@ -1,0 +1,21 @@
+Crafting Upgrade
+==============
+{{:items:crafting_upgrade.png?nolink&128|}}
+
+**Provides:** Component API [[component:crafting| crafting]]
+
+Enables robots to use the top left area of their inventory for crafting objects. Items have to be aligned as they would be in a crafting table.
+
+{{component:crafting_area.png|Crafting area}}\\
+//(free slots are the crafting area)//  
+  
+The Crafting upgrade is crafted using the following recipe: 
+  * 1 x Crafting Table
+  * 4 x Iron Ingot
+  * 2 x [[item:materials|Microchip (Tier 1)]]
+  * 1 x [[item:materials|Printed Circuit Board]]
+{{:recipes:items:craftupgrade.png?nolink&200|}}  
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

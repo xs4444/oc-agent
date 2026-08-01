@@ -1,0 +1,13 @@
+Robot
+=====
+{{:blocks:robot.png?nolink&128|}}
+
+Unlike computers, robots can move around and interact with the world much like a player can. They can **not**  interact with external components, however! If you need to communicate with a computer or other robots, use a [[item:wlan_card|Wireless Network Card]] or create some low-level protocol using redstone signals via a [[item:redstone_card|Redstone Card]], for example.  
+  
+Robots are built by placing a [[block:computer_case|Computer Case]] in an [[block:assembler|Assembler]]. 
+
+[[api:robot|Robot API]]
+
+Contents
+-----------
+{{page>block:contents&noheader&noeditbutton&nouser&nofooter}}

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 大型/二进制目录（模拟器、便携环境、模组数据）
+emulators/
+oc_emulators/
+pi/
+opencomputers/
+lua_portable/
+lua_bin.zip
+
+# 临时输出与杂项
+err.txt
+out.txt
+nul
+
+# opencode 运行时（会话历史、临时状态）
+.opencode/
+
+# 缓存
+wiki_cache/
+
+# 根目录测试截图（保留 ocdoc_md/media/ 下的转换图片）
+/*.png

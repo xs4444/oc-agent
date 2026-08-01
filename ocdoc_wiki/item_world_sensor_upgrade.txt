@@ -1,0 +1,18 @@
+World Sensor Upgrade
+====================
+
+{{:items:worldsensorcard.png?nolink&128|}}
+  
+**Provides**: [[component:world_sensor|World Sensor]] component.  
+  
+Allows the robot or drone to obtain atmospheric and gravitational information about the world it is in, which is particularly useful for operating devices on planets added by Galacticraft. 
+  
+The World Sensor upgrade is crafted using the following recipe:
+  * 1 x Sensor Lens (from Galacticraft)
+  * 2 x [[item:materials|Microchip (Tier 2)]]
+  * 1 x [[item:materials|Card Base]]
+{{:recipes:items:worldsensorcard.png?nolink&200|}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

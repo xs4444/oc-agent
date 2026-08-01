@@ -1,0 +1,24 @@
+Redstone I/O
+===========
+{{:blocks:redstone_io.png?nolink&128|}}
+
+Allows reading and emitting redstone signals around the block. Can be controlled by any computer the block is connected to. This is basically like an external [[item:redstone_card|redstone card]].
+
+- This also supports RedLogic wires, if present, including colored and bundled wires.
+- This also supports MineFactory Reloaded RedNet cables.
+- This also supports Project: Red wires, including colored and bundled wires.
+
+Like redstone cards, this offers the [[component:redstone|redstone component]] API. Note that while redstone cards rely on the container's orientation for the sides in their API, the redstone I/O block always uses absolute directions, e.g. `sides.north`.
+
+The Redstone I/O block is crafted using the following recipe:
+  * 4x Iron ingot
+  * 2 x Redstone Block
+  * 1 x [[item:materials|Microchip (Tier 3)]]
+  * 1 x [[item:redstone_card|Redstone Card (Tier 1)]]
+  * 1 x [[item:materials|Printed Circuit Board]]
+
+{{:recipes:blocks:redstoneio.png?nolink&200|}}
+
+Contents
+-----------
+{{page>block:contents&noheader&noeditbutton&nouser&nofooter}}

@@ -1,0 +1,25 @@
+Drone Case
+=======================
+{{:items:dronecase0.png?nolink&128|}} {{:items:dronecase1.png?nolink&128|}}
+
+This item is used in an [[block:assembler|Assembler]] to build [[item:drone|Drones]], which are kind of to robots what microcontrollers are to computers. They are more limited, specialized versions. In this case they also have some additional functionality, though: they move differently (because they are entities) and have other options for interacting with the world, too, such as via using the [[item:leash_upgrade|Leash Upgrade]].  
+  
+The Drone Case (Tier 1) is crafted using the following recipe:
+  * 4 x End Stone
+  * 1 x [[item:microcontrollercase|Microcontroller Case (Tier 1)]]
+  * 1 x Compass
+  * 2 x [[item:materials|Microchip (Tier 1)]]
+  * 1 x [[item:component_bus|Component Bus (Tier 2)]]
+{{:recipes:items:t1dronecase.png?nolink&200}}
+
+The Drone Case (Tier 2) is crafted using the following recipe:
+  * 4 x End Stone
+  * 1 x [[item:microcontrollercase|Microcontroller Case (Tier 2)]]
+  * 1 x Compass
+  * 2 x [[item:materials|Microchip (Tier 2)]]
+  * 1 x [[item:component_bus|Component Bus (Tier 3)]]
+{{:recipes:items:t2dronecase.png?nolink&200}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

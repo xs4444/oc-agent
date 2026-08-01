@@ -1,0 +1,13 @@
+Component: Tractor Beam
+==============
+This is the component provided by the [[item:tractor_beam_upgrade|Tractor Beam Upgrade]].
+
+Component name: `tractor_beam`.  
+Callbacks:
+
+- `suck(): boolean`  
+  Tries to pick up a random item in the robots' vicinity (a 9x9 area with the robot at its center).
+
+----
+
+{{page>component:contents&noheader&noeditbutton&nouser&nofooter}}
