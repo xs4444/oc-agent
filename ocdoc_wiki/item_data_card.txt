@@ -1,0 +1,32 @@
+Data Card
+=========
+
+**Provides**: [[component:data|Data Card]] component.  
+  
+The data card provides a variety of data encoding and decoding functionality, hashing, encryption and decryption, etc. There is a limit to the size of data that can be passed into any function provided by the data component. The higher the tier of data card, the more functionality is available.  Usage can be found on the [[component:data|data]] component page.
+  
+===Crafting===
+
+The Data card (tier 1) is crafted using the following recipe:
+  * Iron nugget/oreberry
+  * [[item:materials|Arithmetic Logic Unit (ALU)]]
+  * [[item:materials|Microchip (tier 2)]]
+  * [[item:materials|Card base]]
+
+{{:recipes:items:t1datacard.png?nolink&200|}}
+
+The Data card (tier 2) is crafted using the following recipe:
+  * Gold nugget/oreberry
+  * [[item:cpu|CPU (tier 1)]]
+  * [[item:materials|Microchip (tier 3)]]
+  * [[item:materials|Card base]]
+
+{{:recipes:items:t2datacard.png?nolink&200|}}
+
+The Data card (tier 3) is crafted using the following recipe:
+  * Diamond
+  * [[item:cpu|CPU (tier 2)]]
+  * [[item:ram|Memory (tier 3)]]
+  * [[item:materials|Card base]]
+
+{{:recipes:items:t3datacard.png?nolink&200|}}

@@ -1,0 +1,18 @@
+Solar Generator Upgrade
+=====================
+{{:items:solar_generator_upgrade.png?nolink&128|}}
+
+Generates a little bit of energy during the day if the robot is under clear skies.
+
+The Solar Generator Upgrade is crafted using the following recipe:
+  * 3 x Glass
+  * 1 x Lapis Lazuli Block
+  * 2 x [[item:materials|Microchip (Tier 3)]]
+  * 2 x Iron Ingot
+  * 1 x [[item:materials|Printed Circuit Board]]
+
+{{:recipes:items:solargenerator.png?nolink&200|}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

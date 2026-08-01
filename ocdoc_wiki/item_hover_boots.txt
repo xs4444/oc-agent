@@ -1,0 +1,21 @@
+Hover Boots
+==========
+
+Hover boots, when worn, allow players to jump higher and reduce the falling impact. The boots also allow players to walk up steps of one-block height, making it easier to climb up mountains. 
+
+Boots require power, and can be re-charged in any compatible [[block:charger|charger]] (such as Applied Energistics 2 charger, or IndustrialCraft 2's battery box). 
+
+*Since version 1.7.3 for minecraft 1.12* Hover Boots can **also** be charged by any Forge Energy compatible machines, such as Thermal Expansion's Energetic Infuser.
+
+Hover Boots are crafted using the following recipe:
+  * 4 x Iron nugget
+  * 2 x Leather
+  * 1 x [[block:capacitor|Capacitor]]
+  * 1 x Hover upgrade (tier 2)
+  * 1 x [[item:dronecase|Drone case (tier 1)]]
+
+{{:recipes:items:hoverboots.png?nolink&200}}
+
+Contents
+-----------
+{{page>item:contents&noheader&noeditbutton&nouser&nofooter}}

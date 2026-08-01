@@ -1,0 +1,10 @@
+|< 100% 15% 15% >|
+^  [[:start:zh|开放式电脑]]  ^^^^
+^ 通用内容 | | [[:openos:zh|安装与使用Open OS]] - [[:Crossmod Interoperation:zh|模组联动]] - [[:Lua Conventions:zh|Lua编程规范]] - [[:Computer Users:zh|电脑用户]] |
+{{page>block:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+{{page>item:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+{{page>api:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+{{page>component:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+{{page>addon:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+{{page>tutorial:contents:zh&noheader&noeditbutton&nouser&nofooter}}
+^ 其他语言 | | [[:start|英文（English）]] |

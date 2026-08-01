@@ -1,0 +1,136 @@
+# Buffer API
+The `buffer` library provides user friendly streams. These are the kind that the `io` library returns from `io.open` **unlike** the raw streams returned by `filesystem.open` which don't support as many helpful methods. These helper methods on the file handles you get from `io.open` are defined here, under [Instance Methods](buffer.md#instance-methods). Thus, this API documentation is important and helpful even if you aren't building your own buffered streams.
+
+Additionally, this API allows you to create buffered streams. You provide the backend stream read and write, the buffer library provides the formatting and buffering of the data. Generally, users will not need to make their own buffered streams. For reference, the io library uses buffered streams (which includes file io as well as terminal io)
+
+## Static Methods
+The following methods are called on the `buffer` library itself.
+
+- `buffer.new([mode: string], stream: table)`
+
+  Creates a new buffered stream, wrapping `stream` with read-write `mode`. `mode` can be readonly (r or `nil`), read-write (rw), or write-only (w). Read about the stream [interface methods](buffer.md#interface-methods) required on the `stream` object.
+
+## Instance Methods
+The following methods can only be called on instances created by `buffer.new` (**note** file handles returned by `io.open` are  also buffered streams, created with `buffer.new`). These methods are instance methods, requiring instance call notation `:`. In order to help differentiate these instance methods from static methods (e.g. `buffer.new`), `b:` will be used to prefix the method names.
+
+- `b:flush()`
+
+  If any data is buffered it is immediately written to the stream and released.
+- `b:close()`
+
+  Flushes the buffer and closes the wrapped stream.
+- `b:setvbuf([mode: string], [size: number]) mode, size`
+
+  Sets the buffering `mode` and `size` and returns the result `mode` and `size`. The amount of data buffered is specified by `size` which defaults to [512, 8192] bytes, depending on available system memory. `mode` and `size` can be nil, in which case the previous values are used for either. `size` is also used in `read(n)` calls to the stream.
+
+  Modes only affect `write`, which include:
+  * "no" writes are immediately pushed to the stream.
+  * "full" writes are buffered up to `size` bytes. This is the default mode.
+  * "line" writes are buffered until newlines are found or `size` is reached, whichever comes first.
+
+- `b:write([values...])`
+
+  Writes each `value` to the stream, first buffering based on the mode and buffer size (see `setvbuf`). Note that to write to a file, you have to open it for *write*.
+
+```lua
+local file = io.open("/tmp/foo.txt", "w")
+file:write("abc", "def", "\n")
+file:close()
+-- foo.txt now has "abcdef\n"
+```
+
+- `b:lines([line_formats...]) string array`
+
+  Returns a function iterator which reads from the stream until it reaches nil. On each read, the `line_formats` list of args as passed to `stream:read(...)`. The overwhelmingly typical use is to not define `line_formats`, i.e. passing no args to `lines()`. The default behavior (i..e without `line_formats`) is to read a "line" at a time from the stream.
+
+```lua
+local file = io.open("/tmp/foobar.txt")
+for line in file:lines() do
+  process_next_line(line)
+end
+file:close()
+```
+
+- `b:read([formats...]) string...`
+
+  A fairly advanced reader that support various formats. First of all, if called with no `format`, i.e an empty param list, it reads the next line from the stream, which is equivalent to `read("*l")`
+
+  Each `format` is read from the stream and all returned in a multiple return value list of the results. Note all format strings are prefixed with \* and also note that only the first char of the string names of the formats matters, the rest is ignored. These are the supported formats:
+
+    * a number value, e.g. `10`
+
+    Read **n** bytes (in binary mode) or chars (in text mode) from the stream; result is returned as a string. See [io.open](non-standard-lua-libs.md#input-and-output-facilities) for more details about how to open files in different modes.
+
+    `local chars = b:read(10)`
+
+    * "\*n" or "\*number"
+
+    Read the next series of bytes from the stream that can be interpreted as a number. Note that reading numbers is also affected by the open mode, binary or text. See [io.open](non-standard-lua-libs.md#input-and-output-facilities) for more details about how to open files in different modes..
+
+    `local number = b:read("*n")`
+
+    * "\*l" or "\*line"
+
+    Read the next line from the stream, chopping off the line ending marker (which may be \n, \r, or \r\n)
+
+    `local line = b:read("*l")`
+
+    * "\*L" or "\*Line"
+
+    Read the next line from the stream, like "*line", but preserves the line ending marker as part of the result
+
+    `local whole_line = b:read("*L")`
+
+    * "\*a" or "\*all"
+
+    Reads all remaining data from the stream until nil. There would be no point in having formats following this.
+
+    `local the_whole_file = b:read("*a")`
+
+- `b:getTimeout() number`
+
+  Returns the current timeout (in seconds) set on the buffered stream. `math.huge` is the default timeout. Read `setTimeout` for more information about the effects of a buffered stream timeout.
+- `b:setTimeout(timeout)`
+
+  Sets the time in seconds a buffered stream will try to limit a `read` operation. Note that this timeout cannot be strictly adhered to. A read operation that completes within a single `readChunk` (an internal method that invokes the actual `read` on the stream) does not check the `timeout` limit. Timeout is only checked between stream reads within a single buffered read (an example follows). Thus, if a read requires multiple chunk reads, and the time between the start of the first read before the start of the last read is greater than or equal to the timeout, then the buffered stream will error. Again note that a timeout is default `math.huge`.
+
+```lua
+local file = buffer.new("r", { read = function() os.sleep(5) return "a" end })
+file:setvbuf("full", 1) -- set buffer size to 1 char
+file:setTimeout(1) -- set buffer timeout to 1 second
+-- this will time out before trying to read the 2nd char
+local a, b = file:read(1, 1) -- read 1 char, then read 1 char again
+```
+
+- `b:seek([whence:string], [offset:number])`
+
+  Moves the stream position by `offset` bytes from `whence`, both optional params. `whence` defaults to "cur", and `offset` defaults to 0.
+  Valid `whence` values:
+  - "cur" from the current position.
+  - "set" from the start of the stream.
+  - "end" from the end of the stream.
+  Returns the result of the seek operation on the stream (which may fail).
+
+## Interface Methods
+
+The following methods are expected to be implemented on the buffered streams passed to `buffer.new`.
+
+- `close() ok, reason`
+
+  Close handles, release resources, disconnect -- and return success
+
+- `write(arg: string) ok, reason`
+
+  Write `arg` as bytes, assume a string of plain unformatted chars. Return falsey and reason on failure.
+
+- `read(n: number) ok, reason`
+
+  Return `n` bytes, and **not** `n` unicode-aware chars. Assume your data is binary data and let the buffer library manage the mode and the unicode string packaging (if applicable). Note that this is exactly how the [filesystem](filesystem.md) library operates.The caller assumes there is more data to read until `nil` is returned. A empty string or a string shorter than `n` chars long is a valid return, but the caller may assume there is more data to request until `nil` is returned.
+
+- `seek([whence: string], [offset: number]) [offset from start] or falsey, reason`
+
+  Refer to `b:seek()` for details. In short, move the stream position to `offset` from `whence`, and return the `offset` from the start of the stream of the position after the seek operation. Note that `seek("cur", 0)` is a valid request, typical of the caller wanting to determine the current position of the stream. Your stream is not required to support `seek`, in such case (or in any case of failure) you should return nil, and the reason (as a string) for the failure.
+
+## Examples
+
+## Contents

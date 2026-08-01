@@ -1,0 +1,2 @@
+^ [[:addon|Addon Mods]] | Addons | [[https://wiki.vexatos.com/wiki:computronics|Computronics]] | |
+| ::: | Supporting OpenComputers | [[thutconcrete|Thut's Concrete]] -  [[https://nucleartech.wiki/wiki/OpenComputers_Integration|HBM's Nuclear Tech Mod]] |

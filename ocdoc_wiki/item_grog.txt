@@ -1,0 +1,17 @@
+Grog
+=====
+
+{{:items:grog.png?nolink&128|}}
+
+Grog is a highly toxic liquid, not suited for consumption. Consuming it can result in undesirable effects, and must be attempted with caution. Primarily, it is a component that is used in hard-mode recipes to make [[item:materials|printed circuit boards]], which is a base component for many of the components in Open Computers. It is also used in crafting [[item:nanomachines|Nanomachines]]. While under the effect of [[item:nanomachines|Nanomachines]], consuming Grog will clear the player of any [[item:nanomachines|Nanomachine]] effects. 
+
+===Crafting===
+
+Grog is crafted using the following recipe:
+  * Bucket of water
+  * Sugar
+  * Slimeball
+  * Fermented spider eye
+  * Bone
+
+{{:recipes:items:acid.png?nolink&200|}}

@@ -1,0 +1,25 @@
+Microcontroller
+=============
+
+Microcontrollers are more restrictive versions of Computers. The key limitation is that they do not contain a slot for a [[item:hard_disk_drive|Hard disk drive]], and rely solely on a programmed [[item:eeprom|EEPROM]] for specific functionality. They can **not**  interact with external components!
+
+Microcontrollers can be built by placing a [[item:microcontrollercase|Microcontroller case]] in an [[block:assembler|Assembler]]. Higher tier [[item:microcontrollercase|Microcontroller cases]] can take more components and upgrades (as well as higher tier components and upgrades). Microcontrollers take a limited subset of upgrades, and do not contain Upgrade or Card container slots. [[item:graphics_card|Graphics cards]] cannot be placed into the expansion slots either. 
+
+MCUs do not automatically forward network messages. They do not distribute power. Network messages arriving on all sides will always be forwarded to the MCU. Which sides are used for sending can be controlled via the `microcontroller` component. A computer can access its external component if it is directly adjacent to the microcontroller.
+
+The following code snippet illustrates one particular usage of Microcontrollers. The program detects redstone signals (requires a [[item:redstone_card|redstone card]]), and uses a [[item:piston_upgrade|piston upgrade]] to push a block. 
+```lua
+local r,p = component.proxy(component.list("redstone")()), component.proxy(component.list("piston")())
+
+while true do
+    computer.pullSignal(0.5)
+    if r.getInput(2) > 0 then
+        p.push()
+    end
+end
+```
+
+Contents
+------------
+
+{{page>block:contents&noheader&noeditbutton&nouser&nofooter}}

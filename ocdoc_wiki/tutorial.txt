@@ -1,0 +1,27 @@
+Tutorials
+=======
+There are a couple of tutorials that aim to make it easier to get started with mod. They are listed roughly in the order that it makes sense to read them in, since they'll often build upon each other.
+
+Mod Specific
+------------
+
+- To begin with, you'll want to [[tutorial:oc1_basic_computer|learn how to build a computer]] and how to run programs on it.
+- After that you might want to read up on [[tutorial:oc2_writing_code|how to create new programs]].
+- To keep you programs across reboots, [[tutorial:oc3_hard_drives|read up on how to label and mount hard drives]].
+
+There have also been some tutorials posted to the forums:
+
+- [[http://oc.cil.li/index.php?/topic/166-getting-started/|Getting Started]] by PotatoTrumpet.
+- [[http://oc.cil.li/index.php?/topic/167-library-loading-and-writing-the-basics/| Library loading and writing: The basics]] by Wobbo.
+
+General
+-------
+If you're new to Lua, one way to learn is to just have a look at the programs that come with the mod. For basic Lua information, do read the [[http://www.lua.org/manual/5.3/manual.html|Lua Reference Manual]]. 
+There are also tutorial sites about learning Lua, such as [[http://www.tutorialspoint.com/lua/index.htm|tutorialspoint]].
+Finally, you may want to read more about [[component:component_access|how you can interact with components from within Lua]] and what [[component:signals|built-in signals are generated]].
+
+----
+
+Contents
+------------
+{{page>tutorial:contents&noheader&noeditbutton&nouser&nofooter}}
