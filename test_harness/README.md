@@ -46,11 +46,22 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 ## 模拟器内运行方式
 
 ```bash
-# 上传（以 ocvm 为例，挂载点因环境而异）
+# 一键驱动（自动：重启 ocvm → 等 OpenOS 启动 → 上传 agent.lua+脚本 → 探测挂载 → 运行 → 拉取结果）
+python ../tools/ocvm_test.py <测试脚本.lua> [脚本参数...]
+
+# 例：
+python ../tools/ocvm_test.py search_test.lua
+python ../tools/ocvm_test.py newfeat_test.lua
+
+# 手动方式（ocvm，挂载名每次重启会变，先 ls /mnt 确认）：
 # 在 OpenOS shell 中：
-lua /mnt/<mount>/search_test.lua <api_key> <model> <api_url>
-# 结果写入 /mnt/<mount>/<脚本名>_result.txt，宿主机直接 cat 读取
+lua /mnt/<挂载短名>/search_test.lua /mnt/<挂载短名> <api_key> <model> <api_url>
+# 结果写入 /mnt/<挂载>/<脚本名>_result.txt，宿主机直接 cat 读取
 ```
+
+测试脚本统一约定：
+- 脚本首个参数 = 挂载路径（用作 dofile agent.lua 的 base），其后为自定义参数
+- 结果写入挂载根的 `<脚本名>.txt`（capability_one 写 `cap_<task>.txt`）
 
 ## 测试约定
 
