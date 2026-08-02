@@ -36,37 +36,28 @@
 
 ## 目录结构
 
+每个子目录含独立 `README.md` 说明用途与用法。
+
 ```
 ├── agent.lua              # 主程序（部署到游戏）
 ├── README.md
-├── docs/
-│   └── superpowers/       # 设计文档与实现计划
-│       ├── specs/
-│       └── plans/
-├── test_harness/          # 测试脚本（本地 + 模拟器内）
+├── docs/                  # 设计文档与实现计划 → docs/README.md
+│   └── superpowers/
+├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
 │   ├── run_tests.lua      # 本地回归测试（48 项）
-│   ├── capability_one.lua # LLM 能力边界测试（单任务模式）
-│   ├── mem_test.lua       # 内存压力测试
-│   ├── search_test.lua    # web_search 工具测试
-│   ├── chat_test*.lua     # chat() 端到端测试
-│   └── ...                # 其他诊断脚本
-├── emulators/             # 第三方 OC 模拟器（游戏外测试环境）
+│   └── ...                # 能力边界/内存/搜索/端到端测试
+├── emulators/             # 第三方 OC 模拟器 → emulators/README.md
 │   ├── OCEmu/             # 真实 OC machine.lua 沙箱（Lua 5.2）
 │   ├── ocvm/              # C++ 模拟器（Linux，含修复）
 │   └── OpenComputersVM/   # JavaFX 模拟器（Windows GUI）
-├── wiki/                  # OC wiki 离线镜像
+├── wiki/                  # OC wiki 离线镜像 → wiki/README.md
 │   ├── raw/               # DokuWiki 原始文本（215 页）
 │   ├── markdown/          # Markdown 转换版（32 页）
 │   └── reference/         # agent 开发精选 API 参考（35 文件）
-├── tools/                 # Windows 辅助脚本
-│   ├── capture_minecraft.py  # 捕获指定游戏窗口截图
-│   ├── capture_screen.py     # 全屏截图
-│   └── type_to_oc.py         # 向游戏窗口模拟按键
-├── scripts/               # 一次性工具脚本
-│   ├── doku2md.py         # DokuWiki 转 Markdown
-│   └── download_images.py # 批量下载 wiki 图片
-├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）
+├── tools/                 # Windows 辅助脚本 → tools/README.md
+├── scripts/               # 一次性工具脚本 → scripts/README.md
+├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）→ lua_portable/README.md
 ├── opencomputers/         # GTNH OpenComputers fork 源码（参考）
 └── pi/                    # pi.dev agent 源码（架构参考）
 ```
