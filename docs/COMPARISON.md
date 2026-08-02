@@ -26,7 +26,7 @@
 
 | 维度 | agent.lua | oc-ai | pi |
 |------|-----------|-------|-----|
-| 工具数量 | 11（read_file/write_file/list_directory/json_query/calc/text_ops/component_list/component_doc/component_invoke/web_search/shell_execute） | oc-code：7（read_file/write_file/edit_file/list_directory/glob/grep/shell） | 大量（文件/进程/网络/权限/插件…） |
+| 工具数量 | 13（read_file+行切片/write_file/edit_file/append_file/list_directory/json_query/calc/text_ops/component_list/component_doc/component_invoke/web_search/shell_execute） | oc-code：7（read_file/write_file/edit_file/list_directory/glob/grep/shell） | 大量（文件/进程/网络/权限/插件…） |
 | 工具声明 | 内置表 + 动态系统提示生成 | `ai.tool({...})` 声明式 + execute 回调 | `AgentTool` 类型化定义 |
 | 组件感知 | 有（component_list/doc/invoke 三件套，动态生成提示） | 无（纯文件/shell 工具） | 无（OC 外） |
 | 容错 | 参数解析 fallback + pcall 包裹 + 结果截断 | JSON decode pcall 包裹 | 工具调用失败标记 + 重试/截断恢复 |
@@ -61,4 +61,4 @@
 
 ## 结论
 
-三个项目定位互补：**oc-ai 是 OC 生态内最成熟的 AI 库**（流式/结构化输出/声明式工具），**pi 是宿主机构建通用 agent 的参考架构**（并行工具/事件流/多 provider），**agent.lua 是唯一专为 OC 资源约束设计的单文件 agent**。对比后 agent.lua 已落地：移除 `execute_lua`（任意代码执行）并新增 `json_query`/`calc`/`text_ops` 数据处理工具集、HTTP 自动重试、对话摘要压缩（compaction）、会话归档（`/new`）。剩余改进方向：`edit_file` 行级编辑（省内存）与工具失败恢复机制。
+三个项目定位互补：**oc-ai 是 OC 生态内最成熟的 AI 库**（流式/结构化输出/声明式工具），**pi 是宿主机构建通用 agent 的参考架构**（并行工具/事件流/多 provider），**agent.lua 是唯一专为 OC 资源约束设计的单文件 agent**。对比后 agent.lua 已落地：移除 `execute_lua`（任意代码执行）并新增 `json_query`/`calc`/`text_ops` 数据处理工具集、`edit_file`（借鉴 oc-ai，加了唯一性检查与 20KB 上限）、`append_file`（pi 没有的差异化：流式追加内存恒定）、`read_file` 行切片（借鉴 pi 的 offset/limit，加了负 offset tail）、HTTP 自动重试、对话摘要压缩（compaction）、会话归档（`/new`）、append-only 会话日志（消内部 O(n²) 整写）。

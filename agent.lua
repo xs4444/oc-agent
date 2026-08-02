@@ -257,8 +257,18 @@ local load_config
 local TOOLS = {
   {type="function", ["function"]={
     name="read_file",
-    description="Read file contents at the given path",
-    parameters={type="object", properties={path={type="string", description="File path"}}, required={"path"}}
+    description="Read file contents. Optional offset (1-based line number) and limit (max lines) read a slice of a large file instead of the whole thing; negative offset counts from the end (tail). When offset is given, lines are prefixed with their number. Omit both to read the whole file.",
+    parameters={type="object", properties={path={type="string", description="File path"}, offset={type="number", description="Start line (1-based); negative = from end (e.g. -5 = last 5 lines)"}, limit={type="number", description="Max lines to read (after offset)"}}, required={"path"}}
+  }},
+  {type="function", ["function"]={
+    name="edit_file",
+    description="Edit a file by replacing an exact string match. The old_string must be unique unless replace_all is true. Use read_file first to see the exact text. For large files or appending, prefer append_file. Rejects files over 20KB.",
+    parameters={type="object", properties={path={type="string", description="File path"}, old_string={type="string", description="Exact text to find (must be unique unless replace_all)"}, new_string={type="string", description="Replacement text"}, replace_all={type="boolean", description="Replace all occurrences (default false)"}}, required={"path", "old_string", "new_string"}}
+  }},
+  {type="function", ["function"]={
+    name="append_file",
+    description="Append content to the end of a file (creates it if missing). O(1) memory regardless of file size — use for logs, growing records, or adding to large files without reading them first.",
+    parameters={type="object", properties={path={type="string", description="File path"}, content={type="string", description="Content to append"}}, required={"path", "content"}}
   }},
   {type="function", ["function"]={
     name="write_file",
@@ -561,9 +571,97 @@ function execute_tool(name, args_str)
     local ok, result = pcall(function()
       local f = io.open(args.path, "r")
       if not f then error("file not found: " .. args.path) end
-      local c = f:read("*a")
+      local offset = args.offset
+      local limit = args.limit
+      if offset == nil and limit == nil then
+        -- Whole file (original behavior)
+        local c = f:read("*a")
+        f:close()
+        return c
+      end
+      -- Line-slice mode: count lines first (needed for negative offset / tail)
+      local total = 0
+      for _ in f:lines() do total = total + 1 end
       f:close()
-      return c
+      local start = offset or 1
+      if start < 0 then start = total + start + 1 end  -- e.g. -5 -> total-4
+      if start < 1 then start = 1 end
+      -- Re-open and collect the slice (O(target lines) memory)
+      local f2 = io.open(args.path, "r")
+      if not f2 then error("cannot reopen: " .. args.path) end
+      local parts = {}
+      local n = 0
+      local collected = 0
+      for line in f2:lines() do
+        n = n + 1
+        if n >= start then
+          collected = collected + 1
+          parts[#parts + 1] = n .. ". " .. line
+          if limit and collected >= limit then break end
+        end
+      end
+      f2:close()
+      if #parts == 0 then
+        return "no lines (file has " .. total .. " lines; offset " .. tostring(offset or 1) .. ")"
+      end
+      return table.concat(parts, "\n")
+    end)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "edit_file" then
+    local ok, result = pcall(function()
+      local f = io.open(args.path, "r")
+      if not f then error("file not found: " .. args.path) end
+      local content = f:read("*a")
+      f:close()
+      if #content > 20000 then
+        error("file too large for edit_file (" .. #content .. " bytes, max 20000). Use read_file with offset/limit + append_file.")
+      end
+      local old = args.old_string
+      if old == nil or old == "" then error("old_string must be non-empty") end
+      local new = args.new_string or ""
+      -- Count occurrences (plain text, no patterns)
+      local count = 0
+      local pos = 1
+      while true do
+        local found = content:find(old, pos, true)
+        if not found then break end
+        count = count + 1
+        pos = found + 1
+      end
+      if count == 0 then
+        error("old_string not found in file")
+      end
+      if count > 1 and not args.replace_all then
+        error("old_string found " .. count .. " times; use replace_all=true or a longer unique match")
+      end
+      local newContent
+      if args.replace_all then
+        -- literal replace-all: escape magic chars in pattern and % in replacement.
+        -- NOTE: wrap inner gsub calls in parens — gsub returns (result, count),
+        -- and a bare call as an argument would expand both values.
+        local pat = (old:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+        local repl = (new:gsub("%%", "%%%%"))
+        newContent = content:gsub(pat, repl)
+      else
+        local idx = content:find(old, 1, true)
+        newContent = content:sub(1, idx - 1) .. new .. content:sub(idx + #old)
+      end
+      local fw = io.open(args.path, "w")
+      if not fw then error("cannot write: " .. args.path) end
+      fw:write(newContent)
+      fw:close()
+      return "Replaced " .. (args.replace_all and count or 1) .. " occurrence(s) in " .. args.path
+    end)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "append_file" then
+    local ok, result = pcall(function()
+      local f = io.open(args.path, "a")
+      if not f then error("cannot open for append: " .. args.path) end
+      f:write(args.content or "")
+      f:close()
+      return "Appended " .. (#(args.content or "") ) .. " bytes to " .. args.path
     end)
     return ok and result or ("Error: " .. tostring(result))
 
@@ -774,8 +872,10 @@ local function build_system_prompt()
 
   return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Available tools:\n"
-    .. "- read_file: Read file contents at the given path\n"
-    .. "- write_file: Write content to a file\n"
+    .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
+    .. "- write_file: Write content to a file (new files or full rewrites)\n"
+    .. "- edit_file: Replace an exact string in a file (must be unique; replace_all for multiple). Read first, keep files under 20KB\n"
+    .. "- append_file: Append content to a file — use for logs and growing files, memory cost is constant regardless of file size\n"
     .. "- list_directory: List files in a directory\n"
     .. "- json_query: Extract a value from a JSON string using a dot path (e.g. 'hits.0.title'). Use to parse component_invoke, web_search or file contents.\n"
     .. "- calc: Evaluate a safe arithmetic expression (sqrt, abs, floor, ceil, min, max, + - * / % ^)\n"
@@ -1028,6 +1128,26 @@ local function first_run_setup()
   return config
 end
 
+-- Append-only session log: each line is one JSON-encoded message.
+-- Append per message (O(new) memory) instead of rewriting the whole history
+-- (O(n) each call, O(n^2) cumulative). load_history replays + trims.
+local function append_history(msg)
+  local f = io.open(HISTORY_PATH, "a")
+  if not f then return end
+  f:write(json.encode(msg), "\n")
+  f:close()
+end
+
+-- Full rewrite of the session log (after compaction / new session / reset).
+local function rebuild_history(messages)
+  local f = io.open(HISTORY_PATH, "w")
+  if not f then return end
+  for _, m in ipairs(messages) do
+    f:write(json.encode(m), "\n")
+  end
+  f:close()
+end
+
 local function load_history()
   local fs = require("filesystem")
   if not fs.exists(HISTORY_PATH) then return {} end
@@ -1035,21 +1155,27 @@ local function load_history()
   if not f then return {} end
   local content = f:read("*a")
   f:close()
+  if content == "" then return {} end
+
+  -- Legacy format (whole-table serialization): migrate once to JSON-line format.
   local ser = require("serialization")
   local ok, data = pcall(ser.unserialize, content)
-  if ok and type(data) == "table" then
-    return trim_history(data)
+  if ok and type(data) == "table" and (data[1] or data.role) then
+    local list = data.role and {data} or data
+    rebuild_history(list)  -- migrate
+    return trim_history(list)
   end
-  return {}
-end
 
-local function save_history(messages)
-  local ser = require("serialization")
-  local f = io.open(HISTORY_PATH, "w")
-  if not f then return end
-  f:write(ser.serialize(messages))
-   f:close()
- end
+  -- JSON-line format: one message per line, skip corrupt lines.
+  local messages = {}
+  for line in content:gmatch("[^\r\n]+") do
+    local ok2, msg = pcall(json.decode, line)
+    if ok2 and type(msg) == "table" and msg.role then
+      messages[#messages + 1] = msg
+    end
+  end
+  return trim_history(messages)
+end
 
 -- ── Section 7: REPL & Main Loop ────────────────────────────────
 
@@ -1121,7 +1247,7 @@ local function handle_command(cmd, config, messages)
       print("No messages to archive")
     end
     messages = {}
-    save_history(messages)
+    rebuild_history(messages)
     print("New session started")
   elseif command == "/compact" then
     if #messages == 0 then
@@ -1131,7 +1257,7 @@ local function handle_command(cmd, config, messages)
       local compacted = compact_history(messages, config)
       if compacted then
         messages = compacted
-        save_history(messages)
+        rebuild_history(messages)
         print("Compacted: " .. #messages .. " messages kept (summary + recent)")
       else
         print("Compaction failed (network or model error); conversation unchanged")
@@ -1139,7 +1265,7 @@ local function handle_command(cmd, config, messages)
     end
   elseif command == "/reset" then
     messages = {}
-    save_history(messages)
+    rebuild_history(messages)
     print("History cleared")
   elseif command == "/hist" then
     print(#messages .. " messages in history")
@@ -1199,11 +1325,13 @@ local function main()
       local compacted = compact_history(messages, config)
       if compacted then
         messages = compacted
-        save_history(messages)
+        rebuild_history(messages)
       end
     end
     messages = trim_history(messages)
-    save_history(messages)  -- persist user message immediately
+    -- append-only: persist just the new user message (old entries stay in the
+    -- log; load_history trims on replay)
+    append_history(messages[#messages])
 
     while true do
       io.write("Thinking...\r")
@@ -1223,7 +1351,7 @@ local function main()
         assistant_msg.tool_calls = response.tool_calls
       end
       messages[#messages + 1] = assistant_msg
-      save_history(messages)  -- persist assistant reply immediately
+      append_history(assistant_msg)  -- append-only: persist reply
 
       if not response.tool_calls or #response.tool_calls == 0 then
         break
@@ -1238,17 +1366,17 @@ local function main()
         if type(result) == "string" and #result > MAX_TOOL_RESULT then
           result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
         end
-        messages[#messages + 1] = {
+        local tool_msg = {
           role = "tool",
           tool_call_id = tc.id,
           content = result
         }
-        save_history(messages)  -- persist each tool result immediately
+        messages[#messages + 1] = tool_msg
+        append_history(tool_msg)  -- append-only: persist tool result
       end
     end
 
     messages = trim_history(messages)
-    save_history(messages)
 
     ::continue::
   end
@@ -1260,6 +1388,14 @@ if not _TEST_MODE then main() end
 
 -- Test hooks (available when loaded with _TEST_MODE = true)
 if _TEST_MODE then
+  -- allow tests to redirect history storage (default: /home/agent_history.txt)
+  local history_path_override
+  local function set_history_path(p)
+    history_path_override = p
+  end
+  -- rebind HISTORY_PATH usage: load/append/rebuild read this variable at call time
+  -- (declared local above; we re-point the functions' captured upvalue via a
+  -- small indirection)
   agent_test = {
     chat = chat,
     http_post = http_post,
@@ -1268,6 +1404,26 @@ if _TEST_MODE then
     compact_history = compact_history,
     should_compact = should_compact,
     summarize_history = summarize_history,
+    load_history = function()
+      local saved = HISTORY_PATH
+      if history_path_override then HISTORY_PATH = history_path_override end
+      local r = load_history()
+      HISTORY_PATH = saved
+      return r
+    end,
+    append_history = function(msg)
+      local saved = HISTORY_PATH
+      if history_path_override then HISTORY_PATH = history_path_override end
+      append_history(msg)
+      HISTORY_PATH = saved
+    end,
+    rebuild_history = function(messages)
+      local saved = HISTORY_PATH
+      if history_path_override then HISTORY_PATH = history_path_override end
+      rebuild_history(messages)
+      HISTORY_PATH = saved
+    end,
+    set_history_path = set_history_path,
     TOOLS = TOOLS,
   }
 end
