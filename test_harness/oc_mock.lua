@@ -194,6 +194,26 @@ function mock_shell.execute(cmd)
 end
 
 local mock_internet = {}
+
+-- Mock HTTP response handle: callable table with .response
+-- (mimics real OC internet request handle; Lua 5.4 forbids setmetatable on
+-- functions, so we use a table with __call)
+local function make_handle(body, code)
+  local started = false
+  local handle = {}
+  setmetatable(handle, {
+    __call = function()
+      if started then return nil end
+      started = true
+      return body
+    end,
+    __index = {
+      response = function() return code or 200 end,
+    },
+  })
+  return handle
+end
+
 function mock_internet.request(url, data, headers, method)
   -- For testing, handle file:// URLs for local testing
   if url:match("^file://") then
@@ -202,36 +222,34 @@ function mock_internet.request(url, data, headers, method)
     if f then
       local content = f:read("*a")
       f:close()
-      -- Return iterator-like function
-      local started = false
-      return function()
-        if started then return nil end
-        started = true
-        return content
-      end
+      return make_handle(content)
     end
     error("file not found: " .. path)
+  end
+  -- Simulate chat completions (LLM API). The mock looks at the request body:
+  --   "summarize" trigger in the user content → return a summary response
+  --   otherwise → return a generic assistant reply
+  if url:match("chat/completions") then
+    local body = data or ""
+    local reply
+    if body:find("Summarize this conversation") then
+      reply = "[mock summary] user asked about memory; key facts: 2MB limit, no leak"
+    else
+      reply = "This is a mock assistant response"
+    end
+    local resp = '{"choices":[{"message":{"role":"assistant","content":"' .. reply .. '"},"finish_reason":"stop"}]}'
+    return make_handle(resp)
   end
   -- Simulate HN Algolia search response
   if url:match("^https://hn%.algolia%.com/") then
     local q = url:match("query=([^&]+)") or "test"
     local body = '{"hits":[{"title":"Result 1 for ' .. q .. '","url":"https://example.com/1","objectID":"1"},{"title":"Result 2 for ' .. q .. '","url":"https://example.com/2","objectID":"2"}],"nbHits":2}'
-    local started = false
-    return function()
-      if started then return nil end
-      started = true
-      return body
-    end
+    return make_handle(body)
   end
   -- Simulate Tavily search response
   if url:match("^https://api%.tavily%.com/") then
     local body = '{"query":"' .. (data or "") .. '","results":[{"title":"Tavily Result 1","url":"https://tavily.example/1","content":"snippet one"},{"title":"Tavily Result 2","url":"https://tavily.example/2","content":"snippet two"}]}'
-    local started = false
-    return function()
-      if started then return nil end
-      started = true
-      return body
-    end
+    return make_handle(body)
   end
   error("internet.mock: cannot handle " .. url)
 end
