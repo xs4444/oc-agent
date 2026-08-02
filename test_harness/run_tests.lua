@@ -3,6 +3,9 @@
 -- Loads agent.lua with OC mock and runs unit tests
 -- ══════════════════════════════════════════════════════
 
+-- Lua 5.4 has no os.sleep; OC's OpenOS provides it. No-op fallback for tests.
+if not os.sleep then os.sleep = function() end end
+
 local oc_mock = require("oc_mock")
 
 -- Override globals that agent.lua expects
@@ -194,23 +197,71 @@ local function test_tool(label, name, args, expected_check)
   end
 end
 
-test_tool("execute_lua simple", "execute_lua", '{"code":"return 2+2"}',
-  function(r) return r:find("=> 4") ~= nil end)
+test_tool("json_query scalar", "json_query", '{"json":"{\\"name\\":\\"oc\\",\\"count\\":3}","path":"name"}',
+  function(r) return r == "oc" end)
 
-test_tool("execute_lua string", "execute_lua", '{"code":"return \\\"hello\\\""}',
-  function(r) return r:find("hello") ~= nil end)
+test_tool("json_query nested", "json_query", '{"json":"{\\"data\\":{\\"items\\":[{\\"title\\":\\"a\\"},{\\"title\\":\\"b\\"}]}}","path":"data.items.1.title"}',
+  function(r) return r == "b" end)
 
-test_tool("execute_lua table", "execute_lua", '{"code":"return {1,2,3}"}',
-  function(r) return r:find("table") ~= nil or r:find("=>") ~= nil end)
+test_tool("json_query object", "json_query", '{"json":"{\\"user\\":{\\"id\\":7,\\"name\\":\\"x\\"}}","path":"user"}',
+  function(r) return r:find('"id":7') ~= nil and r:find('"name":"x"') ~= nil end)
 
-test_tool("execute_lua compile error", "execute_lua", '{"code":"bad syntax !!!"}',
-  function(r) return r:find("Compile error") ~= nil end)
+test_tool("json_query invalid json", "json_query", '{"json":"not json","path":"a"}',
+  function(r) return r:find("invalid JSON") ~= nil end)
 
-test_tool("execute_lua runtime error", "execute_lua", '{"code":"error(\\\"boom\\\")"}',
-  function(r) return r:find("Runtime error") ~= nil end)
+test_tool("json_query missing path", "json_query", '{"json":"{\\"a\\":1}","path":"b.c"}',
+  function(r) return r:find("not found") ~= nil end)
 
-test_tool("execute_lua stdout capture", "execute_lua", '{"code":"io.write(\\\"hello world\\\")"}',
-  function(r) return r:find("hello world") ~= nil end)
+test_tool("json_query missing arg", "json_query", '{"path":"a"}',
+  function(r) return r:find("must be a string") ~= nil end)
+
+test_tool("calc basic", "calc", '{"expression":"2+3*4"}',
+  function(r) return r == "14" end)
+
+test_tool("calc parens", "calc", '{"expression":"(2+3)*4"}',
+  function(r) return r == "20" end)
+
+test_tool("calc power", "calc", '{"expression":"2^10"}',
+  function(r) return r == "1024" end)
+
+test_tool("calc funcs", "calc", '{"expression":"sqrt(16)+floor(3.7)"}',
+  function(r) return r == "7" end)
+
+test_tool("calc minmax", "calc", '{"expression":"min(3,7)+max(1,9)"}',
+  function(r) return r == "12" end)
+
+test_tool("calc invalid", "calc", '{"expression":"2+*"}',
+  function(r) return r:find("invalid expression") ~= nil end)
+
+test_tool("calc unknown func", "calc", '{"expression":"evil(1)"}',
+  function(r) return r:find("invalid expression") ~= nil or r:find("unknown function") ~= nil end)
+
+test_tool("text_ops upper", "text_ops", '{"op":"upper","text":"hello"}',
+  function(r) return r == "HELLO" end)
+
+test_tool("text_ops length", "text_ops", '{"op":"length","text":"hello"}',
+  function(r) return r == "5" end)
+
+test_tool("text_ops trim", "text_ops", '{"op":"trim","text":"  hi  "}',
+  function(r) return r == "hi" end)
+
+test_tool("text_ops find", "text_ops", '{"op":"find","text":"hello world","arg1":"world"}',
+  function(r) return r:find("found at 7") ~= nil end)
+
+test_tool("text_ops replace", "text_ops", '{"op":"replace","text":"a-b-c","arg1":"-","arg2":"+"}',
+  function(r) return r == "a+b+c" end)
+
+test_tool("text_ops slice", "text_ops", '{"op":"slice","text":"hello world","arg1":"7","arg2":"5"}',
+  function(r) return r == "world" end)
+
+test_tool("text_ops split", "text_ops", '{"op":"split","text":"a\\nb\\nc"}',
+  function(r) return r:find("1%. a") ~= nil and r:find("2%. b") ~= nil and r:find("3%. c") ~= nil end)
+
+test_tool("text_ops unknown op", "text_ops", '{"op":"bogus","text":"x"}',
+  function(r) return r:find("unknown op") ~= nil end)
+
+test_tool("execute_lua removed", "execute_lua", '{"code":"return 1"}',
+  function(r) return r:find("removed") ~= nil end)
 
 test_tool("component_list no filter", "component_list", '{}',
   function(r) return type(r) == "string" and #r > 0 end)
@@ -261,6 +312,94 @@ os.remove(fpath)
 
 test_tool("read_file not found", "read_file", '{"path":"/nonexistent/file.txt"}',
   function(r) return r:find("not found") ~= nil end)
+
+print("")
+print("═══════════════════════════════════════")
+print("Compaction / System Prompt Tests")
+print("═══════════════════════════════════════")
+
+-- Test hooks
+local compact_history = agent_test.compact_history
+local should_compact = agent_test.should_compact
+local summarize_history = agent_test.summarize_history
+local http_post = agent_test.http_post
+local build_system_prompt = agent_test.build_system_prompt
+
+local function test(label, cond, detail)
+  if cond then
+    pass = pass + 1; print("  ✓ " .. label)
+  else
+    fail = fail + 1
+    print("  ✗ " .. label)
+    if detail then print("    " .. tostring(detail)) end
+  end
+end
+
+-- http_post with mock chat/completions endpoint
+local code, resp, err = http_post("https://mock/chat/completions",
+  {["Content-Type"] = "application/json"}, '{"messages":[]}')
+test("http_post mock 200", code == 200 and type(resp) == "string" and not err,
+  "code=" .. tostring(code) .. " err=" .. tostring(err))
+
+-- summarize_history via mock
+local msgs = {
+  {role = "user", content = "how much memory?"},
+  {role = "assistant", content = "2MB limit"},
+  {role = "user", content = "any leak?"},
+}
+local summary = summarize_history(msgs, {model = "m", api_key = ""})
+test("summarize_history returns summary", type(summary) == "string" and #summary > 10,
+  "summary=" .. tostring(summary))
+
+-- compact_history: many messages → summary + last KEEP verbatim
+local big = {}
+for i = 1, 30 do
+  big[#big + 1] = {role = "user", content = "message number " .. i}
+end
+local compacted = compact_history(big, {model = "m", api_key = ""})
+test("compact_history succeeds", compacted ~= nil, "compacted=nil")
+if compacted then
+  test("compact adds summary prefix", compacted[1].role == "system"
+    and tostring(compacted[1].content):find("对话摘要") ~= nil)
+  test("compact keeps last messages", compacted[#compacted].content == "message number 30"
+    and compacted[#compacted - 1].content == "message number 29")
+  test("compact shrinks count", #compacted <= 6)
+end
+
+-- should_compact trigger thresholds
+test("should_compact true when many messages",
+  should_compact({{role="u",content="x"},{role="u",content="y"},{role="u",content="z"},
+    {role="u",content="w"},{role="u",content="v"},{role="u",content="q"},
+    {role="u",content="a"},{role="u",content="b"},{role="u",content="c"},
+    {role="u",content="d"},{role="u",content="e"},{role="u",content="f"},
+    {role="u",content="g"},{role="u",content="h"},{role="u",content="i"},{role="u",content="j"},
+    {role="u",content="k"},{role="u",content="l"}}))
+test("should_compact false when short",
+  not should_compact({{role="u", content="x"}}))
+test("should_compact false when big bytes but few messages",
+  not should_compact({{role="u", content=string.rep("a", 45000)}}))
+
+-- compact_history returns nil when nothing to compact
+test("compact_history nil on tiny history", compact_history({{role="u", content="x"}}, {}) == nil)
+
+-- system prompt no longer mentions execute_lua; mentions new tools
+local sp = build_system_prompt()
+test("system prompt has json_query", sp:find("json_query") ~= nil)
+test("system prompt has calc", sp:find("calc") ~= nil)
+test("system prompt has text_ops", sp:find("text_ops") ~= nil)
+test("system prompt no execute_lua", sp:find("execute_lua") == nil)
+
+-- TOOLS list: execute_lua removed, new tools present
+local tools_have = {}
+for _, t in ipairs(agent_test.TOOLS) do
+  tools_have[t["function"].name] = true
+end
+test("TOOLS has json_query", tools_have["json_query"] == true)
+test("TOOLS has calc", tools_have["calc"] == true)
+test("TOOLS has text_ops", tools_have["text_ops"] == true)
+test("TOOLS no execute_lua", tools_have["execute_lua"] ~= true)
+test("TOOLS count is 11", #agent_test.TOOLS == 11,
+  "count=" .. tostring(#agent_test.TOOLS))
 
 print("")
 print("═══════════════════════════════════════")

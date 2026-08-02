@@ -12,11 +12,14 @@
 
 ## 功能一览
 
-- **9 个 LLM 工具**：`read_file` / `write_file` / `list_directory` / `execute_lua` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute`
+- **11 个 LLM 工具**：`read_file` / `write_file` / `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute`
 - **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
-- **自举扩展**：LLM 通过 `execute_lua` + `write_file` 可创建新 Lua 模块，运行时扩展自身能力
+- **数据处理工具集**：`json_query`（JSON 点路径提取）/ `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）替代了原 `execute_lua`，无任意代码执行风险
 - **联网搜索**：默认 HN Algolia（无 key），`/tavily <key>` 升级为通用搜索（含中文）
 - **上下文持久化**：每条消息/工具结果即时保存，崩溃可恢复；50KB 双预算裁剪防内存膨胀
+- **自动重试**：网络错误 / 429 / 5xx 自动重试（指数退避，最多 3 次），4xx 不重试
+- **对话压缩**：历史超限时自动用 LLM 生成摘要替换旧消息（保留最近 4 条），失败回退裁剪；`/compact` 手动触发
+- **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
 
 ## 部署
@@ -31,7 +34,9 @@
 /key <api_key>        -- 设置 API key（留空用免费模型）
 /url <endpoint>       -- 切换 API 端点
 /tavily <key>         -- 启用 Tavily 通用搜索
-/reset                -- 清空对话历史
+/new                  -- 归档当前会话到 /home/sessions/ 并开新会话
+/compact              -- 手动压缩对话（LLM 摘要 + 保留最近 4 条）
+/reset                -- 清空对话历史（不归档）
 ```
 
 ## 目录结构

@@ -183,7 +183,11 @@ end
 
 -- ── Section 2: HTTP Client ─────────────────────────────────────
 
-local function http_post(url, headers, body)
+local MAX_RETRIES = 3            -- retries for transient HTTP failures
+local RETRY_BASE_DELAY = 2       -- seconds, doubled per attempt
+
+-- Single request attempt. Returns code, body, err.
+local function http_post_once(url, headers, body)
   local internet = require("internet")
   local ok, handle = pcall(function()
     -- 3-arg form: body presence auto-selects POST (compatible with ocvm
@@ -228,6 +232,23 @@ local function http_post(url, headers, body)
   return code or 0, response_body, nil
 end
 
+-- POST with automatic retry: transient failures (network errors, 429, 5xx)
+-- are retried with exponential backoff. 4xx errors are permanent, never retried.
+local function http_post(url, headers, body)
+  for attempt = 1, MAX_RETRIES + 1 do
+    local code, resp, err = http_post_once(url, headers, body)
+    if err then
+      if attempt > MAX_RETRIES then return code, resp, err end
+    else
+      local transient = (code == 429 or code >= 500)
+      if not transient or attempt > MAX_RETRIES then
+        return code, resp, err
+      end
+    end
+    os.sleep(RETRY_BASE_DELAY * 2 ^ (attempt - 1))
+  end
+end
+
 -- ── Section 3: Tool Definitions ────────────────────────────────
 
 -- forward declaration: execute_tool (Section 4) calls load_config (Section 6)
@@ -250,9 +271,19 @@ local TOOLS = {
     parameters={type="object", properties={path={type="string", description="Directory path"}}, required={"path"}}
   }},
   {type="function", ["function"]={
-    name="execute_lua",
-    description="Execute Lua code in the OpenOS environment. Can use require(), component, robot, etc. Must yield in loops with os.sleep(0).",
-    parameters={type="object", properties={code={type="string", description="Lua code to execute"}}, required={"code"}}
+    name="json_query",
+    description="Extract a value from a JSON string using a dot path (e.g. 'hits.0.title', 'data.items.3.name'). Arrays are indexed from 0. Returns the matched value (JSON for objects/arrays, plain text for scalars). Use to parse component_invoke, web_search or file contents.",
+    parameters={type="object", properties={json={type="string", description="JSON text to query"}, path={type="string", description="Dot-separated path, e.g. 'hits.0.title'"}}, required={"json", "path"}}
+  }},
+  {type="function", ["function"]={
+    name="calc",
+    description="Evaluate a safe arithmetic expression. Supports + - * / % ^, parentheses, and functions: sqrt, abs, floor, ceil, min, max. Does NOT execute code — use for math only. Example: 'sqrt(2)*10^3'",
+    parameters={type="object", properties={expression={type="string", description="Arithmetic expression to evaluate"}}, required={"expression"}}
+  }},
+  {type="function", ["function"]={
+    name="text_ops",
+    description="String manipulation operations: find(text, pattern) -> position or nil; replace(text, old, new) -> new text; split(text, sep) -> numbered lines; slice(text, start, length); upper(text); lower(text); trim(text); length(text).",
+    parameters={type="object", properties={op={type="string", description="Operation: find, replace, split, slice, upper, lower, trim, length"}, text={type="string", description="Input text"}, arg1={type="string", description="First argument (pattern/old/separator/start)"}, arg2={type="string", description="Second argument (new/length)"}}, required={"op", "text"}}
   }},
   {type="function", ["function"]={
     name="component_list",
@@ -283,48 +314,227 @@ local TOOLS = {
 
 -- ── Section 4: Tool Execution ──────────────────────────────────
 
+-- json_query: extract value from JSON via dot path (arrays 0-indexed)
+local function json_query_code(json_str, path)
+  if type(json_str) ~= "string" then return "Error: json argument must be a string" end
+  local ok_decode, data, derr = pcall(json.decode, json_str)
+  if not ok_decode then
+    return "Error: invalid JSON: " .. tostring(data)
+  end
+  if data == nil and derr then
+    return "Error: invalid JSON: " .. tostring(derr)
+  end
+
+  local cur = data
+  if path == nil or path == "" then
+    -- no path: return whole value
+    if type(cur) == "table" then return json.encode(cur) end
+    if type(cur) == "boolean" then return tostring(cur) end
+    return tostring(cur or "null")
+  end
+
+  for seg in (path .. "."):gmatch("([^%.]+)%.") do
+    if type(cur) ~= "table" then
+      return "Error: cannot descend into " .. type(cur) .. " at '" .. seg .. "'"
+    end
+    local idx = tonumber(seg)
+    local next_val
+    if idx ~= nil then
+      next_val = cur[idx + 1]  -- JSON array index → 1-based Lua table
+    else
+      next_val = cur[seg]
+    end
+    if next_val == nil then
+      return "Error: path not found at '" .. seg .. "'"
+    end
+    cur = next_val
+  end
+
+  if type(cur) == "table" then return json.encode(cur) end
+  if type(cur) == "boolean" then return tostring(cur) end
+  return tostring(cur or "null")
+end
+
+-- calc: safe arithmetic expression evaluator (no code execution)
+local function calc_code(expr)
+  if type(expr) ~= "string" or expr == "" then
+    return "Error: expression must be a non-empty string"
+  end
+
+  local pos = 1
+  local function peek()
+    while expr:sub(pos, pos):match("%s") do pos = pos + 1 end
+    return expr:sub(pos, pos)
+  end
+
+  local function parse_primary()
+    peek()
+    local c = expr:sub(pos, pos)
+    if c == "(" then
+      pos = pos + 1
+      local v = parse_expr()
+      peek()
+      if expr:sub(pos, pos) ~= ")" then error("expected ')'") end
+      pos = pos + 1
+      return v
+    end
+    -- function call: name(...)
+    local name = expr:match("^([a-zA-Z_][a-zA-Z0-9_]*)%s*%(", pos)
+    if name then
+      pos = pos + #name
+      peek()
+      if expr:sub(pos, pos) ~= "(" then error("expected '(' after " .. name) end
+      pos = pos + 1
+      local args = {}
+      peek()
+      if expr:sub(pos, pos) ~= ")" then
+        while true do
+          args[#args + 1] = parse_expr()
+          peek()
+          local cc = expr:sub(pos, pos)
+          if cc == "," then pos = pos + 1
+          elseif cc == ")" then break
+          else error("expected ',' or ')'") end
+        end
+      end
+      pos = pos + 1
+      local fns = {
+        sqrt = function(x) return math.sqrt(x) end,
+        abs = function(x) return math.abs(x) end,
+        floor = function(x) return math.floor(x) end,
+        ceil = function(x) return math.ceil(x) end,
+        min = function(...) return math.min(...) end,
+        max = function(...) return math.max(...) end,
+      }
+      if not fns[name] then error("unknown function: " .. name) end
+      return fns[name](table.unpack(args))
+    end
+    local rest = expr:sub(pos)
+    -- strict number: optional sign, digits, optional fraction; exponent handled
+    -- separately (a capture group would return nil when the exponent is absent)
+    local num = rest:match("^%-?%d+%.?%d*")
+    if not num or num == "" then error("expected number at " .. pos) end
+    local exp = rest:sub(#num + 1):match("^[eE][%-+]?%d+")
+    if exp then num = num .. exp end
+    pos = pos + #num
+    return tonumber(num)
+  end
+
+  local function parse_unary()
+    peek()
+    if expr:sub(pos, pos) == "-" then
+      pos = pos + 1
+      return -parse_unary()
+    end
+    if expr:sub(pos, pos) == "+" then
+      pos = pos + 1
+      return parse_unary()
+    end
+    return parse_primary()
+  end
+
+  local function parse_power()
+    local v = parse_unary()
+    peek()
+    if expr:sub(pos, pos) == "^" then
+      pos = pos + 1
+      return v ^ parse_power()
+    end
+    return v
+  end
+
+  local function parse_mul()
+    local v = parse_power()
+    while true do
+      peek()
+      local c = expr:sub(pos, pos)
+      if c == "*" then pos = pos + 1; v = v * parse_power()
+      elseif c == "/" then pos = pos + 1; v = v / parse_power()
+      elseif c == "%" then pos = pos + 1; v = v % parse_power()
+      else return v end
+    end
+  end
+
+  local function parse_add()
+    local v = parse_mul()
+    while true do
+      peek()
+      local c = expr:sub(pos, pos)
+      if c == "+" then pos = pos + 1; v = v + parse_mul()
+      elseif c == "-" then pos = pos + 1; v = v - parse_mul()
+      else return v end
+    end
+  end
+
+  parse_expr = parse_add
+
+  local ok, result = pcall(function()
+    local v = parse_expr()
+    peek()
+    if pos <= #expr then error("trailing input at " .. pos) end
+    return v
+  end)
+  if not ok then
+    return "Error: invalid expression: " .. tostring(result)
+  end
+  -- Format: integer-valued results without trailing .0
+  if type(result) == "number" then
+    if math.abs(result % 1) < 1e-9 and math.abs(result) < 1e15 then
+      return string.format("%d", result)
+    end
+    return tostring(result)
+  end
+  return tostring(result or "")
+end
+
+-- text_ops: string manipulation
+local function text_ops_code(op, text, arg1, arg2)
+  if type(text) ~= "string" then return "Error: text must be a string" end
+  local fn = ({
+    length = function() return tostring(#text) end,
+    upper = function() return string.upper(text) end,
+    lower = function() return string.lower(text) end,
+    trim = function() return text:match("^%s*(.-)%s*$") end,
+    find = function()
+      local s, e = text:find(arg1 or "", 1, true)
+      if not s then return "not found" end
+      return "found at " .. s .. " (length " .. (e - s + 1) .. ")"
+    end,
+    replace = function()
+      return (text:gsub(arg1 or "", arg2 or ""))
+    end,
+    slice = function()
+      local start = tonumber(arg1) or 1
+      local len = tonumber(arg2)
+      if start < 1 then start = 1 end
+      if len and len > 0 then
+        return text:sub(start, start + len - 1)
+      end
+      return text:sub(start)
+    end,
+    split = function()
+      local sep = arg1 or "\n"
+      local parts = {}
+      local n = 0
+      for piece in (text .. sep):gmatch("(.-)" .. string.gsub(sep, "[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")) do
+        n = n + 1
+        parts[#parts + 1] = n .. ". " .. piece
+      end
+      if n == 0 then return "(no parts)" end
+      return table.concat(parts, "\n")
+    end,
+  })[op]
+
+  if not fn then return "Error: unknown op: " .. tostring(op) end
+  local ok, result = pcall(fn)
+  if not ok then
+    return "Error: " .. tostring(result)
+  end
+  return tostring(result or "")
+end
+
 function execute_lua_code(code)
-  if type(code) ~= "string" then
-    return "Error: code argument must be a string, got " .. type(code)
-  end
-  -- Capture both io.write and print (OpenOS's print renders to GPU, not io.write)
-  local original_write = io.write
-  local original_print = rawget(_G, "print")
-  local captured = {}
-  io.write = function(s)
-    captured[#captured + 1] = tostring(s or "")
-    return true
-  end
-  if type(original_print) == "function" then
-    _G.print = function(s)
-      captured[#captured + 1] = tostring(s or "")
-    end
-  end
-
-  local fn, compile_err = load(code)
-  local ok, result
-  if fn then
-    ok, result = pcall(fn)
-  end
-
-  io.write = original_write
-  if type(original_print) == "function" then
-    _G.print = original_print
-  end
-
-  local output = table.concat(captured)
-  if not fn then
-    return "Compile error: " .. tostring(compile_err)
-  elseif not ok then
-    return "Runtime error: " .. tostring(result) ..
-      (output ~= "" and ("\nOutput before error:\n" .. output) or "")
-  else
-    local ret = output
-    if result ~= nil then
-      ret = ret .. (ret ~= "" and "\n" or "") .. "=> " .. tostring(result)
-    end
-    return ret ~= "" and ret or "(no output)"
-  end
+  return "Error: execute_lua has been removed. Use json_query (JSON extraction), calc (math), or text_ops (string manipulation) instead."
 end
 
 function execute_tool(name, args_str)
@@ -381,6 +591,18 @@ function execute_tool(name, args_str)
 
   elseif name == "execute_lua" then
     return execute_lua_code(args.code)
+
+  elseif name == "json_query" then
+    local ok, result = pcall(json_query_code, args.json, args.path)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "calc" then
+    local ok, result = pcall(calc_code, args.expression)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "text_ops" then
+    local ok, result = pcall(text_ops_code, args.op, args.text, args.arg1, args.arg2)
+    return ok and result or ("Error: " .. tostring(result))
 
   elseif name == "component_list" then
     local ok, result = pcall(function()
@@ -550,32 +772,41 @@ local function build_system_prompt()
   local uptime = safe_call(computer.uptime) or 0
   local free_mem = safe_call(computer.freeMemory) or 0
 
-  return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, execute Lua code, list connected hardware components, and run shell commands.\n\n"
+  return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Available tools:\n"
     .. "- read_file: Read file contents at the given path\n"
     .. "- write_file: Write content to a file\n"
     .. "- list_directory: List files in a directory\n"
-    .. "- execute_lua: Execute Lua code in the OpenOS environment (use require(), component, robot, etc.)\n"
+    .. "- json_query: Extract a value from a JSON string using a dot path (e.g. 'hits.0.title'). Use to parse component_invoke, web_search or file contents.\n"
+    .. "- calc: Evaluate a safe arithmetic expression (sqrt, abs, floor, ceil, min, max, + - * / % ^)\n"
+    .. "- text_ops: String manipulation: find, replace, split, slice, upper, lower, trim, length\n"
     .. "- component_list: List connected OpenComputers components\n"
     .. "- component_doc: Get documentation for a component's methods (list methods or read one method's doc)\n"
     .. "- component_invoke: Call a method on a component (after checking component_doc)\n"
     .. "- web_search: Search the web for information (titles, URLs, snippets). Uses Tavily if configured, Hacker News otherwise.\n"
     .. "- shell_execute: Run an OpenOS shell command\n\n"
-    .. "You have full access to the OpenComputers environment. You can extend your own capabilities by writing new Lua scripts via write_file and loading them with execute_lua using require().\n\n"
+    .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
     .. "When exploring hardware, use this workflow:\n"
     .. "1. component_list to discover components\n"
     .. "2. component_doc(address) to learn what methods a component has\n"
-    .. "3. component_doc(address, method) for method details, then component_invoke to call it\n"
-    .. "You can also use execute_lua for complex logic, component.proxy() for convenience access, and component.doc() to query documentation from Lua.\n\n"
-    .. "When writing Lua code for execute_lua, remember:\n"
-    .. "- You MUST yield periodically in loops (use os.sleep(0)) to avoid the computer crashing\n"
-    .. "- Use require() to access OpenOS libraries\n"
-    .. "- Use component.proxy() or component.list() to interact with hardware\n"
-    .. "- Memory is limited; keep code efficient\n\n"
+    .. "3. component_doc(address, method) for method details, then component_invoke to call it\n\n"
     .. "Current computer address: " .. tostring(address) .. "\n"
     .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
     .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
     .. "Connected components:\n" .. table.concat(comp_list, "\n")
+end
+
+local function build_headers(config)
+  local headers = {
+    ["Content-Type"] = "application/json",
+  }
+  -- Only send auth when a real key is configured. Some free endpoints
+  -- (e.g. OpenCode Zen free models) reject invalid bearer tokens with 401
+  -- but accept requests without an Authorization header.
+  if config.api_key and config.api_key ~= "" and config.api_key ~= "free" then
+    headers["Authorization"] = "Bearer " .. config.api_key
+  end
+  return headers
 end
 
 local function chat(messages, config)
@@ -595,15 +826,7 @@ local function chat(messages, config)
     temperature = 0.7
   })
 
-  local headers = {
-    ["Content-Type"] = "application/json",
-  }
-  -- Only send auth when a real key is configured. Some free endpoints
-  -- (e.g. OpenCode Zen free models) reject invalid bearer tokens with 401
-  -- but accept requests without an Authorization header.
-  if config.api_key and config.api_key ~= "" and config.api_key ~= "free" then
-    headers["Authorization"] = "Bearer " .. config.api_key
-  end
+  local headers = build_headers(config)
 
   local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions", headers, body)
   if err then
@@ -634,6 +857,97 @@ local function chat(messages, config)
   }
 end
 
+-- ── Section 5.5: Conversation Compaction ───────────────────────
+
+-- forward declaration: msg_bytes is defined in Section 6
+local msg_bytes
+
+local COMPACT_KEEP = 4          -- recent messages kept verbatim after compaction
+local COMPACT_TRIGGER_COUNT = 16  -- auto-compact when history exceeds this many messages
+local COMPACT_TRIGGER_BYTES = 40000 -- ... or this many bytes (of the 50KB budget)
+
+-- Ask the LLM to summarize older messages. Independent minimal request
+-- (no tools, no system prompt) so it can't recurse into compaction.
+-- Returns summary string or nil on any failure.
+local function summarize_history(messages, config)
+  local transcript_parts = {}
+  for _, m in ipairs(messages) do
+    local role = m.role or "?"
+    local content = ""
+    if m.content and m.content ~= "" then
+      content = m.content
+    elseif m.tool_calls then
+      local names = {}
+      for _, tc in ipairs(m.tool_calls) do
+        names[#names + 1] = (tc["function"] and tc["function"].name) or "?"
+      end
+      content = "[tool_calls: " .. table.concat(names, ", ") .. "]"
+    elseif m.role == "tool" then
+      content = tostring(m.content):sub(1, 200)
+    end
+    if content ~= "" then
+      transcript_parts[#transcript_parts + 1] = role .. ": " .. content
+    end
+  end
+  local transcript = table.concat(transcript_parts, "\n")
+  -- Cap what we send to the summarizer
+  if #transcript > 12000 then
+    transcript = transcript:sub(1, 12000) .. "\n...[truncated]"
+  end
+
+  local body = json.encode({
+    model = config.model or "deepseek-v4-flash-free",
+    messages = {
+      {role = "system", content = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Summarize the following conversation, keeping: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble."},
+      {role = "user", content = "Summarize this conversation:\n\n" .. transcript}
+    },
+    max_tokens = 1024,
+    temperature = 0.2
+  })
+
+  local headers = build_headers(config)
+  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions", headers, body)
+  if err then return nil end
+  if not code or code ~= 200 then return nil end
+  local data, derr = json.decode(resp)
+  if not data then return nil end
+  local choice = data.choices and data.choices[1]
+  if not choice then return nil end
+  local summary = choice.message and choice.message.content
+  if not summary or summary == "" then return nil end
+  return summary
+end
+
+-- Compact: replace older messages with an LLM summary, keep recent verbatim.
+-- Returns new message list on success, nil on failure (caller falls back to trim).
+local function compact_history(messages, config)
+  if #messages <= COMPACT_KEEP + 1 then return nil end
+  local old = {}
+  for i = 1, #messages - COMPACT_KEEP do
+    old[#old + 1] = messages[i]
+  end
+  local summary = summarize_history(old, config)
+  if not summary then return nil end
+
+  local result = {{role = "system", content = "[对话摘要] " .. summary}}
+  for i = #messages - COMPACT_KEEP + 1, #messages do
+    result[#result + 1] = messages[i]
+  end
+  return result
+end
+
+-- Decide whether compaction is worthwhile before trimming
+local function should_compact(messages)
+  if #messages <= COMPACT_KEEP + 1 then return false end
+  if #messages >= COMPACT_TRIGGER_COUNT then return true end
+  local total = 0
+  for _, m in ipairs(messages) do
+    total = total + msg_bytes(m)
+    if total >= COMPACT_TRIGGER_BYTES then return true end
+  end
+  return false
+end
+
 -- ── Section 6: Config & History ────────────────────────────────
 
 local CONFIG_PATH = "/home/agent_config.txt"
@@ -642,7 +956,7 @@ local MAX_HISTORY = 20
 local MAX_HISTORY_BYTES = 50000  -- ~50KB budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap for history persistence
 
-local function msg_bytes(msg)
+msg_bytes = function(msg)
   local total = 0
   if type(msg.content) == "string" then total = total + #msg.content end
   if type(msg.tool_calls) == "table" then
@@ -780,6 +1094,49 @@ local function handle_command(cmd, config, messages)
     else
       print("API URL: " .. config.api_url)
     end
+  elseif command == "/new" then
+    -- Archive current session, start fresh (config kept)
+    if #messages > 0 then
+      local fs = require("filesystem")
+      local ok_dir, dir_err = pcall(fs.makeDirectory, "/home/sessions")
+      if not ok_dir then print("Note: cannot create /home/sessions (" .. tostring(dir_err) .. ")") end
+      local stamp = tostring(os.time and pcall(os.time) and (select(2, pcall(os.time)) or "") or "")
+      if stamp == "" then
+        local comp = require("computer")
+        stamp = string.format("%.0f", comp.uptime() or 0)
+      end
+      local archive_path = "/home/sessions/agent_history_" .. stamp .. ".txt"
+      local ok_save, save_err = pcall(function()
+        local f = io.open(archive_path, "w")
+        if not f then error("cannot open " .. archive_path) end
+        f:write(require("serialization").serialize(messages))
+        f:close()
+      end)
+      if ok_save then
+        print("Session archived to " .. archive_path)
+      else
+        print("Session archive failed: " .. tostring(save_err))
+      end
+    else
+      print("No messages to archive")
+    end
+    messages = {}
+    save_history(messages)
+    print("New session started")
+  elseif command == "/compact" then
+    if #messages == 0 then
+      print("Nothing to compact")
+    else
+      print("Compacting conversation...")
+      local compacted = compact_history(messages, config)
+      if compacted then
+        messages = compacted
+        save_history(messages)
+        print("Compacted: " .. #messages .. " messages kept (summary + recent)")
+      else
+        print("Compaction failed (network or model error); conversation unchanged")
+      end
+    end
   elseif command == "/reset" then
     messages = {}
     save_history(messages)
@@ -791,7 +1148,7 @@ local function handle_command(cmd, config, messages)
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
   elseif command == "/help" then
-    print("Commands: /model /key /url /tavily /reset /hist /tools /help /exit")
+    print("Commands: /model /key /url /tavily /new /compact /reset /hist /tools /help /exit")
   elseif command == "/exit" then
     return true, config, messages
   else
@@ -834,6 +1191,16 @@ local function main()
     term_history[#term_history + 1] = input
     if #term_history > 50 then
       table.remove(term_history, 1)  -- keep terminal history bounded
+    end
+    -- Auto-compact before trimming when history gets large: summarize old
+    -- context instead of dropping it. Falls back to trim on failure.
+    if should_compact(messages) then
+      io.write("Compacting conversation...\r")
+      local compacted = compact_history(messages, config)
+      if compacted then
+        messages = compacted
+        save_history(messages)
+      end
     end
     messages = trim_history(messages)
     save_history(messages)  -- persist user message immediately
@@ -898,6 +1265,9 @@ if _TEST_MODE then
     http_post = http_post,
     build_system_prompt = build_system_prompt,
     trim_history = trim_history,
+    compact_history = compact_history,
+    should_compact = should_compact,
+    summarize_history = summarize_history,
     TOOLS = TOOLS,
   }
 end
