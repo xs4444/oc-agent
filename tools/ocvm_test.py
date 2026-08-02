@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+ocvm_test.py — 在 ocvm 模拟器中运行 agent.lua 测试脚本的驱动工具。
+
+用法:
+    python tools/ocvm_test.py <test_script.lua> [脚本参数...]
+    python tools/ocvm_test.py test_harness/newfeat_test.lua
+
+行为:
+    1. 重启干净的 ocvm 虚拟机 (tmux 会话 ocvm_t)
+    2. 等 OpenOS 启动 (健康检查: 屏幕出现提示符)
+    3. 上传 agent.lua + 测试脚本到所有挂载盘
+    4. marker 探测哪个挂载包含 agent.lua (短名每次重启都变)
+    5. 在 OpenOS 中运行测试脚本
+    6. 宿主机侧轮询结果文件 (比屏幕轮询可靠)
+    7. 输出结果
+
+环境: 需要服务器 192.168.31.75 (hcj/hcj2005) 上的 ocvm 构建。
+"""
+import sys
+import time
+import re
+import os
+import paramiko
+
+HOST = "192.168.31.75"
+USER = "hcj"
+PASS = "hcj2005"
+SESSION = "ocvm_t"
+VM_DIR = "~/oc-test/ocvm"
+TMP_DIR = "tmp_t"
+BOOT_WAIT = 50
+RESULT_POLL_INTERVAL = 5
+RESULT_TIMEOUT = 400
+
+# 测试脚本写结果文件的约定: <script>.txt 或 <script>_result.txt
+# (capability_one 例外, 写 cap_<task>.txt)
+def result_file_name(script):
+    base = os.path.basename(script)
+    stem = base.rsplit(".", 1)[0]
+    if stem.startswith("capability_one"):
+        return "cap_*.txt"
+    return f"{stem}_result.txt"
+
+
+class OcvmDriver:
+    def __init__(self, ssh):
+        self.ssh = ssh
+
+    def run(self, cmd, timeout=30):
+        chan = self.ssh.get_transport().open_session()
+        chan.settimeout(timeout)
+        chan.exec_command(cmd)
+        time.sleep(1.0)
+        out = b""
+        while True:
+            while chan.recv_ready():
+                out += chan.recv(4096)
+            if chan.exit_status_ready():
+                break
+            time.sleep(0.3)
+        while chan.recv_ready():
+            out += chan.recv(4096)
+        return chan.recv_exit_status(), out.decode(errors="replace")
+
+    def screen(self):
+        return self.run(f"tmux capture-pane -t {SESSION} -p 2>/dev/null | grep -v '^$'", timeout=10)[1]
+
+    def send(self, keys, enter=True):
+        self.run(f"tmux send-keys -t {SESSION} -l {keys!r}", timeout=10)
+        if enter:
+            self.run(f"tmux send-keys -t {SESSION} Enter", timeout=10)
+
+    def restart_vm(self):
+        self.run(f"tmux kill-session -t {SESSION} 2>/dev/null")
+        self.run(f"rm -rf {VM_DIR}/{TMP_DIR}; mkdir -p {VM_DIR}/{TMP_DIR}")
+        self.run(f"cd {VM_DIR} && tmux new-session -d -s {SESSION} -x 200 -y 50 './ocvm {TMP_DIR}'", timeout=15)
+        print(f"[ocvm] booting, waiting up to {BOOT_WAIT}s for OpenOS...")
+        for _ in range(BOOT_WAIT // 2):
+            time.sleep(2)
+            if "OpenOS" in self.screen():
+                print("[ocvm] OpenOS banner detected")
+                break
+        # 等提示符就绪
+        for _ in range(30):
+            time.sleep(1)
+            s = self.screen()
+            if re.search(r"/home\s*#", s):
+                print("[ocvm] shell ready")
+                return
+        print("[ocvm] WARNING: shell prompt not detected, continuing anyway")
+
+    def upload(self, files):
+        status, out = self.run(f"ls -d {VM_DIR}/{TMP_DIR}/*/", timeout=10)
+        dirs = [l.strip() for l in out.split() if l.strip().startswith("/")]
+        print(f"[ocvm] mounts on host: {[d.split('/')[-1][:8] for d in dirs]}")
+        sftp = self.ssh.open_sftp()
+        for d in dirs:
+            for f in files:
+                sftp.put(f, d + os.path.basename(f))
+        sftp.close()
+        print(f"[ocvm] uploaded {len(files)} file(s) to {len(dirs)} mount(s)")
+
+    def find_agent_mount(self):
+        """探测含 agent.lua 的挂载短名 (每次重启会变)。"""
+        self.send("ls /mnt")
+        time.sleep(2)
+        s = self.screen()
+        cands = []
+        for line in s.splitlines():
+            line = line.strip()
+            if line.endswith("ls /mnt"):
+                continue
+            if re.fullmatch(r"[a-f0-9]{2,4}(\s+[a-f0-9]{2,4})?", line):
+                cands = line.split()
+                break
+        print(f"[ocvm] mount candidates: {cands}")
+        for t in cands:
+            self.send(f"echo PROBE{t}")
+            time.sleep(1)
+            self.send(f"ls /mnt/{t}/agent.lua")
+            time.sleep(1.5)
+            s2 = self.screen()
+            idx = s2.rfind(f"PROBE{t}")
+            seg = s2[idx:] if idx >= 0 else s2
+            if f"PROBE{t}" in seg and "cannot access" not in seg:
+                return t
+        return None
+
+    def run_script(self, mount, script_path, script_args):
+        """在 OpenOS 中运行测试脚本。首个参数固定传挂载路径 (脚本约定
+        用它作为 dofile agent.lua 的 base)，后续参数为脚本自定义参数。"""
+        mount_arg = f"/mnt/{mount}"
+        args = f"{mount_arg} {script_args}".rstrip()
+        self.send(f"lua /mnt/{mount}/{os.path.basename(script_path)} {args}")
+        print(f"[ocvm] launched: lua /mnt/{mount}/{os.path.basename(script_path)} {args}")
+
+    def wait_result(self, script_path, extra_result_names=()):
+        """宿主机侧轮询结果文件。返回内容或 None。"""
+        stem = os.path.basename(script_path).rsplit(".", 1)[0]
+        names = [result_file_name(script_path), stem + ".txt"] + list(extra_result_names)
+        pattern = " -o ".join(f"-name '{n}'" for n in names) or "-name result.txt"
+        for _ in range(RESULT_TIMEOUT // RESULT_POLL_INTERVAL):
+            time.sleep(RESULT_POLL_INTERVAL)
+            status, out = self.run(f"find {VM_DIR}/{TMP_DIR} -type f \\( {pattern} \\) -exec cat {{}} \\;", timeout=10)
+            if out.strip():
+                return out
+        return None
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    script_path = sys.argv[1]
+    script_args = " ".join(sys.argv[2:])
+    if not os.path.exists(script_path):
+        print(f"test script not found: {script_path}")
+        sys.exit(1)
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(HOST, username=USER, password=PASS, timeout=15)
+
+    d = OcvmDriver(ssh)
+    d.restart_vm()
+    # 测试脚本依赖 agent.lua (dofile)，必须一起上传
+    agent = os.path.join(os.path.dirname(os.path.abspath(script_path)), "..", "agent.lua")
+    agent = os.path.normpath(agent)
+    files = [agent] if os.path.exists(agent) else []
+    files.append(os.path.abspath(script_path))
+    d.upload(files)
+    mount = d.find_agent_mount()
+    if not mount:
+        print("[ocvm] FAILED: no mount contains agent.lua")
+        print(d.screen()[-1500:])
+        ssh.close()
+        sys.exit(1)
+    print(f"[ocvm] agent mount: {mount}")
+
+    d.run_script(mount, script_path, script_args)
+
+    # 等待 DONE 或结果文件
+    result = d.wait_result(script_path)
+    print("--- final screen ---")
+    print("\n".join(d.screen().splitlines()[-30:]))
+    if result:
+        print("=== RESULTS ===")
+        print(result)
+    else:
+        print("[ocvm] NO RESULT FILE (timeout)")
+        sys.exit(1)
+    ssh.close()
+
+
+if __name__ == "__main__":
+    main()
