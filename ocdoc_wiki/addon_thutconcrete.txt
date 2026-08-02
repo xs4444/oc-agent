@@ -1,9 +1,0 @@
-Thut's Concrete
-=============
-[[http://www.minecraftforum.net/forums/mapping-and-modding/minecraft-mods/wip-mods/1444197-1-7-2-forge-thuts-mods-elevators-concrete-and|Thut's Concrete]] currently provides one Component, the Elevator component.
-
-Contents
------------
-{{page>:addon:thutconcrete:contents&noheader&noeditbutton&nouser&nofooter}}
-
-{{page>:addon:contents&noheader&noeditbutton&nouser&nofooter}}

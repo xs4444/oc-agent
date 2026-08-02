@@ -1,0 +1,33 @@
+Autorun Options
+================
+
+Access points for automatic program execution on boot:
+
+1. **Interactive Shell Startup (.shrc)**
+   - Edit `/home/.shrc` - each line runs as shell command
+   - Runs each time the shell loads (may be more than once per boot)
+   - Only runs when shell/gpu/screen are available
+
+2. **Runscripts (rc)**
+   - `/etc/rc.d/<name>.lua` with `function start() end`
+   - `rc <name> enable` to autostart at boot
+   - Starts even WITHOUT shell/gpu/screen/keyboard
+   - Config in `/etc/rc.cfg`
+   - Best option for headless/daemon services
+
+3. **Filesystem Autorun (autorun.lua)**
+   - Create `autorun.lua` or `.autorun.lua` at filesystem root
+   - Runs each time the filesystem component is added
+   - Can be disabled: `filesystem.setAutorunEnabled(false)`
+
+4. **Boot Scripts (/boot/)**
+   - NOT recommended - may run before core libraries are available
+   - If needed, prefix with `99_` to load last
+
+Background vs Foreground:
+- Use threads for long-running background tasks
+- Use event listeners/timers for lightweight responders
+- Threads: ~5k RAM each, non-blocking, independent event registrations
+- Event registrants: ~400 bytes, but blocking (share init thread)
+
+For agent service: Use rc script with thread.create():detach()

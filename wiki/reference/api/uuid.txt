@@ -1,0 +1,7 @@
+UUID API
+---------
+(new in OpenOS 1.6)
+
+- `uuid.next(): string` - Returns 128-bit random identifier as hex string
+  e.g. `34eb7b28-14d3-4767-b326-dd1609ba92e`
+  Same format as component addresses.

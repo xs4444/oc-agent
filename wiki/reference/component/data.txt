@@ -1,0 +1,24 @@
+Component: Data
+===============
+Provided by Data Card. Component name: `data`.
+
+Tier 1 Callbacks:
+- `crc32(data:string):string` - CRC-32 hash, binary format
+- `decode64(data:string):string` - Base64 decode
+- `encode64(data:string):string` - Base64 encode, binary format
+- `md5(data:string):string` - MD5 hash, binary format
+- `sha256(data:string):string` - SHA2-256 hash, binary format
+- `deflate(data:string):string` - Deflate compression
+- `inflate(data:string):string` - Inflate decompression
+- `getLimit():number` - Max data size for other functions
+
+Tier 2 Callbacks:
+- `encrypt(data:string, key:string, iv:string):string` - AES encryption
+- `decrypt(data:string, key:string, iv:string):string` - AES decryption
+- `random(len:number):string` - Random binary string
+
+Tier 3 Callbacks:
+- `generateKeyPair([bitLen:number]):table, table` - EC key pair (256 or 384 bits)
+- `ecdsa(data:string, key:userdata[, sig:string]):string or boolean` - Sign/verify
+- `ecdh(privateKey:userdata, publicKey:userdata):string` - Diffie-Hellman shared key
+- `deserializeKey(data:string, type:string):table` - Deserialize key from string

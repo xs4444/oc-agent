@@ -1,0 +1,48 @@
+Signals Reference
+======
+
+Computer
+--------
+- `component_added(address: string, componentType: string)` - New component attached
+- `component_removed(address: string, componentType: string)` - Component removed
+- `component_available(componentType: string)` - Primary component added (preferred over component_added)
+- `component_unavailable(componentType: string)` - Primary component removed (preferred over component_removed)
+- `term_available()` - Both GPU and screen available
+- `term_unavailable()` - GPU or screen unavailable
+
+Screen
+------
+- `screen_resized(screenAddress: string, newWidth: number, newHeight: number)`
+- `touch(screenAddress: string, x: number, y: number, button: number, playerName: string)` - Screen click (tier 2+)
+- `drag(screenAddress: string, x: number, y: number, button: number, playerName: string)` - Screen drag
+- `drop(screenAddress: string, x: number, y: number, button: number, playerName: string)` - Mouse release
+- `scroll(screenAddress: string, x: number, y: number, direction: number, playerName: string)` - Mouse wheel
+- `walk(screenAddress: string, x: number, y: number[, playerName: string])` - Entity walks on screen
+
+Keyboard
+--------
+- `key_down(keyboardAddress: string, char: number, code: number, playerName: string)`
+- `key_up(keyboardAddress: string, char: number, code: number, playerName: string)`
+- `clipboard(keyboardAddress: string, value: string, playerName: string)` - Paste from clipboard
+
+Redstone
+--------
+- `redstone_changed(address: string, side: number, oldValue: number, newValue: number[, color: number])`
+
+Motion Sensor
+-------------
+- `motion(address:string, relativeX:number, relativeY:number, relativeZ:number[, entityName:string])`
+
+Network Cards
+-------------
+- `modem_message(receiverAddress: string, senderAddress: string, port: number, distance: number, ...)`
+
+Robot
+-----
+- `inventory_changed(slot: number)`
+
+Internet
+--------
+- `internet_ready(socketId: string)` - Data available on TCP socket (after finishConnect or read)
+
+HTTP response signals are handled internally by the internet library.

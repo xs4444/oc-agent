@@ -1,0 +1,14 @@
+Component: EEPROM
+===================
+Component name: `eeprom`. Provided by EEPROM item.
+
+- `get():string` - Get stored byte array (the BIOS code)
+- `set(data:string)` - Overwrite stored byte array
+- `getLabel():string` - Get label
+- `setLabel(data:string)` - Set label
+- `getSize():number` - Max storage capacity
+- `getDataSize():number` - Max data storage capacity
+- `getData():string` - Get stored data (usually boot device address)
+- `setData(data:string)` - Set stored data
+- `getChecksum():string` - Checksum of data
+- `makeReadonly(checksum:string):boolean` - Make read-only (irreversible)

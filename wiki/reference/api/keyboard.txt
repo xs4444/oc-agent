@@ -1,0 +1,8 @@
+Keyboard API
+===========
+- `keyboard.keys` - Two-directional table: keyboard.keys.numpad0 = 0x52, keyboard.keys[0x52] = "numpad0"
+- `keyboard.isAltDown(): boolean`
+- `keyboard.isControl(char: number): boolean` - Checks if char is a control character
+- `keyboard.isControlDown(): boolean`
+- `keyboard.isKeyDown(charOrCode: any): boolean`
+- `keyboard.isShiftDown(): boolean`

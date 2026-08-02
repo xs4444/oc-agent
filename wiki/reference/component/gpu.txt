@@ -1,0 +1,24 @@
+Component: GPU
+==============
+Component name: `gpu`. Provided by graphics cards.
+
+Key callbacks for agent:
+- `bind(address: string[, reset: boolean=true]): boolean[, string]` - Bind to screen
+- `getScreen():string` - Get bound screen address
+- `getBackground(): number, boolean` - Get bg color (0xRRGGBB, isPalette)
+- `setBackground(color: number[, isPaletteIndex: boolean]): number[, index]`
+- `getForeground(): number, boolean`
+- `setForeground(color: number[, isPaletteIndex: boolean]): number[, index]`
+- `maxResolution(): number, number` - Max width, height
+- `getResolution(): number, number` - Current width, height
+- `setResolution(width: number, height: number): boolean`
+- `get(x: number, y: number): string, number, number, number or nil, number or nil` - Get char + colors
+- `set(x: number, y: number, value: string[, vertical:boolean]): boolean` - Write string
+- `copy(x, y, width, height, tx, ty): boolean` - Copy screen region
+- `fill(x, y, width, height, char: string): boolean` - Fill rectangle
+- `maxDepth(): number` - Max color depth (1/4/8)
+- `getDepth(): number` - Current depth
+- `setDepth(bit: number): string` - Set depth
+
+Color depths: 1 bit (2 colors), 4 bit (16 colors), 8 bit (256 colors)
+Color format: 0xRRGGBB (24-bit RGB), auto-approximated to available depth

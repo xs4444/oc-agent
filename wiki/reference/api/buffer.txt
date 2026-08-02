@@ -1,0 +1,21 @@
+Buffer API - Instance Methods
+===========
+(Only instance methods documented - the ones you get from io.open)
+
+- `b:flush()` - If any data is buffered it is immediately written to the stream and released.
+- `b:close()` - Flushes the buffer and closes the wrapped stream.
+- `b:setvbuf([mode: string], [size: number])` - Sets buffering mode and size. Modes: "no" (immediate), "full" (buffered up to size, default), "line" (buffered until newline or size).
+- `b:write([values...])` - Writes each value to the stream, first buffering based on mode/size.
+- `b:lines([line_formats...])` - Returns function iterator reading from stream.
+- `b:read([formats...])` - Advanced reader supporting formats:
+    * number: Read n bytes (binary) or chars (text)
+    * "*n": Read next number from stream
+    * "*l": Read next line, chop line ending
+    * "*L": Read next line, preserve line ending
+    * "*a": Read all remaining data
+- `b:getTimeout()` - Returns current timeout in seconds (default: math.huge)
+- `b:setTimeout(timeout)` - Sets read timeout in seconds
+- `b:seek([whence], [offset])` - Move stream position. whence: "cur", "set", "end"
+
+Static:
+- `buffer.new([mode: string], stream: table)` - Creates new buffered stream. mode: r/rw/w.

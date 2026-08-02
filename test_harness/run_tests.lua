@@ -26,8 +26,9 @@ package.loaded["serialization"] = oc_mock.serialization
 _TEST_MODE = true
 
 -- Load the agent
-print("Loading agent.lua...")
-local ok, err = pcall(dofile, "../agent.lua")
+local agent_path = arg and arg[1] or "../agent.lua"
+print("Loading agent.lua from " .. agent_path .. "...")
+local ok, err = pcall(dofile, agent_path)
 if not ok then
   print("AGENT LOAD FAILED:")
   print(err)
@@ -222,6 +223,30 @@ test_tool("component_list no match", "component_list", '{"filter":"xyzzy"}',
 
 test_tool("unknown tool", "unknown_tool", '{}',
   function(r) return r:find("Unknown tool") ~= nil end)
+
+-- web_search tests (HN Algolia fallback, no tavily key configured)
+test_tool("web_search hn", "web_search", '{"query":"gtnh"}',
+  function(r) return r:find("Result 1 for gtnh") ~= nil and r:find("example.com/1") ~= nil end)
+test_tool("web_search limit", "web_search", '{"query":"lua","limit":1}',
+  function(r) return r:find("Result 1 for lua") ~= nil and not r:find("Result 2") end)
+test_tool("web_search empty query", "web_search", '{"query":""}',
+  function(r) return r:find("query is required") ~= nil end)
+
+-- component_doc tests
+test_tool("component_doc list methods", "component_doc", '{"address":"babe1234"}',
+  function(r) return r:find("getInput") ~= nil and r:find("Type: redstone") ~= nil end)
+test_tool("component_doc single method", "component_doc", '{"address":"babe1234","method":"setOutput"}',
+  function(r) return r:find("setOutput") ~= nil end)
+test_tool("component_doc unknown addr", "component_doc", '{"address":"zzzz"}',
+  function(r) return r:find("unknown component") ~= nil end)
+
+-- component_invoke tests
+test_tool("component_invoke redstone", "component_invoke", '{"address":"babe1234","method":"getInput","args":[0]}',
+  function(r) return r == "15" end)
+test_tool("component_invoke gpu", "component_invoke", '{"address":"e1e2e3e4","method":"getResolution"}',
+  function(r) return r == "80\n25" end)
+test_tool("component_invoke unknown", "component_invoke", '{"address":"zzzz","method":"ping"}',
+  function(r) return r:find("unknown component") ~= nil end)
 
 -- Test write_file + read_file roundtrip
 local fpath = "test_agent_temp.txt"

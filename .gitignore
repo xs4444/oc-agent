@@ -5,11 +5,9 @@ __pycache__/
 
 # 大型/二进制目录（模拟器、便携环境、模组数据）
 emulators/
-oc_emulators/
 pi/
 opencomputers/
 lua_portable/
-lua_bin.zip
 
 # 临时输出与杂项
 err.txt
@@ -19,8 +17,9 @@ nul
 # opencode 运行时（会话历史、临时状态）
 .opencode/
 
-# 缓存
-wiki_cache/
+# wiki 镜像（如需纳入版本控制，删除下面两行）
+wiki/raw/
+wiki/markdown/
 
-# 根目录测试截图（保留 ocdoc_md/media/ 下的转换图片）
+# 根目录测试截图
 /*.png

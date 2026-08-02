@@ -1,4 +1,0 @@
-Carpeted Capacitor
-==============================
-
-This page is a stub. Refer to [[https://github.com/MightyPirates/OpenComputers/releases/tag/v1.7.2|1.7.2 release notes]] for details on how to use Carpeted Capacitors for power generation.

@@ -1,0 +1,19 @@
+Computer Case
+=============
+4 tiers (only 3 craftable in survival).
+
+Tier 1:
+- 1 EEPROM, 1 Tier 1 CPU, 2 Tier 1 RAM, 1 Tier 1 HDD, 2 Tier 1 Cards
+
+Tier 2:
+- 1 EEPROM, 1 Tier 2 CPU, 2 Tier 2 RAM, 1 Tier 1 HDD + 1 Tier 2 HDD, 1 Tier 1 Card + 1 Tier 2 Card
+- **Internet Card (Tier 2) fits here** - agent needs Tier 2 case minimum
+
+Tier 3:
+- 1 EEPROM, 1 Tier 3 CPU, 2 Tier 3 RAM, 1 Tier 2 HDD + 1 Tier 3 HDD, 2 Tier 2 Cards + 1 Tier 3 Card, 1 Floppy
+
+Tier 4 (Creative only):
+- 1 EEPROM, 1 Tier 3 CPU, 2 Tier 3 RAM, 2 Tier 3 HDD, 3 Tier 3 Cards, 1 Floppy
+- Spawn with /oc_sc (needs OP 2 on multiplayer)
+
+For agent: Tier 2 case minimum (for Tier 2 card slot for Internet Card)

@@ -1,0 +1,12 @@
+Component: Computer
+==================
+Component name: `computer`. Can only be called by self or direct neighbors.
+
+- `start(): boolean` - Start computer (false if already running)
+- `stop(): boolean` - Stop computer
+- `isRunning(): boolean` - Check if running
+- `beep([frequency:number[, duration:number]])` - Play tone (20-2000Hz, up to 5s)
+- `getDeviceInfo(): table` - Architecture-specific device info
+- `crash(reason: string)` - Crash the computer
+- `getArchitecture(): string` - Current architecture
+- `isRobot(): boolean` - Whether this is a robot

@@ -1,0 +1,29 @@
+Thread API
+===========
+OpenOS threads are autonomous, non-blocking, detachable processes.
+
+Key properties:
+- **Autonomous**: Threads self-resume after yielding, unlike coroutines
+- **Non-Blocking**: event.pull in a thread only blocks that thread, not others
+- **Detachable**: Threads can outlive their parent process
+
+Static API (require("thread")):
+- `thread.create(thread_proc: function[, ...]): table` - Creates and starts a new thread
+- `thread.waitForAll(threads: table[, timeout: number]): boolean, string` - Waits for all threads
+- `thread.waitForAny(threads: table[, timeout: number]): boolean, string` - Waits for any thread
+- `thread.current(): table` - Returns current thread handle
+
+Thread Handle API:
+- `t:resume(): boolean, string` - Resumes a suspended thread
+- `t:suspend(): boolean, string` - Suspends a running thread
+- `t:kill()` - Kills the thread
+- `t:status(): string` - Returns "running", "suspended", or "dead"
+- `t:attach([level: number]): boolean, string` - Attaches to parent process
+- `t:detach(): table, string` - Detaches from parent (thread continues after parent exits)
+- `t:join([timeout: number]): boolean, string` - Blocks until thread finishes
+
+Event Registration Independence:
+- Each thread has its own event registrations
+- When a thread dies, its event registrations die with it
+- A suspended thread ignores events
+- A pushed event is observed by all running threads

@@ -1,0 +1,14 @@
+Sides API
+========
+Two-directional lookup: sides.top = 1, sides[1] = "top"
+
+Basic values:
+- bottom(0), top(1), back(2), front(3), right(4), left(5)
+
+Aliases:
+- Bottom: down, negy
+- Top: up, posy
+- Back: north, negz
+- Front: south, posz, forward
+- Right: west, negx
+- Left: east, posx
