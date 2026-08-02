@@ -1,0 +1,6 @@
+Internet Card Item
+===========
+Tier 2 card - requires Tier 2 (or higher) slot.
+Supports HTTP requests and TCP sockets (unless disabled in config).
+HTTPS is supported.
+Crafting: Interweb + Obsidian + Microchip (Tier 2) + Redstone Torch + Card Base

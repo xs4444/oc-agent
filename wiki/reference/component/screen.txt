@@ -1,0 +1,15 @@
+Component: Screen
+================
+Component name: `screen`.
+
+- `isOn():boolean` - Whether screen is on
+- `turnOn():boolean, boolean` - Turn on, returns wasOff, newState
+- `turnOff():boolean, boolean` - Turn off, returns wasOn, newState
+- `getAspectRatio():number, number` - Width x Height in blocks
+- `getKeyboards():table` - Attached keyboards
+- `setPrecise(enabled:boolean):boolean` - High-precision mouse (Tier 3 only)
+- `isPrecise():boolean` - Check precision mode
+- `setTouchModeInverted(enabled:boolean):boolean` - Invert touch mode
+- `isTouchModeInverted():boolean` - Check inverted mode
+
+Screen tiers affect resolution and color depth (see GPU).

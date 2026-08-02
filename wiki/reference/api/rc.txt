@@ -1,0 +1,22 @@
+RC API
+===========
+RC = "run command". Automates running scripts as services at boot.
+
+RC Scripts:
+- Place in `/etc/rc.d/<name>.lua`
+- Must define at least `function start() end` (global, not local)
+- Optional: `stop()`, `restart()`, any custom methods
+- Config in `/etc/rc.cfg` (e.g. `agent = {key="...", model="..."}`)
+- Access config via global `args` in script
+
+RC Controller CLI:
+- `rc` - Start all enabled scripts
+- `rc <name> enable` - Enable autostart at boot
+- `rc <name> disable` - Disable autostart
+- `rc <name> restart` - Call stop() then start()
+- `rc <name> <method> [args...]` - Call custom method
+
+RC API (require("rc")):
+- `unload(moduleName: string)` - Remove from cache
+
+Key: RC scripts start even on systems with no shell/gpu/screen/keyboard.

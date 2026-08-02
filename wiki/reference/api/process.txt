@@ -1,0 +1,9 @@
+Process API
+==========
+Rudimentary process management. Processes are coroutines with extra metadata (stdio, terminal).
+
+- `process.load(path:string[, env:table[, init:function[, name:string]]]):coroutine`
+  Loads a Lua script as a process. Since 1.6, path can be a function.
+- `process.info([level: number]): table`
+  Returns command, path, and other data. level=1 is current, 2 is parent, etc.
+- `process.running([level: number]): string, table, string` (deprecated, use process.info)

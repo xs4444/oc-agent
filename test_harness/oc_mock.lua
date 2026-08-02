@@ -85,6 +85,64 @@ function mock_component.getPrimary(typ)
   end
   error("no primary " .. typ)
 end
+function mock_component.get(addr, typ)
+  -- resolve abbreviated address
+  for full, t in pairs(OC._components) do
+    if full == addr or full:sub(1, #addr) == addr then
+      if not typ or t == typ then return full end
+    end
+  end
+  return nil, "no such component"
+end
+function mock_component.type(addr)
+  for full, t in pairs(OC._components) do
+    if full == addr or full:sub(1, #addr) == addr then return t end
+  end
+  return nil
+end
+function mock_component.methods(addr)
+  for full, t in pairs(OC._components) do
+    if full == addr or full:sub(1, #addr) == addr then
+      if t == "redstone" then
+        return {getInput = true, setOutput = true, getOutput = true, setBundledOutput = true}
+      elseif t == "internet" then
+        return {request = true, isHttpEnabled = true, isTcpEnabled = true, connect = true}
+      elseif t == "filesystem" then
+        return {list = true, exists = true, open = true, size = true}
+      elseif t == "gpu" then
+        return {bind = true, set = true, get = true, fill = true}
+      elseif t == "screen" then
+        return {isOn = true, turnOn = true, turnOff = true}
+      end
+      return {ping = true}
+    end
+  end
+  return nil
+end
+function mock_component.doc(addr, method)
+  for full, t in pairs(OC._components) do
+    if full == addr or full:sub(1, #addr) == addr then
+      return ("function %s(): %s method documentation"):format(method or "?", t)
+    end
+  end
+  return nil
+end
+function mock_component.invoke(addr, method, ...)
+  local resolved = mock_component.get(addr)
+  if not resolved then error("no such component: " .. tostring(addr)) end
+  local typ = mock_component.type(resolved)
+  if typ == "redstone" and method == "getInput" then
+    local side = ...
+    return 15
+  elseif typ == "internet" and method == "isHttpEnabled" then
+    return true
+  elseif typ == "gpu" and method == "getResolution" then
+    return 80, 25
+  elseif typ == "screen" and method == "isOn" then
+    return true
+  end
+  return 0
+end
 
 local mock_computer = {}
 function mock_computer.address() return OC._address end
@@ -153,6 +211,27 @@ function mock_internet.request(url, data, headers, method)
       end
     end
     error("file not found: " .. path)
+  end
+  -- Simulate HN Algolia search response
+  if url:match("^https://hn%.algolia%.com/") then
+    local q = url:match("query=([^&]+)") or "test"
+    local body = '{"hits":[{"title":"Result 1 for ' .. q .. '","url":"https://example.com/1","objectID":"1"},{"title":"Result 2 for ' .. q .. '","url":"https://example.com/2","objectID":"2"}],"nbHits":2}'
+    local started = false
+    return function()
+      if started then return nil end
+      started = true
+      return body
+    end
+  end
+  -- Simulate Tavily search response
+  if url:match("^https://api%.tavily%.com/") then
+    local body = '{"query":"' .. (data or "") .. '","results":[{"title":"Tavily Result 1","url":"https://tavily.example/1","content":"snippet one"},{"title":"Tavily Result 2","url":"https://tavily.example/2","content":"snippet two"}]}'
+    local started = false
+    return function()
+      if started then return nil end
+      started = true
+      return body
+    end
   end
   error("internet.mock: cannot handle " .. url)
 end

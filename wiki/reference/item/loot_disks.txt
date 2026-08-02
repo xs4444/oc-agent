@@ -1,0 +1,23 @@
+Loot Disks
+===========
+Craftable floppy disks. Insert into disk drive to automount filesystem.
+Run `install` to install programs to HDD.
+
+Available loot disks:
+- builder - Robot building program (plan files)
+- data - Data card tools (md5sum, deflate, inflate, gpg)
+- dig - Robot digging program
+- generator - Robot power management
+- internet - Internet card tools (wget, pastebin)
+- irc - Minimalistic IRC client
+- maze - Robot maze builder
+- network - LAN tools (ping, etc.)
+- openloader - Alternative bootloader
+- openos - Standard OS with installer
+- oppm - Package manager (crafted with floppy + interweb)
+- plan9k - Alternative OS by Magik6k
+
+Key for agent deployment:
+- Use `internet` loot disk for wget/pastebin to download agent.lua
+- Or craft custom loot disk by modifying OC source loot/ directory
+- Or copy via clipboard (Shift+Ins) in game

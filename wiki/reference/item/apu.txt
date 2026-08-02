@@ -1,0 +1,8 @@
+APU (Accelerated Processing Unit)
+==================================
+CPU + GPU combined. Frees up an expansion card slot.
+
+Tier 1 APU: Tier 2 CPU + Tier 1 GPU
+Tier 2 APU: Tier 3 CPU + Tier 2 GPU
+
+Useful for agent: APU saves a card slot, allowing Internet Card + another card.

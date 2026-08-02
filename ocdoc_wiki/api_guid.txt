@@ -1,4 +1,0 @@
-Guid API
----------
-
-Renamed to [[api:uuid|uuid]]

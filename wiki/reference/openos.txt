@@ -1,0 +1,22 @@
+OpenOS Installation
+====================
+
+Boot with OpenOS floppy + empty HDD → run `install` → reboot
+
+Key paths:
+- `/lib/` - System libraries
+- `/usr/lib/` - User libraries (custom libs go here)
+- `/home/` - User home directory
+- `/etc/rc.d/` - RC service scripts
+- `/etc/rc.cfg` - RC service configuration
+- `/etc/profile.lua` - Shell profile (loads aliases, env vars)
+- `/home/.shrc` - User shell startup commands
+- `/boot/` - Boot scripts (DO NOT MODIFY)
+- `/tmp/` - Temporary filesystem (cleared on reboot)
+- `/bin/` - System binaries
+- `/usr/bin/` - User binaries
+
+Filesystem notes:
+- rootfs from boot device, can be (ro) or (rw)
+- Additional filesystems auto-mounted in /mnt/<first3hex>/
+- `mount` command shows all filesystems

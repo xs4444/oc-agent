@@ -1,0 +1,15 @@
+Component: Drive (Unmanaged)
+================
+For raw disk access. Component name: `drive`.
+(Managed mode uses filesystem component instead)
+
+- `readByte(offset:number):number` - Read single byte at offset
+- `writeByte(offset:number, value:number)` - Write byte at offset
+- `getSectorSize():number` - Sector size in bytes
+- `getLabel():string` / `setLabel(value:string):string`
+- `readSector(sector:number):string` - Read sector contents
+- `writeSector(sector:number, value:string)` - Write sector
+- `getPlatterCount():number` - Number of platters
+- `getCapacity():number` - Total capacity in bytes
+
+Note: Switching to Unmanaged mode WIPES the drive.
