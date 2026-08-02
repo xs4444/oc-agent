@@ -12,11 +12,12 @@
 
 ## 功能一览
 
-- **11 个 LLM 工具**：`read_file` / `write_file` / `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute`
+- **13 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute`
 - **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
 - **数据处理工具集**：`json_query`（JSON 点路径提取）/ `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）替代了原 `execute_lua`，无任意代码执行风险
+- **文件工具族**：`read_file` 行切片（大文件只读目标区段，带行号；负 offset = tail）+ `edit_file`（精确替换，>20KB 拒绝）+ `append_file`（流式追加，内存与文件大小无关）——先查后改，适配 OC 1MB 内存
 - **联网搜索**：默认 HN Algolia（无 key），`/tavily <key>` 升级为通用搜索（含中文）
-- **上下文持久化**：每条消息/工具结果即时保存，崩溃可恢复；50KB 双预算裁剪防内存膨胀
+- **append-only 会话日志**：每条消息 JSON 单行追加（O(新增) 内存，替代整表重写 O(n²)）；启动重放 + 裁剪；旧格式自动迁移
 - **自动重试**：网络错误 / 429 / 5xx 自动重试（指数退避，最多 3 次），4xx 不重试
 - **对话压缩**：历史超限时自动用 LLM 生成摘要替换旧消息（保留最近 4 条），失败回退裁剪；`/compact` 手动触发
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）

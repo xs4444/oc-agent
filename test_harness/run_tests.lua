@@ -307,8 +307,61 @@ test_tool("write_file", "write_file", json.encode({path=fpath, content="test con
 test_tool("read_file", "read_file", json.encode({path=fpath}),
   function(r) return r == "test content 123" end)
 
+-- Multi-line file for line-slice tests
+local mpath = "test_lines_temp.txt"
+local ml = {}
+for i = 1, 10 do ml[i] = "line " .. i end
+test_tool("write multi-line", "write_file", json.encode({path=mpath, content=table.concat(ml, "\n")}),
+  function(r) return r:find("Written") ~= nil end)
+
+test_tool("read_file offset", "read_file", json.encode({path=mpath, offset=3}),
+  function(r) return r:find("^3%. line 3") ~= nil and r:find("10%. line 10") ~= nil and r:find("line 2") == nil end)
+
+test_tool("read_file offset+limit", "read_file", json.encode({path=mpath, offset=2, limit=3}),
+  function(r) return r:find("2%. line 2") ~= nil and r:find("4%. line 4") ~= nil and r:find("line 5") == nil end)
+
+test_tool("read_file tail", "read_file", json.encode({path=mpath, offset=-3}),
+  function(r) return r:find("8%. line 8") ~= nil and r:find("10%. line 10") ~= nil and r:find("line 7") == nil end)
+
+test_tool("read_file tail beyond", "read_file", json.encode({path=mpath, offset=-100}),
+  function(r) return r:find("1%. line 1") ~= nil end)
+
+test_tool("read_file offset beyond eof", "read_file", json.encode({path=mpath, offset=100}),
+  function(r) return r:find("no lines") ~= nil end)
+
+test_tool("read_file whole still works", "read_file", json.encode({path=mpath}),
+  function(r) return r == table.concat(ml, "\n") end)
+
+-- edit_file tests
+test_tool("edit_file replace", "edit_file", json.encode({path=fpath, old_string="test content", new_string="EDITED content"}),
+  function(r) return r:find("Replaced 1") ~= nil end)
+test_tool("edit_file applied", "read_file", json.encode({path=fpath}),
+  function(r) return r == "EDITED content 123" end)
+test_tool("edit_file not found", "edit_file", json.encode({path=fpath, old_string="zzz", new_string="x"}),
+  function(r) return r:find("not found") ~= nil end)
+test_tool("edit_file multi no replace_all", "edit_file", json.encode({path=mpath, old_string="line", new_string="row"}),
+  function(r) return r:find("10 times") ~= nil end)
+test_tool("edit_file replace_all", "edit_file", json.encode({path=mpath, old_string="line", new_string="row", replace_all=true}),
+  function(r) return r:find("Replaced 10") ~= nil end)
+test_tool("edit_file replace_all applied", "read_file", json.encode({path=mpath}),
+  function(r) return r:find("row 1") ~= nil and r:find("row 10") ~= nil and r:find("line 1") == nil end)
+test_tool("edit_file empty old", "edit_file", json.encode({path=fpath, old_string="", new_string="x"}),
+  function(r) return r:find("non%-empty") ~= nil end)
+
+-- append_file tests
+test_tool("append_file", "append_file", json.encode({path=fpath, content=" +appended"}),
+  function(r) return r:find("Appended") ~= nil end)
+test_tool("append_file applied", "read_file", json.encode({path=fpath}),
+  function(r) return r == "EDITED content 123 +appended" end)
+test_tool("append_file creates new", "append_file", json.encode({path="test_new_append.txt", content="hello"}),
+  function(r) return r:find("Appended") ~= nil end)
+test_tool("append_file new file content", "read_file", json.encode({path="test_new_append.txt"}),
+  function(r) return r == "hello" end)
+
 -- Cleanup
 os.remove(fpath)
+os.remove(mpath)
+os.remove("test_new_append.txt")
 
 test_tool("read_file not found", "read_file", '{"path":"/nonexistent/file.txt"}',
   function(r) return r:find("not found") ~= nil end)
@@ -398,8 +451,79 @@ test("TOOLS has json_query", tools_have["json_query"] == true)
 test("TOOLS has calc", tools_have["calc"] == true)
 test("TOOLS has text_ops", tools_have["text_ops"] == true)
 test("TOOLS no execute_lua", tools_have["execute_lua"] ~= true)
-test("TOOLS count is 11", #agent_test.TOOLS == 11,
+test("TOOLS has edit_file", tools_have["edit_file"] == true)
+test("TOOLS has append_file", tools_have["append_file"] == true)
+test("TOOLS count is 13", #agent_test.TOOLS == 13,
   "count=" .. tostring(#agent_test.TOOLS))
+
+print("")
+print("═══════════════════════════════════════")
+print("Append-only Session Log Tests")
+print("═══════════════════════════════════════")
+
+-- Session log: append single messages, replay via load_history, legacy migrate
+local hist_path = "test_history_temp.txt"
+local append_history = agent_test.append_history
+local load_history = agent_test.load_history
+local rebuild_history = agent_test.rebuild_history
+
+-- Redirect history storage to a local file for real round-trip testing
+os.remove(hist_path)
+agent_test.set_history_path(hist_path)
+
+-- append-only: three messages appended one at a time
+append_history({role = "user", content = "hello"})
+append_history({role = "assistant", content = "hi there"})
+append_history({role = "tool", tool_call_id = "x", content = "result"})
+
+local replayed = load_history()
+test("replay: 3 messages", #replayed == 3, "#=" .. tostring(#replayed))
+if #replayed == 3 then
+  test("replay msg1", replayed[1].role == "user" and replayed[1].content == "hello")
+  test("replay msg2", replayed[2].role == "assistant" and replayed[2].content == "hi there")
+  test("replay msg3", replayed[3].role == "tool" and replayed[3].tool_call_id == "x")
+end
+
+-- rebuild (compaction path): full rewrite shrinks the log
+rebuild_history({{role = "system", content = "[摘要] s"}, {role = "user", content = "q"}})
+local r2 = load_history()
+test("rebuild: 2 messages", #r2 == 2)
+test("rebuild content", r2[1].role == "system" and r2[2].content == "q")
+
+-- legacy format migration: serialize() whole-table file → JSON lines
+local ser = require("serialization")
+local legacy = "test_legacy_temp.txt"
+local lf = io.open(legacy, "w")
+lf:write(ser.serialize({{role = "user", content = "old1"}, {role = "user", content = "old2"}}))
+lf:close()
+agent_test.set_history_path(legacy)
+local r3 = load_history()
+test("legacy migrate: 2 messages", #r3 == 2 and r3[1].content == "old1" and r3[2].content == "old2")
+local migrated = io.open(legacy, "r")
+local migrated_content = migrated:read("*a")
+migrated:close()
+test("legacy migrated to JSON lines", migrated_content:find('"role"') ~= nil and migrated_content:find("%[") == nil)
+os.remove(legacy)
+
+-- corrupt line tolerance
+local corrupt = "test_corrupt_temp.txt"
+local cf = io.open(corrupt, "w")
+cf:write('{"role":"user","content":"ok"}\nTHIS IS NOT JSON\n{"role":"assistant","content":"also ok"}\n')
+cf:close()
+agent_test.set_history_path(corrupt)
+local r4 = load_history()
+test("corrupt line skipped", #r4 == 2 and r4[1].content == "ok" and r4[2].content == "also ok",
+  "#=" .. tostring(#r4))
+os.remove(corrupt)
+
+-- empty file → empty history
+local emptyf = "test_empty_temp.txt"
+local ef = io.open(emptyf, "w"); ef:close()
+agent_test.set_history_path(emptyf)
+test("empty file → empty history", #load_history() == 0)
+os.remove(emptyf)
+
+os.remove(hist_path)
 
 print("")
 print("═══════════════════════════════════════")
