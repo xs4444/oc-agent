@@ -251,6 +251,32 @@ end
 
 -- ── Section 3: Tool Definitions ────────────────────────────────
 
+-- Subagent protocol constants (used by the subagent_call tool below)
+local SUBAGENT_LISTEN_PORT = 9090  -- subagent's task intake port
+local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
+local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
+
+-- Wait for a modem_message event (with timeout). Returns
+-- (sender, port, arg1) or nil on timeout. Uses event.pull which yields.
+local function wait_modem_message(timeout, reply_port)
+  local event = require("event")
+  local waited = 0
+  local step = 0.5
+  while timeout == nil or waited < timeout do
+    local sig = {event.pull(step, "modem_message")}
+    if sig[1] == "modem_message" then
+      local sender = sig[3]
+      local port = sig[4]
+      -- sig[2] is receiver address, sig[3] sender, sig[4] port
+      if reply_port == nil or port == reply_port then
+        return sender, port, sig[6]
+      end
+    end
+    waited = waited + step
+  end
+  return nil
+end
+
 -- forward declaration: execute_tool (Section 4) calls load_config (Section 6)
 local load_config
 
@@ -269,6 +295,11 @@ local TOOLS = {
     name="append_file",
     description="Append content to the end of a file (creates it if missing). O(1) memory regardless of file size — use for logs, growing records, or adding to large files without reading them first.",
     parameters={type="object", properties={path={type="string", description="File path"}, content={type="string", description="Content to append"}}, required={"path", "content"}}
+  }},
+  {type="function", ["function"]={
+    name="subagent_call",
+    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from component_list filter='modem'), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate) and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research.",
+    parameters={type="object", properties={address={type="string", description="Target modem address (component_list filter='modem')"}, task={type="string", description="Task description for the subagent"}, role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
   }},
   {type="function", ["function"]={
     name="write_file",
@@ -665,6 +696,64 @@ function execute_tool(name, args_str)
     end)
     return ok and result or ("Error: " .. tostring(result))
 
+  elseif name == "subagent_call" then
+    local ok, result = pcall(function()
+      local comp = require("component")
+      local modem = comp.modem
+      if not modem then error("no modem (network card) component") end
+      local addr = args.address
+      if not addr or addr == "" then error("address is required") end
+      -- allow abbreviated address: resolve to full modem address
+      if #addr < 32 then
+        local full
+        for a, t in comp.list("modem") do
+          if a:sub(1, #addr) == addr then
+            full = a
+            break
+          end
+        end
+        if not full then error("no modem component matches address: " .. addr) end
+        addr = full
+      end
+
+      local request_tbl = {
+        v = 1,
+        id = string.format("%x", (os.clock and math.floor(os.clock() * 1e6)) or math.random(1, 1e9)),
+        role = args.role or "delegate",
+        task = args.task or "",
+        context = args.context or ""
+      }
+      local request = json.encode(request_tbl)
+      -- Cap request to fit the 8192-byte modem packet limit
+      if #request > 7800 then
+        request = json.encode({v = 1, id = request_tbl.id, role = request_tbl.role,
+          task = request_tbl.task:sub(1, 7000), context = request_tbl.context:sub(1, 500)})
+      end
+
+      -- listen for reply first, then send (avoids race: reply port must be open)
+      local m_ok = pcall(modem.open, SUBAGENT_REPLY_PORT)
+      if not m_ok then error("cannot open reply port " .. SUBAGENT_REPLY_PORT) end
+
+      local sent = pcall(modem.send, addr, SUBAGENT_LISTEN_PORT, request)
+      if not sent then error("modem.send failed (target reachable?)") end
+
+      local timeout = tonumber(args.timeout) or SUBAGENT_TIMEOUT
+      local sender, port, payload = wait_modem_message(timeout, SUBAGENT_REPLY_PORT)
+      pcall(modem.close, SUBAGENT_REPLY_PORT)
+      if not sender then
+        return "subagent timeout after " .. timeout .. "s (no reply from " .. addr .. ")"
+      end
+      local ok_json, reply = pcall(json.decode, payload or "")
+      if not ok_json or type(reply) ~= "table" then
+        return "subagent reply decode failed: " .. tostring(payload):sub(1, 200)
+      end
+      if reply.ok then
+        return tostring(reply.result or "")
+      end
+      return "subagent error: " .. tostring(reply.error or "unknown")
+    end)
+    return ok and result or ("Error: " .. tostring(result))
+
   elseif name == "write_file" then
     local ok, result = pcall(function()
       local f = io.open(args.path, "w")
@@ -884,6 +973,7 @@ local function build_system_prompt()
     .. "- component_doc: Get documentation for a component's methods (list methods or read one method's doc)\n"
     .. "- component_invoke: Call a method on a component (after checking component_doc)\n"
     .. "- web_search: Search the web for information (titles, URLs, snippets). Uses Tavily if configured, Hacker News otherwise.\n"
+    .. "- subagent_call: Delegate heavy work to another computer on your modem network running agent.lua --subagent. Pass its modem address + task (+ role). It uses its own memory/disk.\n"
     .. "- shell_execute: Run an OpenOS shell command\n\n"
     .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
     .. "When exploring hardware, use this workflow:\n"
@@ -1050,8 +1140,32 @@ end
 
 -- ── Section 6: Config & History ────────────────────────────────
 
-local CONFIG_PATH = "/home/agent_config.txt"
-local HISTORY_PATH = "/home/agent_history.txt"
+-- Paths. If /home is not writable (OpenOS not installed to a writeable
+-- medium), fall back to the first writable mount (tmpfs/hdd).
+local function find_writable_base()
+  local fs = require("filesystem")
+  -- probe /home first
+  local f = io.open("/home/agent_write_probe.txt", "w")
+  if f then f:close(); os.remove("/home/agent_write_probe.txt"); return "/home" end
+  -- iterate mounts: iterator yields (proxy, mount_path)
+  for _, mount in fs.mounts() do
+    if mount and mount ~= "/" then
+      local probe = mount .. "/agent_write_probe.txt"
+      local f2 = io.open(probe, "w")
+      if f2 then
+        f2:close()
+        os.remove(probe)
+        return mount
+      end
+    end
+  end
+  return "/home"  -- give up; callers will handle write errors
+end
+
+local WRITABLE_BASE = find_writable_base()
+local CONFIG_PATH = WRITABLE_BASE .. "/agent_config.txt"
+local HISTORY_PATH = WRITABLE_BASE .. "/agent_history.txt"
+local SESSIONS_DIR = WRITABLE_BASE .. "/sessions"
 local MAX_HISTORY = 20
 local MAX_HISTORY_BYTES = 50000  -- ~50KB budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap for history persistence
@@ -1224,14 +1338,14 @@ local function handle_command(cmd, config, messages)
     -- Archive current session, start fresh (config kept)
     if #messages > 0 then
       local fs = require("filesystem")
-      local ok_dir, dir_err = pcall(fs.makeDirectory, "/home/sessions")
-      if not ok_dir then print("Note: cannot create /home/sessions (" .. tostring(dir_err) .. ")") end
+      local ok_dir, dir_err = pcall(fs.makeDirectory, SESSIONS_DIR)
+      if not ok_dir then print("Note: cannot create " .. SESSIONS_DIR .. " (" .. tostring(dir_err) .. ")") end
       local stamp = tostring(os.time and pcall(os.time) and (select(2, pcall(os.time)) or "") or "")
       if stamp == "" then
         local comp = require("computer")
         stamp = string.format("%.0f", comp.uptime() or 0)
       end
-      local archive_path = "/home/sessions/agent_history_" .. stamp .. ".txt"
+      local archive_path = SESSIONS_DIR .. "/agent_history_" .. stamp .. ".txt"
       local ok_save, save_err = pcall(function()
         local f = io.open(archive_path, "w")
         if not f then error("cannot open " .. archive_path) end
@@ -1283,7 +1397,84 @@ local function handle_command(cmd, config, messages)
   return false, config, messages
 end
 
-local function main()
+-- ── Section 8: Subagent Protocol (modem-based) ─────────────────
+
+-- Game-network subagents: master agent delegates tasks to agent.lua
+-- instances running on OTHER OpenComputers computers via the modem
+-- (network card) component. Messages are JSON strings (single arg, stays
+-- under the 8-argument limit), one per line, on a dedicated task port.
+-- Protocol (request → response, id must match):
+--   request:  {v=1, id, role?, task, context?}
+--   response: {v=1, id, ok=true, result} | {v=1, id, ok=false, error}
+
+-- ── Section 8.5: Shared message-processing loop ─────────────────
+-- Used by both the interactive REPL and the subagent server: takes one
+-- user input, runs the LLM tool-calling loop, returns the final text
+-- (concatenated assistant content) and updates `messages`.
+
+local function process_exchange(messages, config, user_input, persist)
+  messages[#messages + 1] = {role = "user", content = user_input}
+
+  -- Auto-compact before trimming when history gets large
+  if should_compact(messages) then
+    local compacted = compact_history(messages, config)
+    if compacted then
+      messages = compacted
+      if persist then rebuild_history(messages) end
+    end
+  end
+  messages = trim_history(messages)
+  if persist then append_history(messages[#messages]) end
+
+  local final_text = {}
+  while true do
+    io.write("Thinking...\r")
+    local response = chat(messages, config)
+
+    if response.error then
+      return {error = response.error}
+    end
+
+    if response.content then
+      print(response.content)
+      final_text[#final_text + 1] = response.content
+    end
+
+    local assistant_msg = {role = "assistant", content = response.content or ""}
+    if response.tool_calls then
+      assistant_msg.tool_calls = response.tool_calls
+    end
+    messages[#messages + 1] = assistant_msg
+    if persist then append_history(assistant_msg) end
+
+    if not response.tool_calls or #response.tool_calls == 0 then
+      break
+    end
+
+    for _, tc in ipairs(response.tool_calls) do
+      local tool_name = tc["function"].name
+      local tool_args = tc["function"].arguments
+      print("[tool] " .. tool_name)
+      local result = execute_tool(tool_name, tool_args)
+      -- Cap large tool outputs so history + memory stay bounded
+      if type(result) == "string" and #result > MAX_TOOL_RESULT then
+        result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
+      end
+      local tool_msg = {
+        role = "tool",
+        tool_call_id = tc.id,
+        content = result
+      }
+      messages[#messages + 1] = tool_msg
+      if persist then append_history(tool_msg) end
+    end
+  end
+
+  messages = trim_history(messages)
+  return {text = table.concat(final_text, "\n")}
+end
+
+local function main(...)
   local component = require("component")
   if not component.isAvailable("internet") then
     print("Error: No internet card found. Tier 2 Internet Card required.")
@@ -1292,6 +1483,71 @@ local function main()
 
   local config = load_config()
   if not config then config = first_run_setup() end
+
+  -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
+  -- Listens on the modem network for task requests, runs them through the
+  -- full agent loop, replies over modem. No interactive REPL.
+  local arg1 = ...
+  if arg1 == "--subagent" then
+    local port_arg = select(2, ...)
+    local listen_port = (port_arg and tonumber(port_arg)) or SUBAGENT_LISTEN_PORT
+    local modem = component.modem
+    if not modem then
+      print("Error: no modem (network card) component found")
+      return
+    end
+    local ok_open = pcall(modem.open, listen_port)
+    -- Announce our modem address: print + write to writable base (for the
+    -- operator to find us; the master discovers subagents via component.list
+    -- on its own network — on ocvm the addresses are per-VM so the driver
+    -- reads this file).
+    local my_addr = type(modem.address) == "string" and modem.address or "?"
+    print("Subagent modem address: " .. my_addr)
+    local af = io.open(WRITABLE_BASE .. "/subagent_address.txt", "w")
+    if af then
+      af:write(my_addr)
+      af:close()
+    end
+    print("Subagent listening on modem port " .. listen_port .. " (model: " .. config.model .. ")")
+    local event = require("event")
+
+    while true do
+      local sig = {event.pull("modem_message")}
+      if sig[1] == "modem_message" then
+        local sender = sig[3]
+        local port = sig[4]
+        local payload = sig[6]
+        if port == listen_port and type(payload) == "string" then
+          local ok_json, req = pcall(json.decode, payload)
+          if ok_json and type(req) == "table" and req.id then
+            print("[subagent] task " .. tostring(req.id) .. " from " .. tostring(sender))
+            local req_messages = {}
+            if req.context and req.context ~= "" then
+              req_messages[#req_messages + 1] = {role = "user", content = "[来自主代理的上下文]\n" .. req.context}
+            end
+            local task_text = req.task or ""
+            if req.role and req.role ~= "" then
+              task_text = "[角色: " .. req.role .. "]\n" .. task_text
+            end
+            local result = process_exchange(req_messages, config, task_text, false)
+            local reply
+            if result.error then
+              reply = json.encode({v = 1, id = req.id, ok = false, error = result.error})
+            else
+              reply = json.encode({v = 1, id = req.id, ok = true, result = result.text})
+            end
+            local ok_send = pcall(modem.send, sender, SUBAGENT_REPLY_PORT, reply)
+            if ok_send then
+              print("[subagent] reply sent for " .. tostring(req.id))
+            else
+              print("[subagent] FAILED to send reply for " .. tostring(req.id))
+            end
+          end
+        end
+      end
+    end
+    -- unreachable
+  end
 
   local messages = load_history()
   local term_history = {}
@@ -1313,70 +1569,12 @@ local function main()
       goto continue
     end
 
-    messages[#messages + 1] = {role = "user", content = input}
     term_history[#term_history + 1] = input
     if #term_history > 50 then
       table.remove(term_history, 1)  -- keep terminal history bounded
     end
-    -- Auto-compact before trimming when history gets large: summarize old
-    -- context instead of dropping it. Falls back to trim on failure.
-    if should_compact(messages) then
-      io.write("Compacting conversation...\r")
-      local compacted = compact_history(messages, config)
-      if compacted then
-        messages = compacted
-        rebuild_history(messages)
-      end
-    end
-    messages = trim_history(messages)
-    -- append-only: persist just the new user message (old entries stay in the
-    -- log; load_history trims on replay)
-    append_history(messages[#messages])
 
-    while true do
-      io.write("Thinking...\r")
-      local response = chat(messages, config)
-
-      if response.error then
-        print("Error: " .. response.error)
-        break
-      end
-
-      if response.content then
-        print(response.content)
-      end
-
-      local assistant_msg = {role = "assistant", content = response.content or ""}
-      if response.tool_calls then
-        assistant_msg.tool_calls = response.tool_calls
-      end
-      messages[#messages + 1] = assistant_msg
-      append_history(assistant_msg)  -- append-only: persist reply
-
-      if not response.tool_calls or #response.tool_calls == 0 then
-        break
-      end
-
-      for _, tc in ipairs(response.tool_calls) do
-        local tool_name = tc["function"].name
-        local tool_args = tc["function"].arguments
-        print("[tool] " .. tool_name)
-        local result = execute_tool(tool_name, tool_args)
-        -- Cap large tool outputs so history + memory stay bounded
-        if type(result) == "string" and #result > MAX_TOOL_RESULT then
-          result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
-        end
-        local tool_msg = {
-          role = "tool",
-          tool_call_id = tc.id,
-          content = result
-        }
-        messages[#messages + 1] = tool_msg
-        append_history(tool_msg)  -- append-only: persist tool result
-      end
-    end
-
-    messages = trim_history(messages)
+    process_exchange(messages, config, input, true)
 
     ::continue::
   end
@@ -1384,7 +1582,21 @@ local function main()
   print("Goodbye!")
 end
 
-if not _TEST_MODE then main() end
+-- Script args arrive as file-level varargs (OpenOS lua has no `arg` global;
+-- note OpenOS's lua consumes options, so use `lua agent.lua -- --subagent`).
+--   lua agent.lua                       → interactive REPL
+--   lua agent.lua -- --subagent [port]  → subagent server mode
+-- Alternatively set subagent=true in the config file, then plain
+-- `lua agent.lua` also starts in subagent mode.
+if not _TEST_MODE then
+  local script_arg1 = ...
+  local cfg = load_config()
+  if script_arg1 == "--subagent" or (cfg and cfg.subagent) then
+    main("--subagent", select(2, ...))
+  else
+    main()
+  end
+end
 
 -- Test hooks (available when loaded with _TEST_MODE = true)
 if _TEST_MODE then
@@ -1424,6 +1636,8 @@ if _TEST_MODE then
       HISTORY_PATH = saved
     end,
     set_history_path = set_history_path,
+    process_exchange = process_exchange,
+    wait_modem_message = wait_modem_message,
     TOOLS = TOOLS,
   }
 end

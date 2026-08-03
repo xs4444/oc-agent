@@ -12,7 +12,8 @@
 
 ## 功能一览
 
-- **13 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute`
+- **13 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute` + **`subagent_call`（14 个）**
+- **子代理**：`subagent_call(address, task)` 通过游戏内网卡（modem 组件）把任务委派给其他 OC 计算机上运行的 `agent.lua -- --subagent`——每台子代理拥有独立内存和磁盘，主代理可并行调度；跨机器经 ocvm 双实例实测通过（SUBAGENT_PONG 往返）
 - **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
 - **数据处理工具集**：`json_query`（JSON 点路径提取）/ `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）替代了原 `execute_lua`，无任意代码执行风险
 - **文件工具族**：`read_file` 行切片（大文件只读目标区段，带行号；负 offset = tail）+ `edit_file`（精确替换，>20KB 拒绝）+ `append_file`（流式追加，内存与文件大小无关）——先查后改，适配 OC 1MB 内存
@@ -38,6 +39,19 @@
 /new                  -- 归档当前会话到 /home/sessions/ 并开新会话
 /compact              -- 手动压缩对话（LLM 摘要 + 保留最近 4 条）
 /reset                -- 清空对话历史（不归档）
+```
+
+## 子代理部署（多台 OC 组网）
+
+```bash
+# 子代理机器（需网络卡/无线网卡，与主代理同网络）：
+# OpenOS 的 lua 会吞掉 -- 开头的参数，用 -- 分隔符传递
+lua agent.lua -- --subagent          # 监听 modem 端口 9090
+# 或在 config 里加 subagent=true，然后直接 lua agent.lua
+
+# 主代理机器：运行时 LLM 通过 component_list(filter="modem") 发现子代理地址，
+# 然后 subagent_call(address, task, role?, context?, timeout?) 委派任务。
+# 子代理收到后用自己的内存/磁盘/算力处理（完整 agent 循环），结果回传。
 ```
 
 ## 目录结构
