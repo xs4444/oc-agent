@@ -1,0 +1,135 @@
+-- ═══════════════════════════════════════════════════════════════
+-- agent.chat — LLM client (Phase 3 split).
+--
+-- Verbatim move of the old agent.lua Section 5: safe_call,
+-- build_system_prompt, build_headers and chat.
+--
+-- The old Section 3 captured the tool list once (local TOOLS =
+-- require("agent.tools").list()); here tools_mod.list() is fetched on
+-- every call so a tool module registered mid-run shows up without a
+-- restart (same declarations, identical wire behavior).
+--
+-- Dependencies: agent.json (encode/decode), agent.http (post),
+-- agent.tools (live tool list for the tools[] field).
+-- ═══════════════════════════════════════════════════════════════
+
+local http_post = require("agent.http").post
+local json = require("agent.json")
+local tools_mod = require("agent.tools")
+
+local function safe_call(fn, ...)
+  if type(fn) == "function" then
+    local ok, r = pcall(fn, ...)
+    if ok then return r end
+  end
+  return nil
+end
+
+local function build_system_prompt()
+  local computer = require("computer")
+  local component = require("component")
+
+  local comp_list = {}
+  for addr, typ in component.list() do
+    comp_list[#comp_list + 1] = addr:sub(1, 8) .. "... = " .. typ
+  end
+
+  local address = safe_call(computer.address) or "unknown"
+  local uptime = safe_call(computer.uptime) or 0
+  local free_mem = safe_call(computer.freeMemory) or 0
+
+  return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+    .. "Available tools:\n"
+    .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
+    .. "- write_file: Write content to a file (new files or full rewrites)\n"
+    .. "- edit_file: Replace an exact string in a file (must be unique; replace_all for multiple). Read first, keep files under 20KB\n"
+    .. "- append_file: Append content to a file — use for logs and growing files, memory cost is constant regardless of file size\n"
+    .. "- list_directory: List files in a directory\n"
+    .. "- json_query: Extract a value from a JSON string using a dot path (e.g. 'hits.0.title'). Use to parse component_invoke, web_search or file contents.\n"
+    .. "- calc: Evaluate a safe arithmetic expression (sqrt, abs, floor, ceil, min, max, + - * / % ^)\n"
+    .. "- text_ops: String manipulation: find, replace, split, slice, upper, lower, trim, length\n"
+    .. "- component_list: List connected OpenComputers components\n"
+    .. "- component_doc: Get documentation for a component's methods (list methods or read one method's doc)\n"
+    .. "- component_invoke: Call a method on a component (after checking component_doc)\n"
+    .. "- web_search: Search the web for information (titles, URLs, snippets). Uses Tavily if configured, Hacker News otherwise.\n"
+    .. "- subagent_call: Delegate heavy work to another computer on your modem network running agent.lua --subagent. Pass its modem address + task (+ role). It uses its own memory/disk.\n"
+    .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
+    .. "- shell_execute: Run an OpenOS shell command\n\n"
+    .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
+    .. "When exploring hardware, use this workflow:\n"
+    .. "1. component_list to discover components\n"
+    .. "2. component_doc(address) to learn what methods a component has\n"
+    .. "3. component_doc(address, method) for method details, then component_invoke to call it\n\n"
+    .. "Current computer address: " .. tostring(address) .. "\n"
+    .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
+    .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
+    .. "Connected components:\n" .. table.concat(comp_list, "\n")
+end
+
+local function build_headers(config)
+  local headers = {
+    ["Content-Type"] = "application/json",
+  }
+  -- Only send auth when a real key is configured. Some free endpoints
+  -- (e.g. OpenCode Zen free models) reject invalid bearer tokens with 401
+  -- but accept requests without an Authorization header.
+  if config.api_key and config.api_key ~= "" and config.api_key ~= "free" then
+    headers["Authorization"] = "Bearer " .. config.api_key
+  end
+  return headers
+end
+
+local function chat(messages, config)
+  local system_prompt = build_system_prompt()
+
+  local api_messages = {}
+  api_messages[#api_messages + 1] = {role = "system", content = system_prompt}
+  for _, msg in ipairs(messages) do
+    api_messages[#api_messages + 1] = msg
+  end
+
+  local body = json.encode({
+    model = config.model or "deepseek-v4-flash-free",
+    messages = api_messages,
+    tools = tools_mod.list(),
+    max_tokens = 2048,
+    temperature = 0.7
+  })
+
+  local headers = build_headers(config)
+
+  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions", headers, body)
+  if err then
+    return {content = nil, tool_calls = nil, finish_reason = "error", error = err}
+  end
+  if not code or code ~= 200 then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "HTTP " .. tostring(code) .. ": " .. tostring(resp):sub(1, 500)}
+  end
+
+  local data, decode_err = json.decode(resp)
+  if not data then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "JSON decode: " .. tostring(decode_err)}
+  end
+
+  local choice = data.choices and data.choices[1]
+  if not choice then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "No choices in response"}
+  end
+
+  local msg = choice.message or {}
+  return {
+    content = msg.content,
+    tool_calls = msg.tool_calls,
+    finish_reason = choice.finish_reason
+  }
+end
+
+return {
+  safe_call = safe_call,
+  build_system_prompt = build_system_prompt,
+  build_headers = build_headers,
+  chat = chat,
+}
