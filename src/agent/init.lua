@@ -173,7 +173,11 @@ local function handle_command(cmd, config, messages)
       local fs = require("filesystem")
       local ok_dir, dir_err = pcall(fs.makeDirectory, SESSIONS_DIR)
       if not ok_dir then print("Note: cannot create " .. SESSIONS_DIR .. " (" .. tostring(dir_err) .. ")") end
-      local stamp = tostring(os.time and pcall(os.time) and (select(2, pcall(os.time)) or "") or "")
+      local stamp = ""
+      if os.time then
+        local ok_t, t = pcall(os.time)
+        if ok_t and t then stamp = tostring(t) end
+      end
       if stamp == "" then
         local comp = require("computer")
         stamp = string.format("%.0f", comp.uptime() or 0)
@@ -309,15 +313,15 @@ local function process_exchange(messages, config, user_input, persist, session)
   return {text = table.concat(final_text, "\n")}
 end
 
-local function main(...)
+-- main(config, ...): config is loaded ONCE at the entry point below and
+-- passed in (same table instance the /model /key /url /tavily commands
+-- mutate via save_config).
+local function main(config, ...)
   local component = require("component")
   if not component.isAvailable("internet") then
     print("Error: No internet card found. Tier 2 Internet Card required.")
     return
   end
-
-  local config = load_config()
-  if not config then config = first_run_setup() end
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the
@@ -382,7 +386,11 @@ local function main(...)
               end
               -- persist into the session file when a session id is given
               local persist = session and session ~= ""
-              local result = process_exchange(req_messages, config, task_text, persist, persist and session or nil)
+              -- Guard against unexpected exceptions escaping process_exchange:
+              -- busy_session must be released either way, or this session would
+              -- be permanently stuck busy and reject all new tasks.
+              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil)
+              if not ok_proc then result = { error = tostring(result) } end
               busy_session = nil  -- release (opencode: Active → Reusable)
               local reply
               if result.error then
@@ -445,11 +453,14 @@ end
 -- `lua agent.lua` also starts in subagent mode.
 if not _TEST_MODE then
   local script_arg1 = ...
+  -- Load the config exactly once; main() receives the same table so the
+  -- /model /key /url /tavily commands still mutate + save the live config.
   local cfg = load_config()
+  if not cfg then cfg = first_run_setup() end
   if script_arg1 == "--subagent" or (cfg and cfg.subagent) then
-    main("--subagent", select(2, ...))
+    main(cfg, "--subagent", select(2, ...))
   else
-    main()
+    main(cfg)
   end
 end
 

@@ -40,7 +40,16 @@ function M.run(name, args_str, deps)
       args = {}
     end
     -- Diagnose: expose raw args + error for debugging
-    local err_info = ok and tostring(decoded) or tostring(ok2 and decoded2)
+    local err_info
+    if ok and type(decoded) ~= "table" then
+      -- decode actually succeeded, but the result wasn't an object —
+      -- don't report it as a decode failure
+      err_info = "decoded to " .. type(decoded) .. ", expected object"
+    elseif ok then
+      err_info = tostring(ok2 and decoded2 or decoded)
+    else
+      err_info = tostring(decoded)
+    end
     return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200)
   end
 

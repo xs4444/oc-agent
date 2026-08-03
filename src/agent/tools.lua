@@ -9,6 +9,10 @@
 -- into the tools/ directory via write_file; on the next start it is
 -- auto-registered here (no agent.lua edit needed).
 --
+-- NOTE (plugin bootstrap): writing a custom tool module to tools/ works
+-- in multi-file mode; the single-file build embeds modules via
+-- package.preload and cannot require new files.
+--
 -- Directory enumeration falls back to the builtin module list when the
 -- filesystem cannot be scanned (e.g. host-side test env without a real
 -- filesystem). Both paths are exercised by the test harness.
@@ -32,6 +36,13 @@ local BUILTIN = {
   "agent.tools.shell",
   "agent.tools.subagent",
 }
+
+-- Names already loaded by the BUILTIN loop (below). scan_dir skips these
+-- so the directory scan does not re-require the six core modules.
+-- This is a per-instance local table, NOT package.loaded: ocvm tests
+-- clear package.loaded and re-require the registry fresh, giving the
+-- reload semantics we want without double-loading builtins.
+local loaded_names = {}
 
 -- Resolve this module's own directory from the loader source, never cwd.
 -- Prefer AGENT_DIR exported by init.lua (entry script — its source is an
@@ -97,8 +108,10 @@ end
 -- `names_override` lets callers (e.g. tests) supply the module file
 -- names (e.g. "hello.lua", as fs.list would return) without relying on
 -- a real filesystem enumeration.
--- No package.loaded skip: already-loaded modules are re-registered into
--- the (new) registry; register() dedupes on name so ORDER stays stable.
+-- loaded_names (populated by the BUILTIN loop) is skipped here: the six
+-- core modules were already required, so the directory scan only loads
+-- genuinely new/custom modules. register() dedupes on name so ORDER
+-- stays stable across rescans.
 local function scan_dir(dir, names_override)
   local scanned = names_override or collect_dir_names(dir)
   for _, entry in ipairs(scanned) do
@@ -107,19 +120,20 @@ local function scan_dir(dir, names_override)
     if type(entry) == "string" and entry:match("%.lua$") and not entry:match("^agent%.") then
       req_name = "agent.tools." .. entry:gsub("%.lua$", "")
     end
-    if type(req_name) == "string" then
+    if type(req_name) == "string" and not loaded_names[req_name] then
       require_module(req_name)
+      loaded_names[req_name] = true
     end
   end
 end
 
 -- Core load: builtin modules first (deterministic), then any custom
--- modules discovered by the directory scan. No package.loaded skip:
--- re-require of an already-loaded module returns the cached table and
--- register() dedupes on name, so reloading the registry (e.g. after a
--- plugin module is added) correctly rebuilds the full set.
+-- modules discovered by the directory scan. Builtins are recorded in
+-- loaded_names so scan_dir does not re-require them; register() still
+-- dedupes on name so ORDER stays stable on re-scan/reload.
 for _, req_name in ipairs(BUILTIN) do
   require_module(req_name)
+  loaded_names[req_name] = true
 end
 scan_dir(TOOLS_DIR)
 

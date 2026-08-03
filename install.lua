@@ -152,8 +152,17 @@ end
 if manifest then
   -- ── 多文件安装流程 ──────────────────────────────────────
   local AGENT_DIR = DEST_DIR .. "/agent"
-  fs.makeDirectory(AGENT_DIR)
-  fs.makeDirectory(AGENT_DIR .. "/tools")
+  -- OpenOS fs.makeDirectory can raise (not just return false) when the
+  -- parent is not writable, so guard both creates.
+  local mk_ok, mk_err = pcall(function()
+    fs.makeDirectory(AGENT_DIR)
+    fs.makeDirectory(AGENT_DIR .. "/tools")
+  end)
+  if not mk_ok then
+    print("无法创建安装目录 " .. AGENT_DIR .. ": " .. tostring(mk_err))
+    print("请检查父目录是否可写，然后重新运行 install.lua。")
+    return
+  end
 
   local relpaths = {}
   for relpath in pairs(manifest.files) do
