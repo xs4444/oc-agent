@@ -13,7 +13,8 @@
 ## 功能一览
 
 - **13 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute` + **`subagent_call`（14 个）**
-- **子代理**：`subagent_call(address, task)` 通过游戏内网卡（modem 组件）把任务委派给其他 OC 计算机上运行的 `agent.lua -- --subagent`——每台子代理拥有独立内存和磁盘，主代理可并行调度；跨机器经 ocvm 双实例实测通过（SUBAGENT_PONG 往返）
+- **子代理**：`subagent_call(address, task, role?, session?, context?, timeout?)` 通过游戏内网卡（modem 组件）把任务委派给其他 OC 计算机上运行的 `agent.lua -- --subagent`——每台子代理拥有独立内存和磁盘，主代理可并行调度；跨机器经 ocvm 双实例实测通过（SUBAGENT_PONG 往返）
+- **子代理会话复用**：`session` 参数延续子代理对话（同 id 恢复磁盘上的会话历史，省略则全新会话）；busy 状态机防止同会话并发（对齐 opencode 的 Active/Reusable 会话模型）
 - **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
 - **数据处理工具集**：`json_query`（JSON 点路径提取）/ `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）替代了原 `execute_lua`，无任意代码执行风险
 - **文件工具族**：`read_file` 行切片（大文件只读目标区段，带行号；负 offset = tail）+ `edit_file`（精确替换，>20KB 拒绝）+ `append_file`（流式追加，内存与文件大小无关）——先查后改，适配 OC 1MB 内存
@@ -79,14 +80,18 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 每个子目录含独立 `README.md` 说明用途与用法。
 
 ```
-├── agent.lua              # 主程序（部署到游戏）
+├── agent.lua              # 主程序（部署到游戏，单文件）
+├── install.lua            # 引导安装器（游戏内 wget 下载，自动安装 agent.lua）
 ├── README.md
 ├── docs/                  # 设计文档与实现计划 → docs/README.md
+│   ├── COMPARISON.md      # 与 oc-ai / pi / pi-subagents 三方对比
 │   └── superpowers/
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
-│   ├── run_tests.lua      # 本地回归测试（48 项）
-│   └── ...                # 能力边界/内存/搜索/端到端测试
+│   ├── run_tests.lua      # 本地回归测试（122 项）
+│   ├── subagent_test.lua  # 子代理双实例集成测试
+│   ├── subagent_session_test.lua  # 子代理会话复用集成测试
+│   └── ...                # 能力边界/内存/搜索/文件工具测试
 ├── emulators/             # 第三方 OC 模拟器 → emulators/README.md
 │   ├── OCEmu/             # 真实 OC machine.lua 沙箱（Lua 5.2）
 │   ├── ocvm/              # C++ 模拟器（Linux，含修复）
@@ -95,11 +100,13 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── raw/               # DokuWiki 原始文本（215 页）
 │   ├── markdown/          # Markdown 转换版（32 页）
 │   └── reference/         # agent 开发精选 API 参考（35 文件）
-├── tools/                 # Windows 辅助脚本 → tools/README.md
+├── tools/                 # Windows 辅助脚本（截图/按键/ocvm 测试驱动）→ tools/README.md
 ├── scripts/               # 一次性工具脚本 → scripts/README.md
 ├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）→ lua_portable/README.md
 ├── opencomputers/         # GTNH OpenComputers fork 源码（参考）
-└── pi/                    # pi.dev agent 源码（架构参考）
+├── oc-ai/                 # DonChong2000/oc-ai 源码（参考）
+├── pi/                    # pi.dev agent 源码（架构参考）
+└── pi-subagents/          # nicobailon/pi-subagents 源码（子代理参考）
 ```
 
 ## 测试环境（Ubuntu 服务器 192.168.31.75）
@@ -116,8 +123,9 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 ```
 
 测试要点：
-- 本地：`lua_portable/bin/lua.exe test_harness/run_tests.lua`（48 项回归）
-- 模拟器：部署 `agent.lua` + 测试脚本到 `/mnt/<mount>/`，经 shell 执行
+- 本地：`lua_portable/bin/lua.exe test_harness/run_tests.lua`（122 项回归）
+- 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果）
+- 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
 - LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）
 
 ## 已知限制

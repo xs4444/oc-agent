@@ -26,7 +26,7 @@
 
 | 维度 | agent.lua | oc-ai | pi |
 |------|-----------|-------|-----|
-| 工具数量 | 13（read_file+行切片/write_file/edit_file/append_file/list_directory/json_query/calc/text_ops/component_list/component_doc/component_invoke/web_search/shell_execute） | oc-code：7（read_file/write_file/edit_file/list_directory/glob/grep/shell） | 大量（文件/进程/网络/权限/插件…） |
+| 工具数量 | 14（read_file+行切片/write_file/edit_file/append_file/list_directory/json_query/calc/text_ops/component_list/component_doc/component_invoke/web_search/shell_execute/**subagent_call**） | oc-code：7（read_file/write_file/edit_file/list_directory/glob/grep/shell） | 大量（文件/进程/网络/权限/插件…） |
 | 工具声明 | 内置表 + 动态系统提示生成 | `ai.tool({...})` 声明式 + execute 回调 | `AgentTool` 类型化定义 |
 | 组件感知 | 有（component_list/doc/invoke 三件套，动态生成提示） | 无（纯文件/shell 工具） | 无（OC 外） |
 | 容错 | 参数解析 fallback + pcall 包裹 + 结果截断 | JSON decode pcall 包裹 | 工具调用失败标记 + 重试/截断恢复 |
@@ -61,4 +61,15 @@
 
 ## 结论
 
-三个项目定位互补：**oc-ai 是 OC 生态内最成熟的 AI 库**（流式/结构化输出/声明式工具），**pi 是宿主机构建通用 agent 的参考架构**（并行工具/事件流/多 provider），**agent.lua 是唯一专为 OC 资源约束设计的单文件 agent**。对比后 agent.lua 已落地：移除 `execute_lua`（任意代码执行）并新增 `json_query`/`calc`/`text_ops` 数据处理工具集、`edit_file`（借鉴 oc-ai，加了唯一性检查与 20KB 上限）、`append_file`（pi 没有的差异化：流式追加内存恒定）、`read_file` 行切片（借鉴 pi 的 offset/limit，加了负 offset tail）、HTTP 自动重试、对话摘要压缩（compaction）、会话归档（`/new`）、append-only 会话日志（消内部 O(n²) 整写）。
+三个项目定位互补：**oc-ai 是 OC 生态内最成熟的 AI 库**（流式/结构化输出/声明式工具），**pi 是宿主机构建通用 agent 的参考架构**（并行工具/事件流/多 provider），**agent.lua 是唯一专为 OC 资源约束设计的单文件 agent**。对比后 agent.lua 已落地：移除 `execute_lua`（任意代码执行）并新增 `json_query`/`calc`/`text_ops` 数据处理工具集、`edit_file`（借鉴 oc-ai，加了唯一性检查与 20KB 上限）、`append_file`（pi 没有的差异化：流式追加内存恒定）、`read_file` 行切片（借鉴 pi 的 offset/limit，加了负 offset tail）、HTTP 自动重试、对话摘要压缩（compaction，借鉴 opencode 的 anchored summary 增量更新）、会话归档（`/new`）、append-only 会话日志（消内部 O(n²) 整写）。
+
+## 子代理能力对比（落地后）
+
+| 维度 | pi-subagents（第三方） | **我们的实现** |
+|------|------------------------|---------------|
+| 子代理形态 | 独立 pi 子进程（`pi --mode json`）| 独立 OC 计算机（modem 组网）|
+| 资源 | 共享宿主机内存 | **每子代理独立内存/磁盘**（OC 场景核心价值）|
+| 会话复用 | sessionDir / fork / fresh | `session` 参数 + 子代理磁盘 JSONL 历史（同 id 延续）|
+| 状态机 | Active/Reusable | busy 标记（处理中拒绝同会话新任务）|
+| 角色 | scout/researcher/planner/worker/reviewer/oracle/delegate 等 8 内置代理 | `role` 参数（同一角色集）|
+| 协议 | 进程间 RPC 事件 | 游戏内 modem 消息（JSON 单参数，≤8192 字节包）|
