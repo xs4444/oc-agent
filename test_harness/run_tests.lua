@@ -15,6 +15,7 @@ filesystem = oc_mock.filesystem
 shell = oc_mock.shell
 internet = oc_mock.internet
 serialization = oc_mock.serialization
+event = oc_mock.event
 
 -- Intercept require() to return mocked OC modules
 local orig_require = require
@@ -24,6 +25,7 @@ package.loaded["filesystem"] = oc_mock.filesystem
 package.loaded["shell"] = oc_mock.shell
 package.loaded["internet"] = oc_mock.internet
 package.loaded["serialization"] = oc_mock.serialization
+package.loaded["event"] = oc_mock.event
 
 -- Prevent main() from auto-running
 _TEST_MODE = true
@@ -453,7 +455,8 @@ test("TOOLS has text_ops", tools_have["text_ops"] == true)
 test("TOOLS no execute_lua", tools_have["execute_lua"] ~= true)
 test("TOOLS has edit_file", tools_have["edit_file"] == true)
 test("TOOLS has append_file", tools_have["append_file"] == true)
-test("TOOLS count is 13", #agent_test.TOOLS == 13,
+test("TOOLS has subagent_call", tools_have["subagent_call"] == true)
+test("TOOLS count is 14", #agent_test.TOOLS == 14,
   "count=" .. tostring(#agent_test.TOOLS))
 
 print("")
@@ -524,6 +527,56 @@ test("empty file → empty history", #load_history() == 0)
 os.remove(emptyf)
 
 os.remove(hist_path)
+
+print("")
+print("═══════════════════════════════════════")
+print("Subagent Protocol Tests")
+print("═══════════════════════════════════════")
+
+-- modem loopback: send enqueues a modem_message event that pull() delivers
+local modem = oc_mock.component.modem
+local mock_event = oc_mock.event
+
+-- test modem mock basics
+test("modem open/isOpen", (function()
+  modem.close()
+  modem.open(9090)
+  return modem.isOpen(9090)
+end)())
+
+-- wait_modem_message: send to self → should receive (sender, port, payload)
+local wait_modem_message = agent_test.wait_modem_message
+modem.open(9091)
+modem.send("self", 9091, "hello-payload")
+local sender, port, payload = wait_modem_message(1, 9091)
+test("wait_modem_message receives", sender == modem.address() and port == 9091 and payload == "hello-payload",
+  "sender=" .. tostring(sender) .. " port=" .. tostring(port) .. " payload=" .. tostring(payload))
+modem.close(9091)
+
+-- wait_modem_message timeout (no event queued)
+local t0 = os.clock()
+local r = wait_modem_message(0.2, 9999)
+local elapsed = os.clock() - t0
+test("wait_modem_message timeout", r == nil and elapsed < 2,
+  "r=" .. tostring(r) .. " elapsed=" .. tostring(elapsed))
+
+-- subagent_call end-to-end: loopback modem replies as the "subagent"
+-- (request sent to LISTEN port; we enqueue a fake reply on REPLY port)
+local subagent_call_tool = nil
+for _, t in ipairs(agent_test.TOOLS) do
+  if t["function"].name == "subagent_call" then subagent_call_tool = t end
+end
+test("subagent_call in TOOLS", subagent_call_tool ~= nil)
+
+-- reply flow: request goes to LISTEN port (9090); reply expected on REPLY
+-- port (9091). Mock is loopback-only (self), so a real peer reply can't be
+-- simulated easily here — verify request send + timeout path locally; the
+-- full master↔subagent round-trip is covered by the ocvm integration test.
+modem.close()
+modem.open(9090)
+local req_json = execute_tool("subagent_call", json.encode({address = modem.address(), task = "count lines", timeout = 0.5}))
+test("subagent_call sends and times out (no real peer)", req_json:find("timeout") ~= nil,
+  "result=" .. tostring(req_json):sub(1, 120))
 
 print("")
 print("═══════════════════════════════════════")

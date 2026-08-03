@@ -155,6 +155,68 @@ function mock_computer.users() return end
 function mock_computer.pushSignal(name, ...) end
 function mock_computer.pullSignal(timeout) return nil end
 
+-- modem (network card) + event loop mock for subagent protocol testing.
+-- Supports single-machine loopback: modem.send() enqueues a modem_message
+-- event that event.pull() will deliver (as if another computer replied).
+OC._modem_queue = {}
+OC._event_queue = {}
+OC._modem_open_ports = {}
+
+local mock_event = {}
+function mock_event.pull(timeout, ...)
+  local filter = {...}
+  local deadline = os.clock() + (timeout or 5)
+  while true do
+    -- deliver queued modem events first
+    if #OC._event_queue > 0 then
+      local sig = table.remove(OC._event_queue, 1)
+      if #filter == 0 or filter[1] == sig[1] then
+        return table.unpack(sig)
+      end
+      -- non-matching event: drop and continue (keeps test simple)
+    end
+    if os.clock() >= deadline then return nil end
+    -- small yield so the deadline check happens; no-op if os.sleep absent
+    if os.sleep then os.sleep(0.01) end
+  end
+end
+function mock_event.timer(interval, func, ...) return 1 end
+function mock_event.cancel(timer) end
+
+local modem_addr = "11aa22bb-3344-5566-7788-99aabbccddee"
+
+local mock_modem = {}
+function mock_modem.address() return modem_addr end
+function mock_modem.isWireless() return false end
+function mock_modem.maxPacketSize() return 8192 end
+function mock_modem.isOpen(port)
+  return OC._modem_open_ports[port] ~= nil
+end
+function mock_modem.open(port)
+  OC._modem_open_ports[port] = true
+  return true
+end
+function mock_modem.close(port)
+  if port then OC._modem_open_ports[port] = nil else OC._modem_open_ports = {} end
+  return true
+end
+function mock_modem.broadcast(port, ...)
+  local args = {...}
+  table.insert(OC._event_queue, {"modem_message", modem_addr, modem_addr, port, 0, table.unpack(args)})
+  return true
+end
+function mock_modem.send(addr, port, ...)
+  local args = {...}
+  -- loopback: deliver to self (testing single machine)
+  table.insert(OC._event_queue, {"modem_message", modem_addr, modem_addr, port, 0, table.unpack(args)})
+  return true
+end
+function mock_modem.getStrength() return 0 end
+function mock_modem.setStrength(v) return 0 end
+
+-- register modem in component list
+OC._components[modem_addr] = "modem"
+
 local mock_filesystem = {}
 -- delegate to Lua's io for testing
 function mock_filesystem.exists(path)
@@ -183,6 +245,17 @@ end
 function mock_filesystem.isDirectory(path) return false end
 function mock_filesystem.makeDirectory(path) return true end
 function mock_filesystem.size(path) return 0 end
+function mock_filesystem.mounts()
+  -- local test env: current directory is writable; expose it as a mount.
+  -- Real OC: iterator yields (proxy, mount_path) per iteration.
+  local called = false
+  local cwd = "./"
+  return function()
+    if called then return nil end
+    called = true
+    return {}, cwd  -- (proxy, mount_path)
+  end
+end
 
 local mock_shell = {}
 function mock_shell.execute(cmd)
@@ -262,6 +335,10 @@ local M = {
   shell = mock_shell,
   internet = mock_internet,
   serialization = mock_serialization,
+  event = mock_event,
 }
+
+-- component.modem — real OC exposes primary component proxies like this
+mock_component.modem = mock_modem
 
 return M

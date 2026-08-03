@@ -6,6 +6,7 @@ __pycache__/
 # 大型/二进制目录（模拟器、便携环境、模组数据）
 emulators/
 pi/
+pi-subagents/
 opencomputers/
 oc-ai/
 lua_portable/
