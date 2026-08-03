@@ -16,11 +16,52 @@
 -- ═══════════════════════════════════════════════════════════════
 
 do
+  -- AGENT_DIR: the directory that contains this entry script (deploy:
+  -- <writable>/agent/, where init.lua was renamed to agent.lua and the
+  -- module tree sits next to it). Resolve order:
+  --   1. A value already set by the harness/installer (most reliable)
+  --   2. The chunk source, with or without the "@" prefix
+  --   3. The shell working directory (when run as `lua agent.lua` from
+  --      the agent dir)
+  -- The chosen candidate is validated against the filesystem (must
+  -- contain this script's sibling modules, e.g. json.lua) before use.
+  local function pick_dir(cands)
+    local ok_fs, fs = pcall(require, "filesystem")
+    for _, c in ipairs(cands) do
+      if type(c) == "string" and c ~= "" then
+        if ok_fs then
+          local ok_ex, ex = pcall(fs.exists, c .. "/json.lua")
+          if ok_ex and ex then return c end
+        else
+          return c  -- no fs (host tests): trust the candidate
+        end
+      end
+    end
+    return nil
+  end
+
   local source = debug.getinfo(1, "S").source or ""
-  local self_dir = source:match("^@(.*)[/\\][^/\\]+$")
-  if not self_dir or self_dir == "" then self_dir = "." end
+  local cands = {}
+  if type(AGENT_DIR) == "string" and AGENT_DIR ~= "" then
+    cands[1] = AGENT_DIR
+  end
+  local m1 = source:match("^@(.*)[/\\][^/\\]+$")
+  local m2 = source:match("^(.*)[/\\][^/\\]+$")
+  if m1 then cands[#cands + 1] = m1 end
+  if m2 then cands[#cands + 1] = m2 end
+  local ok_sh, sh = pcall(require, "shell")
+  if ok_sh and type(sh.getWorkingDirectory) == "function" then
+    cands[#cands + 1] = sh.getWorkingDirectory()
+  end
+  local self_dir = pick_dir(cands)
+  if not self_dir or self_dir == "" then
+    self_dir = "."
+    -- Plugin directory scan will be unavailable; core tools still load
+    -- via require (they sit next to this script on package.path).
+  end
   local parent = self_dir:match("^(.*)[/\\][^/\\]+$") or "."
   package.path = parent .. "/?.lua;" .. package.path
+  AGENT_DIR = self_dir
 end
 
 -- ── Infrastructure modules (Phase 2 split) ─────────────────────

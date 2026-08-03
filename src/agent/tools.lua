@@ -34,8 +34,14 @@ local BUILTIN = {
 }
 
 -- Resolve this module's own directory from the loader source, never cwd.
-local src = debug.getinfo(1, "S").source or ""
-local base = src:match("^@(.*)[/\\][^/\\]+$")
+-- Prefer AGENT_DIR exported by init.lua (entry script — its source is an
+-- absolute path under OpenOS). Fall back to debug.getinfo for direct
+-- require scenarios where the source lacks the "@" prefix.
+local base = AGENT_DIR
+if not base or base == "" then
+  local src = debug.getinfo(1, "S").source or ""
+  base = src:match("^@(.*)[/\\][^/\\]+$")
+end
 if not base or base == "" then base = "." end
 local TOOLS_DIR = base .. "/tools"
 
@@ -91,6 +97,8 @@ end
 -- `names_override` lets callers (e.g. tests) supply the module file
 -- names (e.g. "hello.lua", as fs.list would return) without relying on
 -- a real filesystem enumeration.
+-- No package.loaded skip: already-loaded modules are re-registered into
+-- the (new) registry; register() dedupes on name so ORDER stays stable.
 local function scan_dir(dir, names_override)
   local scanned = names_override or collect_dir_names(dir)
   for _, entry in ipairs(scanned) do
@@ -99,16 +107,19 @@ local function scan_dir(dir, names_override)
     if type(entry) == "string" and entry:match("%.lua$") and not entry:match("^agent%.") then
       req_name = "agent.tools." .. entry:gsub("%.lua$", "")
     end
-    if type(req_name) == "string" and not package.loaded[req_name] then
+    if type(req_name) == "string" then
       require_module(req_name)
     end
   end
 end
 
 -- Core load: builtin modules first (deterministic), then any custom
--- modules discovered by the directory scan.
+-- modules discovered by the directory scan. No package.loaded skip:
+-- re-require of an already-loaded module returns the cached table and
+-- register() dedupes on name, so reloading the registry (e.g. after a
+-- plugin module is added) correctly rebuilds the full set.
 for _, req_name in ipairs(BUILTIN) do
-  if not package.loaded[req_name] then require_module(req_name) end
+  require_module(req_name)
 end
 scan_dir(TOOLS_DIR)
 
@@ -118,4 +129,5 @@ return {
   register_module = register_module,
   registry = function() return REGISTRY end,
   scan_dir = scan_dir,
+  tools_dir = TOOLS_DIR,
 }
