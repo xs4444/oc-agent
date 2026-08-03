@@ -19,6 +19,7 @@ docs/
 | `COMPARISON.md` | 对比 | agent.lua vs oc-ai（OC SDK）vs pi（TS harness）vs pi-subagents（子代理参考）|
 | `specs/2026-07-28-oc-agent-design.md` | 设计 | OC Agent 完整设计：JSON/HTTP/工具/LLM/REPL 架构、硬件需求、风险 |
 | `plans/2026-07-28-oc-agent.md` | 计划 | 7 个任务的实现计划（JSON 编解码 → HTTP → 工具 → LLM → 配置 → REPL → 集成）|
+| `plans/2026-08-03-modular-split.md` | 计划 | 模块化拆分（4 阶段）：工具插件化 → 基础设施模块 → 核心装配 → 自举扩展验证 |
 
 ## 与现状的差异
 
