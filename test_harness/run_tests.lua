@@ -30,8 +30,9 @@ package.loaded["event"] = oc_mock.event
 -- Prevent main() from auto-running
 _TEST_MODE = true
 
--- Load the agent
-local agent_path = arg and arg[1] or "../agent.lua"
+-- Load the agent. Default = multi-file entry (src/agent/init.lua); pass a
+-- path as arg[1] to test a specific file (e.g. the built single-file agent.lua).
+local agent_path = arg and arg[1] or "../src/agent/init.lua"
 print("Loading agent.lua from " .. agent_path .. "...")
 local ok, err = pcall(dofile, agent_path)
 if not ok then
