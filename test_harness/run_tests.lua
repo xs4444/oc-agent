@@ -580,6 +580,53 @@ test("subagent_call sends and times out (no real peer)", req_json:find("timeout"
 
 print("")
 print("═══════════════════════════════════════")
+print("Subagent Session Persistence Tests")
+print("═══════════════════════════════════════")
+
+-- session history: subagent keeps per-session JSONL histories (same format
+-- as main history). Verify format + replay + path sanitization locally.
+local session_file = "test_session_temp/history.jsonl"
+os.execute("mkdir test_session_temp 2>nul")
+os.remove(session_file)
+
+local function sim_append(path, msg)
+  local f = io.open(path, "a")
+  f:write(json.encode(msg) .. "\n")
+  f:close()
+end
+sim_append(session_file, {role = "user", content = "task one"})
+sim_append(session_file, {role = "assistant", content = "answer one"})
+sim_append(session_file, {role = "user", content = "task two (continued)"})
+
+local sim_replay = {}
+local f = io.open(session_file, "r")
+for line in f:lines() do
+  local ok2, msg = pcall(json.decode, line)
+  if ok2 and type(msg) == "table" and msg.role then
+    sim_replay[#sim_replay + 1] = msg
+  end
+end
+f:close()
+test("session replay: 3 messages", #sim_replay == 3)
+test("session replay content",
+  sim_replay[1].content == "task one" and sim_replay[3].content == "task two (continued)")
+
+-- sanitization: session ids with special chars must be path-safe
+local function sanitize(s)
+  return tostring(s):gsub("[^%w_%-]", "_"):sub(1, 64)
+end
+local san_a = sanitize("my session/../evil")
+local san_b = sanitize("abc-123")
+local san_c = sanitize("正常中文")
+test("session id sanitize",
+  san_a == "my_session____evil" and san_b == "abc-123" and san_c == "____________",
+  string.format("a=%q b=%q c=%q", san_a, san_b, san_c))
+
+os.remove(session_file)
+os.execute("rmdir test_session_temp 2>nul")
+
+print("")
+print("═══════════════════════════════════════")
 print(string.format("FINAL: %d pass, %d fail out of %d tests", pass, fail, pass + fail))
 print("═══════════════════════════════════════")
 

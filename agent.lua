@@ -298,8 +298,8 @@ local TOOLS = {
   }},
   {type="function", ["function"]={
     name="subagent_call",
-    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from component_list filter='modem'), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate) and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research.",
-    parameters={type="object", properties={address={type="string", description="Target modem address (component_list filter='modem')"}, task={type="string", description="Task description for the subagent"}, role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
+    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from component_list filter='modem'), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate), a session id to continue a previous conversation on that subagent (same id = context preserved; omit for a fresh session), and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research.",
+    parameters={type="object", properties={address={type="string", description="Target modem address (component_list filter='modem')"}, task={type="string", description="Task description for the subagent"}, role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate"}, session={type="string", description="Optional session id: same id continues the previous conversation on that subagent; omit for fresh context"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
   }},
   {type="function", ["function"]={
     name="write_file",
@@ -721,6 +721,7 @@ function execute_tool(name, args_str)
         id = string.format("%x", (os.clock and math.floor(os.clock() * 1e6)) or math.random(1, 1e9)),
         role = args.role or "delegate",
         task = args.task or "",
+        session = args.session or "",
         context = args.context or ""
       }
       local request = json.encode(request_tbl)
@@ -974,6 +975,7 @@ local function build_system_prompt()
     .. "- component_invoke: Call a method on a component (after checking component_doc)\n"
     .. "- web_search: Search the web for information (titles, URLs, snippets). Uses Tavily if configured, Hacker News otherwise.\n"
     .. "- subagent_call: Delegate heavy work to another computer on your modem network running agent.lua --subagent. Pass its modem address + task (+ role). It uses its own memory/disk.\n"
+    .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command\n\n"
     .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
     .. "When exploring hardware, use this workflow:\n"
@@ -1059,7 +1061,7 @@ local COMPACT_TRIGGER_BYTES = 40000 -- ... or this many bytes (of the 50KB budge
 -- Ask the LLM to summarize older messages. Independent minimal request
 -- (no tools, no system prompt) so it can't recurse into compaction.
 -- Returns summary string or nil on any failure.
-local function summarize_history(messages, config)
+local function summarize_history(messages, config, previous_summary)
   local transcript_parts = {}
   for _, m in ipairs(messages) do
     local role = m.role or "?"
@@ -1085,11 +1087,23 @@ local function summarize_history(messages, config)
     transcript = transcript:sub(1, 12000) .. "\n...[truncated]"
   end
 
+  -- Anchored summary (opencode-style): when a previous summary exists, ask the
+  -- model to UPDATE it instead of summarizing from scratch. Keeps older facts
+  -- stable and saves tokens.
+  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble."
+  local user_prompt
+  if previous_summary and previous_summary ~= "" then
+    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary."
+    user_prompt = "<previous-summary>\n" .. previous_summary .. "\n</previous-summary>\n\n<new-history>\n" .. transcript .. "\n</new-history>\n\nUpdate the summary."
+  else
+    user_prompt = "Summarize this conversation:\n\n" .. transcript
+  end
+
   local body = json.encode({
     model = config.model or "deepseek-v4-flash-free",
     messages = {
-      {role = "system", content = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Summarize the following conversation, keeping: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble."},
-      {role = "user", content = "Summarize this conversation:\n\n" .. transcript}
+      {role = "system", content = sys_prompt},
+      {role = "user", content = user_prompt}
     },
     max_tokens = 1024,
     temperature = 0.2
@@ -1109,14 +1123,28 @@ local function summarize_history(messages, config)
 end
 
 -- Compact: replace older messages with an LLM summary, keep recent verbatim.
+-- Anchored: if the history already starts with a summary (system message),
+-- the new summary is an UPDATE of it (opencode-style), preserving old facts.
 -- Returns new message list on success, nil on failure (caller falls back to trim).
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
+  local previous_summary
   local old = {}
   for i = 1, #messages - COMPACT_KEEP do
-    old[#old + 1] = messages[i]
+    local m = messages[i]
+    if m.role == "system" and type(m.content) == "string" then
+      local s = m.content:match("^%[对话摘要%] (.*)$")
+      if s then
+        previous_summary = s
+        -- drop the old summary message from the transcript (it's passed separately)
+      else
+        old[#old + 1] = m
+      end
+    else
+      old[#old + 1] = m
+    end
   end
-  local summary = summarize_history(old, config)
+  local summary = summarize_history(old, config, previous_summary)
   if not summary then return nil end
 
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
@@ -1404,15 +1432,69 @@ end
 -- (network card) component. Messages are JSON strings (single arg, stays
 -- under the 8-argument limit), one per line, on a dedicated task port.
 -- Protocol (request → response, id must match):
---   request:  {v=1, id, role?, task, context?}
---   response: {v=1, id, ok=true, result} | {v=1, id, ok=false, error}
+--   request:  {v=1, id, role?, task, session?, context?}
+--   response: {v=1, id, ok=true, result, session?} | {v=1, id, ok=false, error}
+--
+-- Sessions: each subagent keeps per-session append-only histories on its own
+-- disk (<writable>/subagent_sessions/<session>/history.jsonl). Reusing the
+-- same session id continues the conversation; omitting it starts fresh.
+
+local function session_path(session)
+  local safe = tostring(session):gsub("[^%w_%-]", "_"):sub(1, 64)
+  return WRITABLE_BASE .. "/subagent_sessions/" .. safe .. "/history.jsonl"
+end
+
+-- Load session history (JSONL lines, same format as main history).
+local function load_session_history(session)
+  local p = session_path(session)
+  local fs = require("filesystem")
+  if not fs.exists(p) then return {} end
+  local f = io.open(p, "r")
+  if not f then return {} end
+  local content = f:read("*a")
+  f:close()
+  local messages = {}
+  for line in content:gmatch("[^\r\n]+") do
+    local ok2, msg = pcall(json.decode, line)
+    if ok2 and type(msg) == "table" and msg.role then
+      messages[#messages + 1] = msg
+    end
+  end
+  return trim_history(messages)
+end
+
+-- Append one message to a session history.
+local function append_session_history(session, msg)
+  local p = session_path(session)
+  local fs = require("filesystem")
+  local dir = p:match("^(.*)/[^/]+$")
+  if dir then pcall(fs.makeDirectory, dir) end
+  local f = io.open(p, "a")
+  if not f then return end
+  f:write(json.encode(msg), "\n")
+  f:close()
+end
+
+-- Rebuild a session history (after compaction/trim).
+local function rebuild_session_history(session, messages)
+  local p = session_path(session)
+  local fs = require("filesystem")
+  local dir = p:match("^(.*)/[^/]+$")
+  if dir then pcall(fs.makeDirectory, dir) end
+  local f = io.open(p, "w")
+  if not f then return end
+  for _, m in ipairs(messages) do
+    f:write(json.encode(m), "\n")
+  end
+  f:close()
+end
 
 -- ── Section 8.5: Shared message-processing loop ─────────────────
 -- Used by both the interactive REPL and the subagent server: takes one
 -- user input, runs the LLM tool-calling loop, returns the final text
 -- (concatenated assistant content) and updates `messages`.
 
-local function process_exchange(messages, config, user_input, persist)
+local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
 
   -- Auto-compact before trimming when history gets large
@@ -1420,11 +1502,17 @@ local function process_exchange(messages, config, user_input, persist)
     local compacted = compact_history(messages, config)
     if compacted then
       messages = compacted
-      if persist then rebuild_history(messages) end
+      if persist then
+        if session then rebuild_session_history(session, messages)
+        else rebuild_history(messages) end
+      end
     end
   end
   messages = trim_history(messages)
-  if persist then append_history(messages[#messages]) end
+  if persist then
+    if session then append_session_history(session, messages[#messages])
+    else append_history(messages[#messages]) end
+  end
 
   local final_text = {}
   while true do
@@ -1445,7 +1533,10 @@ local function process_exchange(messages, config, user_input, persist)
       assistant_msg.tool_calls = response.tool_calls
     end
     messages[#messages + 1] = assistant_msg
-    if persist then append_history(assistant_msg) end
+    if persist then
+      if session then append_session_history(session, assistant_msg)
+      else append_history(assistant_msg) end
+    end
 
     if not response.tool_calls or #response.tool_calls == 0 then
       break
@@ -1466,7 +1557,10 @@ local function process_exchange(messages, config, user_input, persist)
         content = result
       }
       messages[#messages + 1] = tool_msg
-      if persist then append_history(tool_msg) end
+      if persist then
+        if session then append_session_history(session, tool_msg)
+        else append_history(tool_msg) end
+      end
     end
   end
 
@@ -1510,6 +1604,7 @@ local function main(...)
     end
     print("Subagent listening on modem port " .. listen_port .. " (model: " .. config.model .. ")")
     local event = require("event")
+    local busy_session = nil  -- currently-processing session (opencode Active state)
 
     while true do
       local sig = {event.pull("modem_message")}
@@ -1520,27 +1615,46 @@ local function main(...)
         if port == listen_port and type(payload) == "string" then
           local ok_json, req = pcall(json.decode, payload)
           if ok_json and type(req) == "table" and req.id then
-            print("[subagent] task " .. tostring(req.id) .. " from " .. tostring(sender))
-            local req_messages = {}
-            if req.context and req.context ~= "" then
-              req_messages[#req_messages + 1] = {role = "user", content = "[来自主代理的上下文]\n" .. req.context}
-            end
-            local task_text = req.task or ""
-            if req.role and req.role ~= "" then
-              task_text = "[角色: " .. req.role .. "]\n" .. task_text
-            end
-            local result = process_exchange(req_messages, config, task_text, false)
-            local reply
-            if result.error then
-              reply = json.encode({v = 1, id = req.id, ok = false, error = result.error})
+            local session = req.session
+            -- Busy guard: one task at a time per session (matches opencode's
+            -- "Active sessions cannot receive new instructions" rule).
+            if busy_session ~= nil and session == busy_session then
+              local busy_reply = json.encode({v = 1, id = req.id, ok = false, error = "busy: session '" .. tostring(session) .. "' is still processing", session = session})
+              pcall(modem.send, sender, SUBAGENT_REPLY_PORT, busy_reply)
+              print("[subagent] busy: rejected task " .. tostring(req.id) .. " for session " .. tostring(session))
             else
-              reply = json.encode({v = 1, id = req.id, ok = true, result = result.text})
-            end
-            local ok_send = pcall(modem.send, sender, SUBAGENT_REPLY_PORT, reply)
-            if ok_send then
-              print("[subagent] reply sent for " .. tostring(req.id))
-            else
-              print("[subagent] FAILED to send reply for " .. tostring(req.id))
+              busy_session = session
+              print("[subagent] task " .. tostring(req.id) .. " from " .. tostring(sender))
+              -- Session reuse: same session id continues the previous
+              -- conversation (opencode-style session reuse); omit = fresh.
+              local req_messages = {}
+              if session and session ~= "" then
+                req_messages = load_session_history(session)
+                print("[subagent] session '" .. session .. "': " .. #req_messages .. " prior messages")
+              end
+              if req.context and req.context ~= "" then
+                req_messages[#req_messages + 1] = {role = "user", content = "[来自主代理的上下文]\n" .. req.context}
+              end
+              local task_text = req.task or ""
+              if req.role and req.role ~= "" then
+                task_text = "[角色: " .. req.role .. "]\n" .. task_text
+              end
+              -- persist into the session file when a session id is given
+              local persist = session and session ~= ""
+              local result = process_exchange(req_messages, config, task_text, persist, persist and session or nil)
+              busy_session = nil  -- release (opencode: Active → Reusable)
+              local reply
+              if result.error then
+                reply = json.encode({v = 1, id = req.id, ok = false, error = result.error, session = session})
+              else
+                reply = json.encode({v = 1, id = req.id, ok = true, result = result.text, session = session})
+              end
+              local ok_send = pcall(modem.send, sender, SUBAGENT_REPLY_PORT, reply)
+              if ok_send then
+                print("[subagent] reply sent for " .. tostring(req.id))
+              else
+                print("[subagent] FAILED to send reply for " .. tostring(req.id))
+              end
             end
           end
         end
