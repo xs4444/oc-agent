@@ -31,11 +31,12 @@ local function exec(name, args, deps)
       local function read_all(handle)
         local chunks = {}
         local ok_iter, err_iter = pcall(function()
-          local n = 0
+          -- Yield on EVERY chunk: http.lua warns that otherwise the
+          -- computer crashes with "too long without yielding". Responses
+          -- may be only 1-3 chunks, so a modulo would never fire.
           for chunk in handle do
-            n = n + 1
             chunks[#chunks + 1] = chunk
-            if n % 4 == 0 then os.sleep(0.02) end
+            os.sleep(0.02)
           end
         end)
         if not ok_iter then

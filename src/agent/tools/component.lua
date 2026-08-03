@@ -45,8 +45,9 @@ local function exec(name, args, deps)
       local comp = require("component")
       local resolved, err = comp.get(args.address)
       if not resolved then
-        local addr2 = comp.type(args.address) and args.address or nil
-        if not addr2 then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
+        -- no resolved proxy, but the address may still be a known component
+        -- (get only fails for unrecognized addresses); type() is the check
+        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
       end
       local addr = resolved or args.address
       local parts = {}
@@ -70,8 +71,9 @@ local function exec(name, args, deps)
       local comp = require("component")
       local resolved, err = comp.get(args.address)
       if not resolved then
-        local addr2 = comp.type(args.address) and args.address or nil
-        if not addr2 then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
+        -- no resolved proxy, but the address may still be a known component
+        -- (get only fails for unrecognized addresses); type() is the check
+        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
       end
       local addr = resolved or args.address
       local arg_values = {}

@@ -29,12 +29,9 @@ local tools = {
 -- json_query: extract value from JSON via dot path (arrays 0-indexed)
 local function json_query_code(json, json_str, path)
   if type(json_str) ~= "string" then return "Error: json argument must be a string" end
-  local ok_decode, data, derr = pcall(json.decode, json_str)
+  local ok_decode, data = pcall(json.decode, json_str)
   if not ok_decode then
     return "Error: invalid JSON: " .. tostring(data)
-  end
-  if data == nil and derr then
-    return "Error: invalid JSON: " .. tostring(derr)
   end
 
   local cur = data

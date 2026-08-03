@@ -304,8 +304,6 @@ package.preload["agent.config"] = function()
 -- Depends on require("filesystem").
 -- ═══════════════════════════════════════════════════════════════
 
-local fs = require("filesystem")
-
 -- Paths. If /home is not writable (OpenOS not installed to a writeable
 -- medium), fall back to the first writable mount (tmpfs/hdd).
 local function find_writable_base()
@@ -580,13 +578,24 @@ local function load_history()
   f:close()
   if content == "" then return {} end
 
-  -- Legacy format (whole-table serialization): migrate once to JSON-line format.
-  local ser = require("serialization")
-  local ok, data = pcall(ser.unserialize, content)
-  if ok and type(data) == "table" and (data[1] or data.role) then
-    local list = data.role and {data} or data
-    rebuild_history(list)  -- migrate
-    return trim_history(list)
+  -- JSON-line format: one message per line, skip corrupt lines.
+  -- Detect it first: the first char is "{" AND the content contains a
+  -- quoted "role" key. A legacy whole-table file never matches (OC's
+  -- serialization writes bare keys like role="user", no quotes), so this
+  -- can't be a false positive — and it prevents a JSON-lines file whose
+  -- first line happens to be a valid Lua expression from being
+  -- mis-migrated by the unserialize path below.
+  local is_json_lines = content:sub(1, 1) == "{" and content:find('"role"', 1, true) ~= nil
+
+  if not is_json_lines then
+    -- Legacy format (whole-table serialization): migrate once to JSON-line format.
+    local ser = require("serialization")
+    local ok, data = pcall(ser.unserialize, content)
+    if ok and type(data) == "table" and (data[1] or data.role) then
+      local list = data.role and {data} or data
+      rebuild_history(list)  -- migrate
+      return trim_history(list)
+    end
   end
 
   -- JSON-line format: one message per line, skip corrupt lines.
@@ -640,6 +649,10 @@ package.preload["agent.tools"] = function()
 -- into the tools/ directory via write_file; on the next start it is
 -- auto-registered here (no agent.lua edit needed).
 --
+-- NOTE (plugin bootstrap): writing a custom tool module to tools/ works
+-- in multi-file mode; the single-file build embeds modules via
+-- package.preload and cannot require new files.
+--
 -- Directory enumeration falls back to the builtin module list when the
 -- filesystem cannot be scanned (e.g. host-side test env without a real
 -- filesystem). Both paths are exercised by the test harness.
@@ -663,6 +676,13 @@ local BUILTIN = {
   "agent.tools.shell",
   "agent.tools.subagent",
 }
+
+-- Names already loaded by the BUILTIN loop (below). scan_dir skips these
+-- so the directory scan does not re-require the six core modules.
+-- This is a per-instance local table, NOT package.loaded: ocvm tests
+-- clear package.loaded and re-require the registry fresh, giving the
+-- reload semantics we want without double-loading builtins.
+local loaded_names = {}
 
 -- Resolve this module's own directory from the loader source, never cwd.
 -- Prefer AGENT_DIR exported by init.lua (entry script — its source is an
@@ -728,8 +748,10 @@ end
 -- `names_override` lets callers (e.g. tests) supply the module file
 -- names (e.g. "hello.lua", as fs.list would return) without relying on
 -- a real filesystem enumeration.
--- No package.loaded skip: already-loaded modules are re-registered into
--- the (new) registry; register() dedupes on name so ORDER stays stable.
+-- loaded_names (populated by the BUILTIN loop) is skipped here: the six
+-- core modules were already required, so the directory scan only loads
+-- genuinely new/custom modules. register() dedupes on name so ORDER
+-- stays stable across rescans.
 local function scan_dir(dir, names_override)
   local scanned = names_override or collect_dir_names(dir)
   for _, entry in ipairs(scanned) do
@@ -738,19 +760,20 @@ local function scan_dir(dir, names_override)
     if type(entry) == "string" and entry:match("%.lua$") and not entry:match("^agent%.") then
       req_name = "agent.tools." .. entry:gsub("%.lua$", "")
     end
-    if type(req_name) == "string" then
+    if type(req_name) == "string" and not loaded_names[req_name] then
       require_module(req_name)
+      loaded_names[req_name] = true
     end
   end
 end
 
 -- Core load: builtin modules first (deterministic), then any custom
--- modules discovered by the directory scan. No package.loaded skip:
--- re-require of an already-loaded module returns the cached table and
--- register() dedupes on name, so reloading the registry (e.g. after a
--- plugin module is added) correctly rebuilds the full set.
+-- modules discovered by the directory scan. Builtins are recorded in
+-- loaded_names so scan_dir does not re-require them; register() still
+-- dedupes on name so ORDER stays stable on re-scan/reload.
 for _, req_name in ipairs(BUILTIN) do
   require_module(req_name)
+  loaded_names[req_name] = true
 end
 scan_dir(TOOLS_DIR)
 
@@ -808,7 +831,16 @@ function M.run(name, args_str, deps)
       args = {}
     end
     -- Diagnose: expose raw args + error for debugging
-    local err_info = ok and tostring(decoded) or tostring(ok2 and decoded2)
+    local err_info
+    if ok and type(decoded) ~= "table" then
+      -- decode actually succeeded, but the result wasn't an object —
+      -- don't report it as a decode failure
+      err_info = "decoded to " .. type(decoded) .. ", expected object"
+    elseif ok then
+      err_info = tostring(ok2 and decoded2 or decoded)
+    else
+      err_info = tostring(decoded)
+    end
     return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200)
   end
 
@@ -1283,12 +1315,9 @@ local tools = {
 -- json_query: extract value from JSON via dot path (arrays 0-indexed)
 local function json_query_code(json, json_str, path)
   if type(json_str) ~= "string" then return "Error: json argument must be a string" end
-  local ok_decode, data, derr = pcall(json.decode, json_str)
+  local ok_decode, data = pcall(json.decode, json_str)
   if not ok_decode then
     return "Error: invalid JSON: " .. tostring(data)
-  end
-  if data == nil and derr then
-    return "Error: invalid JSON: " .. tostring(derr)
   end
 
   local cur = data
@@ -1569,8 +1598,9 @@ local function exec(name, args, deps)
       local comp = require("component")
       local resolved, err = comp.get(args.address)
       if not resolved then
-        local addr2 = comp.type(args.address) and args.address or nil
-        if not addr2 then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
+        -- no resolved proxy, but the address may still be a known component
+        -- (get only fails for unrecognized addresses); type() is the check
+        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
       end
       local addr = resolved or args.address
       local parts = {}
@@ -1594,8 +1624,9 @@ local function exec(name, args, deps)
       local comp = require("component")
       local resolved, err = comp.get(args.address)
       if not resolved then
-        local addr2 = comp.type(args.address) and args.address or nil
-        if not addr2 then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
+        -- no resolved proxy, but the address may still be a known component
+        -- (get only fails for unrecognized addresses); type() is the check
+        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
       end
       local addr = resolved or args.address
       local arg_values = {}
@@ -1657,11 +1688,12 @@ local function exec(name, args, deps)
       local function read_all(handle)
         local chunks = {}
         local ok_iter, err_iter = pcall(function()
-          local n = 0
+          -- Yield on EVERY chunk: http.lua warns that otherwise the
+          -- computer crashes with "too long without yielding". Responses
+          -- may be only 1-3 chunks, so a modulo would never fire.
           for chunk in handle do
-            n = n + 1
             chunks[#chunks + 1] = chunk
-            if n % 4 == 0 then os.sleep(0.02) end
+            os.sleep(0.02)
           end
         end)
         if not ok_iter then
@@ -2024,7 +2056,11 @@ local function handle_command(cmd, config, messages)
       local fs = require("filesystem")
       local ok_dir, dir_err = pcall(fs.makeDirectory, SESSIONS_DIR)
       if not ok_dir then print("Note: cannot create " .. SESSIONS_DIR .. " (" .. tostring(dir_err) .. ")") end
-      local stamp = tostring(os.time and pcall(os.time) and (select(2, pcall(os.time)) or "") or "")
+      local stamp = ""
+      if os.time then
+        local ok_t, t = pcall(os.time)
+        if ok_t and t then stamp = tostring(t) end
+      end
       if stamp == "" then
         local comp = require("computer")
         stamp = string.format("%.0f", comp.uptime() or 0)
@@ -2160,15 +2196,15 @@ local function process_exchange(messages, config, user_input, persist, session)
   return {text = table.concat(final_text, "\n")}
 end
 
-local function main(...)
+-- main(config, ...): config is loaded ONCE at the entry point below and
+-- passed in (same table instance the /model /key /url /tavily commands
+-- mutate via save_config).
+local function main(config, ...)
   local component = require("component")
   if not component.isAvailable("internet") then
     print("Error: No internet card found. Tier 2 Internet Card required.")
     return
   end
-
-  local config = load_config()
-  if not config then config = first_run_setup() end
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the
@@ -2233,7 +2269,11 @@ local function main(...)
               end
               -- persist into the session file when a session id is given
               local persist = session and session ~= ""
-              local result = process_exchange(req_messages, config, task_text, persist, persist and session or nil)
+              -- Guard against unexpected exceptions escaping process_exchange:
+              -- busy_session must be released either way, or this session would
+              -- be permanently stuck busy and reject all new tasks.
+              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil)
+              if not ok_proc then result = { error = tostring(result) } end
               busy_session = nil  -- release (opencode: Active → Reusable)
               local reply
               if result.error then
@@ -2296,11 +2336,14 @@ end
 -- `lua agent.lua` also starts in subagent mode.
 if not _TEST_MODE then
   local script_arg1 = ...
+  -- Load the config exactly once; main() receives the same table so the
+  -- /model /key /url /tavily commands still mutate + save the live config.
   local cfg = load_config()
+  if not cfg then cfg = first_run_setup() end
   if script_arg1 == "--subagent" or (cfg and cfg.subagent) then
-    main("--subagent", select(2, ...))
+    main(cfg, "--subagent", select(2, ...))
   else
-    main()
+    main(cfg)
   end
 end
 

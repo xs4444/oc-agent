@@ -193,13 +193,24 @@ local function load_history()
   f:close()
   if content == "" then return {} end
 
-  -- Legacy format (whole-table serialization): migrate once to JSON-line format.
-  local ser = require("serialization")
-  local ok, data = pcall(ser.unserialize, content)
-  if ok and type(data) == "table" and (data[1] or data.role) then
-    local list = data.role and {data} or data
-    rebuild_history(list)  -- migrate
-    return trim_history(list)
+  -- JSON-line format: one message per line, skip corrupt lines.
+  -- Detect it first: the first char is "{" AND the content contains a
+  -- quoted "role" key. A legacy whole-table file never matches (OC's
+  -- serialization writes bare keys like role="user", no quotes), so this
+  -- can't be a false positive — and it prevents a JSON-lines file whose
+  -- first line happens to be a valid Lua expression from being
+  -- mis-migrated by the unserialize path below.
+  local is_json_lines = content:sub(1, 1) == "{" and content:find('"role"', 1, true) ~= nil
+
+  if not is_json_lines then
+    -- Legacy format (whole-table serialization): migrate once to JSON-line format.
+    local ser = require("serialization")
+    local ok, data = pcall(ser.unserialize, content)
+    if ok and type(data) == "table" and (data[1] or data.role) then
+      local list = data.role and {data} or data
+      rebuild_history(list)  -- migrate
+      return trim_history(list)
+    end
   end
 
   -- JSON-line format: one message per line, skip corrupt lines.

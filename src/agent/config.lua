@@ -11,8 +11,6 @@
 -- Depends on require("filesystem").
 -- ═══════════════════════════════════════════════════════════════
 
-local fs = require("filesystem")
-
 -- Paths. If /home is not writable (OpenOS not installed to a writeable
 -- medium), fall back to the first writable mount (tmpfs/hdd).
 local function find_writable_base()
