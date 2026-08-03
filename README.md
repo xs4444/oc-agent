@@ -24,11 +24,30 @@
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
 
-## 部署
+## 部署（GitHub 自动安装，无需粘贴）
 
-1. 将 `agent.lua` 上传到 OC 计算机（`wget` / `pastebin get` / 手动复制）
-2. 运行 `lua agent.lua`
-3. 首次引导直接回车接受默认（免费模型，无需 API key）
+agent.lua 已发布到 GitHub（xs4444/oc-agent），游戏内一条命令安装：
+
+```bash
+# 方式 1: jsDelivr CDN（国内可达性好，推荐）
+wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@main/install.lua install.lua
+
+# 方式 2: GitHub raw（需要服务器能访问 GitHub）
+wget https://raw.githubusercontent.com/xs4444/oc-agent/main/install.lua install.lua
+
+# 运行安装器（自动下载 agent.lua + 校验；回答 y 配置为子代理）
+lua install.lua
+
+# 启动
+lua agent.lua                  # 主代理
+lua agent.lua -- --subagent    # 子代理（监听 modem 9090）
+```
+
+- 安装器自动检测可写目录（/home 只读时用挂载盘），支持 `lua install.lua /mnt/xxx` 指定目录
+- 更新：重新运行 install.lua 即覆盖为最新版（jsDelivr CDN 缓存可能延迟，必要时用 commit hash URL）
+- 手动方式（备用）：将 `agent.lua` 上传到 OC 计算机（wget / pastebin / 手动复制）
+
+> 首次引导直接回车接受默认（免费模型，无需 API key）；`/home` 只读时配置自动写入挂载盘。
 
 ```lua
 -- 游戏内命令
@@ -44,13 +63,14 @@
 ## 子代理部署（多台 OC 组网）
 
 ```bash
-# 子代理机器（需网络卡/无线网卡，与主代理同网络）：
-# OpenOS 的 lua 会吞掉 -- 开头的参数，用 -- 分隔符传递
+# 每台子代理机器（需网络卡/无线网卡，与主代理同网络）：
+# 安装器回答 y 自动写 subagent=true 配置，然后：
 lua agent.lua -- --subagent          # 监听 modem 端口 9090
 # 或在 config 里加 subagent=true，然后直接 lua agent.lua
 
 # 主代理机器：运行时 LLM 通过 component_list(filter="modem") 发现子代理地址，
-# 然后 subagent_call(address, task, role?, context?, timeout?) 委派任务。
+# 然后 subagent_call(address, task, role?, session?, context?, timeout?) 委派任务。
+# session 参数延续子代理的对话记录（同 id = 复用上下文，省略 = 新会话）。
 # 子代理收到后用自己的内存/磁盘/算力处理（完整 agent 循环），结果回传。
 ```
 
