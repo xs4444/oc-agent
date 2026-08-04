@@ -122,6 +122,7 @@ local function chat(messages, config)
   local msg = choice.message or {}
   return {
     content = msg.content,
+    reasoning_content = msg.reasoning_content,
     tool_calls = msg.tool_calls,
     finish_reason = choice.finish_reason
   }

@@ -1,10 +1,10 @@
 {
   "files": {
-    "chat.lua": 6648,
+    "chat.lua": 6695,
     "config.lua": 3349,
     "execute.lua": 2769,
     "http.lua": 2992,
-    "init.lua": 19475,
+    "init.lua": 19764,
     "json.lua": 5892,
     "session.lua": 10052,
     "subagent.lua": 4121,
@@ -16,5 +16,5 @@
     "tools/shell.lua": 1245,
     "tools/subagent.lua": 5015
   },
-  "version": "2026-08-04"
+  "version": "2026-08-05"
 }
