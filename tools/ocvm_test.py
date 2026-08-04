@@ -15,7 +15,8 @@ ocvm_test.py — 在 ocvm 模拟器中运行 agent.lua 测试脚本的驱动工�
     6. 宿主机侧轮询结果文件 (比屏幕轮询可靠)
     7. 输出结果
 
-环境: 需要服务器 192.168.31.75 (hcj/hcj2005) 上的 ocvm 构建。
+环境: 需要内网测试服务器上的 ocvm 构建（服务器地址与凭据经环境变量
+OCVM_HOST / OCVM_USER / OCVM_PASS 传入，不硬编码）。
 """
 import sys
 import time
@@ -23,9 +24,12 @@ import re
 import os
 import paramiko
 
-HOST = "192.168.31.75"
-USER = "hcj"
-PASS = "hcj2005"
+HOST = os.environ.get("OCVM_HOST", "")
+USER = os.environ.get("OCVM_USER", "")
+PASS = os.environ.get("OCVM_PASS", "")
+if not (HOST and USER and PASS):
+    print("错误: 请设置环境变量 OCVM_HOST / OCVM_USER / OCVM_PASS（SSH 到 ocvm 测试服务器）")
+    sys.exit(1)
 SESSION = "ocvm_t"
 VM_DIR = "~/oc-test/ocvm"
 TMP_DIR = "tmp_t"
