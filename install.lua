@@ -129,6 +129,29 @@ local function download_verified(relpath, dest, expected, attempts)
 end
 
 -- ── 多文件模式: 尝试下载并解析 files.json ──────────────────────
+-- files.json 是标准 JSON（"key": value）。真实 OpenOS 的
+-- serialization.unserialize 只认 OC 的 key=value 格式，解析 JSON 会
+-- 失败，因此先试 unserialize，失败则回退到 JSON 模式提取
+-- （清单结构固定: {"files": {"relpath": 字节数, ...}}）。
+local function parse_manifest(body)
+  local ser = require("serialization")
+  local ok, parsed = pcall(ser.unserialize, body)
+  if ok and type(parsed) == "table" and type(parsed.files) == "table" then
+    return parsed
+  end
+  -- JSON 回退: 提取所有 "relpath": <数字> 键值对（排除 "version" 等非文件键）
+  local files = {}
+  for relpath, size in body:gmatch('"([^"]+)"%s*:%s*(%d+)') do
+    if relpath ~= "version" then
+      files[relpath] = tonumber(size)
+    end
+  end
+  if next(files) then
+    return { files = files }
+  end
+  return nil
+end
+
 local manifest
 for i, base in ipairs(SOURCES) do
   local url = base .. "/files.json"
@@ -136,10 +159,8 @@ for i, base in ipairs(SOURCES) do
   local body = fetch(url)
   if body then
     print("  清单下载成功: " .. #body .. " 字节")
-    local ser = require("serialization")
-    local ok, parsed = pcall(ser.unserialize, body)
-    if ok and type(parsed) == "table" and type(parsed.files) == "table" then
-      manifest = parsed
+    manifest = parse_manifest(body)
+    if manifest then
       break
     else
       print("  清单解析失败，尝试下一个源")

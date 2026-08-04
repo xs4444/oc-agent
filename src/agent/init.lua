@@ -86,10 +86,12 @@ local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
 
--- Tool registry + execution dispatcher (Phase 1 split). execute_tool
--- below keeps the lazy require for parity with the original agent.lua.
+-- Tool registry + execution dispatcher (Phase 1 split). The deps
+-- table is built once at module scope (not on every call) to avoid
+-- per-invocation require lookups and table construction — critical in
+-- pure-Java LuaJ environments where these overheads are amplified.
 require("agent.tools")
-require("agent.execute")
+local execute_mod = require("agent.execute")
 
 local chat_mod = require("agent.chat")
 local chat = chat_mod.chat
@@ -105,23 +107,24 @@ local TOOLS = require("agent.tools").list()
 -- Injection point: session.lua's summarize/compact path needs chat.
 session_mod.set_chat(chat)
 
+-- Cached deps injected into plugin tool modules; built once, reused
+-- for every execute_tool call (no per-call require or table allocation).
+local DEPS = {
+  json = json,
+  http_post = http_post,
+  load_config = load_config,
+  wait_modem_message = subagent_mod.wait_modem_message,
+  subagent_listen_port = SUBAGENT_LISTEN_PORT,
+  subagent_reply_port = SUBAGENT_REPLY_PORT,
+  subagent_timeout = SUBAGENT_TIMEOUT,
+}
+
 -- ── Section 4: Tool Execution ──────────────────────────────────
 -- Tool implementations live in src/agent/tools/*.lua (registered in
--- agent.tools). This wrapper injects agent.lua's locals (json,
--- http_post, load_config, subagent protocol constants) as deps into
--- the plugin modules, then delegates to execute.lua.
+-- agent.tools). This thin wrapper delegates to execute.lua with the
+-- cached DEPS table.
 function execute_tool(name, args_str)
-  local subagent = require("agent.subagent")
-  local deps = {
-    json = json,
-    http_post = http_post,
-    load_config = load_config,
-    wait_modem_message = subagent.wait_modem_message,
-    subagent_listen_port = subagent.SUBAGENT_LISTEN_PORT,
-    subagent_reply_port = subagent.SUBAGENT_REPLY_PORT,
-    subagent_timeout = subagent.SUBAGENT_TIMEOUT,
-  }
-  return require("agent.execute").run(name, args_str, deps)
+  return execute_mod.run(name, args_str, DEPS)
 end
 
 -- ── Section 7: REPL & Main Loop ────────────────────────────────
