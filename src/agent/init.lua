@@ -264,11 +264,15 @@ local function process_exchange(messages, config, user_input, persist, session)
 
   local final_text = {}
   while true do
-    io.write("Thinking...\r")
+    io.write("Thinking...\n")
     local response = chat(messages, config)
 
     if response.error then
       return {error = response.error}
+    end
+
+    if response.reasoning_content then
+      print(response.reasoning_content)
     end
 
     if response.content then
@@ -291,23 +295,37 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
 
     for _, tc in ipairs(response.tool_calls) do
-      local tool_name = tc["function"].name
-      local tool_args = tc["function"].arguments
-      print("[tool] " .. tool_name)
-      local result = execute_tool(tool_name, tool_args)
-      -- Cap large tool outputs so history + memory stay bounded
-      if type(result) == "string" and #result > MAX_TOOL_RESULT then
-        result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
-      end
-      local tool_msg = {
-        role = "tool",
-        tool_call_id = tc.id,
-        content = result
-      }
-      messages[#messages + 1] = tool_msg
-      if persist then
-        if session then append_session_history(session, tool_msg)
-        else append_history(tool_msg) end
+      local fn = tc["function"]
+      if fn then
+        local tool_name = fn.name or "?"
+        local tool_args = fn.arguments
+        print("[tool] " .. tool_name)
+        local ok_call, result = pcall(execute_tool, tool_name, tool_args)
+        if not ok_call then
+          result = "Error: " .. tostring(result)
+        end
+        if type(result) == "string" and #result > MAX_TOOL_RESULT then
+          result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
+        end
+        local tool_msg = {
+          role = "tool",
+          tool_call_id = tc.id,
+          content = result
+        }
+        messages[#messages + 1] = tool_msg
+        if persist then
+          if session then append_session_history(session, tool_msg)
+          else append_history(tool_msg) end
+        end
+      else
+        local err_msg = "malformed tool_call (missing 'function')"
+        print("[error] " .. err_msg)
+        local tool_msg = {role = "tool", tool_call_id = tc.id or "?", content = "Error: " .. err_msg}
+        messages[#messages + 1] = tool_msg
+        if persist then
+          if session then append_session_history(session, tool_msg)
+          else append_history(tool_msg) end
+        end
       end
     end
   end
@@ -406,9 +424,10 @@ local function main(config, ...)
                 print("[subagent] reply sent for " .. tostring(req.id))
               else
                 print("[subagent] FAILED to send reply for " .. tostring(req.id))
-              end
-            end
-          end
+end
+      end
+      ::continue_tc::
+    end
         end
       end
     end
@@ -440,7 +459,10 @@ local function main(config, ...)
       table.remove(term_history, 1)  -- keep terminal history bounded
     end
 
-    process_exchange(messages, config, input, true)
+    local result = process_exchange(messages, config, input, true)
+    if result and result.error then
+      print("[error] " .. result.error)
+    end
 
     ::continue::
   end
