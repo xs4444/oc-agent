@@ -109,7 +109,7 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 └── pi-subagents/          # nicobailon/pi-subagents 源码（子代理参考）
 ```
 
-## 测试环境（Ubuntu 服务器 192.168.31.75）
+## 测试环境（内网 Ubuntu 测试服务器）
 
 游戏外验证链路（均已在真实 OpenOS 1.8.9 中通过）：
 

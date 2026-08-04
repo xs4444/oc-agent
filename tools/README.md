@@ -9,7 +9,7 @@ Windows 主机上的辅助工具：游戏交互截图/按键 + ocvm 测试驱动
 | `capture_minecraft.py` | 捕获指定 Minecraft 窗口（按标题匹配 "GT: New Horizons" 等），非全屏 | `python capture_minecraft.py [输出.png]` |
 | `capture_screen.py` | 全屏截图 | `python capture_screen.py [输出.png]` |
 | `type_to_oc.py` | 向游戏窗口模拟按键（向 OC 终端输入命令）| `python type_to_oc.py "<文本>"` |
-| `ocvm_test.py` | **ocvm 测试驱动**：自动重启虚拟机 → 等 OpenOS 启动 → 上传 agent.lua+测试脚本 → 探测挂载 → 运行 → 拉取结果 | `python ocvm_test.py <测试脚本.lua> [参数...]`（需可 SSH 到 192.168.31.75） |
+| `ocvm_test.py` | **ocvm 测试驱动**：自动重启虚拟机 → 等 OpenOS 启动 → 上传 agent.lua+测试脚本 → 探测挂载 → 运行 → 拉取结果 | `python ocvm_test.py <测试脚本.lua> [参数...]`（需可 SSH 到测试服务器） |
 
 ## 典型工作流
 
