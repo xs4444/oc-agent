@@ -25,3 +25,5 @@ wiki/markdown/
 
 # 根目录测试截图
 /*.png
+old_agent.lua
+test_harness/perf_result.txt
