@@ -23,7 +23,7 @@ local script_dir = debug.getinfo(1, "S").source:match("^@(.*)[/\\][^/\\]+$") or 
 local ROOT = script_dir .. "/.."
 local SRC = ROOT .. "/src/agent"
 
-local VERSION = os.date("%Y-%m-%d")
+local VERSION = os.date("%Y-%m-%dT%H%M")
 
 local function lf_normalize(content)
   return (content:gsub("\r\n", "\n"):gsub("\r", "\n"))
