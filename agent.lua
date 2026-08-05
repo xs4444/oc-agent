@@ -1137,6 +1137,139 @@ return {
 }
 end
 
+-- agent.agent.debug (embedded module)
+package.preload["agent.debug"] = function()
+-- ═══════════════════════════════════════════════════════════════
+-- agent.debug — 诊断报告收集 + 上传（Phase 4b 新增）。
+--
+-- 供 `/debug` 命令使用：把版本、配置（脱敏）、最近会话历史、
+-- 运行状态汇总成一个文本报告，可选上传到 GitHub Gist
+-- （api.github.com/gists），便于远程调试。
+--
+-- 依赖: agent.json / agent.http / agent.config（config 传参即可）。
+-- ═══════════════════════════════════════════════════════════════
+
+local json = require("agent.json")
+
+-- 脱敏: 只保留首 4 + 尾 4 字符
+local function mask(s)
+  if not s or s == "" then return "(未设置)" end
+  if #s <= 8 then return "***" end
+  return s:sub(1, 4) .. "***" .. s:sub(-4)
+end
+
+-- 单条消息 → 紧凑单行（截断长内容）
+local function msg_line(msg)
+  if type(msg) ~= "table" then return tostring(msg) end
+  local role = msg.role or "?"
+  local parts = { "[" .. role .. "]" }
+  if msg.tool_call_id then parts[#parts + 1] = "(" .. msg.tool_call_id .. ")" end
+  if msg.content and msg.content ~= "" then
+    local c = tostring(msg.content):gsub("\n", " "):gsub("\r", "")
+    if #c > 200 then c = c:sub(1, 197) .. "..." end
+    parts[#parts + 1] = c
+  end
+  if msg.tool_calls then
+    for _, tc in ipairs(msg.tool_calls) do
+      local fn = tc and tc["function"]
+      if fn then parts[#parts + 1] = "→tool:" .. tostring(fn.name or "?") end
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+-- 收集报告。config = 当前配置表；history = load_history() 结果（可选）。
+-- 返回报告字符串。
+local function collect(config, history)
+  local lines = {}
+
+  lines[#lines + 1] = "=== OC Agent Debug Report ==="
+  lines[#lines + 1] = "Generated: " .. (os.date and os.date("%Y-%m-%d %H:%M:%S") or "?")
+  lines[#lines + 1] = ""
+
+  -- 版本
+  local ver = "(未记录)"
+  do
+    local dir = type(AGENT_DIR) == "string" and AGENT_DIR or ""
+    local vf = dir ~= "" and io.open(dir .. "/version.txt", "r")
+    if vf then
+      local v = vf:read("*a"):gsub("%s", "")
+      vf:close()
+      if v ~= "" then ver = v end
+    end
+  end
+  lines[#lines + 1] = "Version: " .. ver
+
+  -- 运行状态
+  local computer = require("computer")
+  local ok_uptime, uptime = pcall(computer.uptime)
+  local ok_mem, free_mem = pcall(computer.freeMemory)
+  local ok_addr, addr = pcall(computer.address)
+  lines[#lines + 1] = "Uptime: " .. (ok_uptime and string.format("%.1f", uptime) or "?") .. "s"
+  lines[#lines + 1] = "Free memory: " .. (ok_mem and tostring(free_mem) or "?") .. " bytes"
+  lines[#lines + 1] = "Computer address: " .. (ok_addr and tostring(addr) or "?")
+  lines[#lines + 1] = ""
+
+  -- 配置（脱敏）
+  lines[#lines + 1] = "--- Config ---"
+  local cfg = config or {}
+  lines[#lines + 1] = "model: " .. tostring(cfg.model or "?")
+  lines[#lines + 1] = "api_url: " .. tostring(cfg.api_url or "?")
+  lines[#lines + 1] = "api_key: " .. mask(cfg.api_key)
+  lines[#lines + 1] = "tavily_key: " .. mask(cfg.tavily_key)
+  lines[#lines + 1] = "gist_token: " .. mask(cfg.gist_token)
+  lines[#lines + 1] = "subagent: " .. tostring(cfg.subagent or false)
+  lines[#lines + 1] = ""
+
+  -- 最近会话历史（默认最近 30 条，避免报告过大）
+  local max_msgs = 30
+  lines[#lines + 1] = "--- Recent history (last " .. max_msgs .. " of " .. tostring(history and #history or 0) .. ") ---"
+  if history and #history > 0 then
+    local start = math.max(1, #history - max_msgs + 1)
+    for i = start, #history do
+      lines[#lines + 1] = msg_line(history[i])
+    end
+  else
+    lines[#lines + 1] = "(empty)"
+  end
+
+  return table.concat(lines, "\n")
+end
+
+-- 上传到 GitHub Gist。返回 (url, err)。
+local function upload(report, token)
+  if not token or token == "" then
+    return nil, "no gist token configured (use /gist-token <token>)"
+  end
+  local http = require("agent.http")
+  local body = json.encode({
+    description = "OC Agent debug report",
+    public = false,
+    files = { ["debug_report.txt"] = { content = report } },
+  })
+  local headers = {
+    ["Content-Type"] = "application/json",
+    ["Authorization"] = "token " .. token,
+    ["Accept"] = "application/vnd.github+json",
+    ["User-Agent"] = "oc-agent",
+  }
+  local code, resp, err = http.post("https://api.github.com/gists", headers, body)
+  if err then return nil, "network: " .. tostring(err) end
+  if code ~= 201 then
+    return nil, "HTTP " .. tostring(code) .. ": " .. tostring(resp):sub(1, 200)
+  end
+  local url = resp and resp:match('"html_url"%s*:%s*"([^"]+)"')
+  if not url then url = resp and resp:match('"url"%s*:%s*"([^"]+)"') end
+  return url or "(gist created, no url parsed)"
+end
+
+return {
+  collect = collect,
+  upload = upload,
+  mask = mask,
+}
+end
+
 -- agent.agent.tools.file (embedded module)
 package.preload["agent.tools.file"] = function()
 -- ═══════════════════════════════════════════════════════════════
@@ -2170,6 +2303,50 @@ local function handle_command(cmd, config, messages)
     else
       print("Agent version: (未记录 — 请重新运行 update.lua 安装)")
     end
+  elseif command == "/debug" then
+    -- 收集诊断报告（版本+脱敏配置+最近历史）→ 写入本地 + 可选上传 Gist
+    local ok_debug, debug_mod = pcall(require, "agent.debug")
+    if not ok_debug then
+      print("Debug module unavailable: " .. tostring(debug_mod))
+    else
+      local report = debug_mod.collect(config, load_history())
+      local out_path = WRITABLE_BASE .. "/debug_report.txt"
+      local ok_w, werr = pcall(function()
+        local f = io.open(out_path, "w")
+        f:write(report)
+        f:close()
+      end)
+      if ok_w then
+        print("Debug report written to " .. out_path .. " (" .. #report .. " bytes)")
+      else
+        print("Cannot write " .. out_path .. ": " .. tostring(werr))
+      end
+      local token = config.gist_token
+      if token and token ~= "" then
+        print("Uploading to GitHub gist...")
+        local url, err = debug_mod.upload(report, token)
+        if url then
+          print("Gist uploaded: " .. url)
+        else
+          print("Upload failed: " .. tostring(err))
+        end
+      else
+        print("(set /gist-token <github_token> to auto-upload; or paste the report content)")
+      end
+    end
+  elseif command == "/gist-token" then
+    if parts[2] then
+      config.gist_token = parts[2]
+      save_config(config)
+      print("Gist token saved. /debug will now upload reports.")
+    else
+      if config.gist_token then
+        print("Gist token: " .. config.gist_token:sub(1, 4) .. "***")
+      else
+        print("Usage: /gist-token <github_personal_access_token>")
+        print("Get one at https://github.com/settings/tokens (scope: gist)")
+      end
+    end
   elseif command == "/tools" then
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
@@ -2185,6 +2362,8 @@ local function handle_command(cmd, config, messages)
     print("  /reset          Clear history without archiving")
     print("  /hist           Show message count in current session")
     print("  /version        Show installed agent version")
+    print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
+    print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
