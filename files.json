@@ -4,7 +4,7 @@
     "config.lua": 3349,
     "execute.lua": 2769,
     "http.lua": 2992,
-    "init.lua": 19764,
+    "init.lua": 20284,
     "json.lua": 5892,
     "session.lua": 10052,
     "subagent.lua": 4121,
@@ -13,7 +13,7 @@
     "tools/data.lua": 9636,
     "tools/file.lua": 7685,
     "tools/search.lua": 4566,
-    "tools/shell.lua": 1245,
+    "tools/shell.lua": 2182,
     "tools/subagent.lua": 5015
   },
   "version": "2026-08-05"
