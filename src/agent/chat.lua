@@ -39,6 +39,14 @@ local function build_system_prompt()
   local free_mem = safe_call(computer.freeMemory) or 0
 
   return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+    .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
+    .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
+    .. "- Read first N lines of a file: use read_file with offset=1 and limit=N (no 'head -N')\n"
+    .. "- Read last N lines: use read_file with offset=-N (no 'tail -N')\n"
+    .. "- Grep/search in files: use list_directory to find files, read_file to read, text_ops to search (no 'grep')\n"
+    .. "- Count file lines: read_file then text_ops op=length (no 'wc -l')\n"
+    .. "- List directory: list_directory tool (no 'ls' in shell; though 'ls' works in OpenOS, the tool is more reliable)\n\n"
+    .. "CRITICAL: Never run 'lua' or any command without arguments that starts an interactive/REPL session — it will block forever waiting for stdin input. Always pass a script: 'lua script.lua' or 'lua -e \"expression\"'.\n\n"
     .. "Available tools:\n"
     .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
     .. "- write_file: Write content to a file (new files or full rewrites)\n"
