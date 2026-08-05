@@ -232,6 +232,50 @@ local function handle_command(cmd, config, messages)
     else
       print("Agent version: (未记录 — 请重新运行 update.lua 安装)")
     end
+  elseif command == "/debug" then
+    -- 收集诊断报告（版本+脱敏配置+最近历史）→ 写入本地 + 可选上传 Gist
+    local ok_debug, debug_mod = pcall(require, "agent.debug")
+    if not ok_debug then
+      print("Debug module unavailable: " .. tostring(debug_mod))
+    else
+      local report = debug_mod.collect(config, load_history())
+      local out_path = WRITABLE_BASE .. "/debug_report.txt"
+      local ok_w, werr = pcall(function()
+        local f = io.open(out_path, "w")
+        f:write(report)
+        f:close()
+      end)
+      if ok_w then
+        print("Debug report written to " .. out_path .. " (" .. #report .. " bytes)")
+      else
+        print("Cannot write " .. out_path .. ": " .. tostring(werr))
+      end
+      local token = config.gist_token
+      if token and token ~= "" then
+        print("Uploading to GitHub gist...")
+        local url, err = debug_mod.upload(report, token)
+        if url then
+          print("Gist uploaded: " .. url)
+        else
+          print("Upload failed: " .. tostring(err))
+        end
+      else
+        print("(set /gist-token <github_token> to auto-upload; or paste the report content)")
+      end
+    end
+  elseif command == "/gist-token" then
+    if parts[2] then
+      config.gist_token = parts[2]
+      save_config(config)
+      print("Gist token saved. /debug will now upload reports.")
+    else
+      if config.gist_token then
+        print("Gist token: " .. config.gist_token:sub(1, 4) .. "***")
+      else
+        print("Usage: /gist-token <github_personal_access_token>")
+        print("Get one at https://github.com/settings/tokens (scope: gist)")
+      end
+    end
   elseif command == "/tools" then
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
@@ -247,6 +291,8 @@ local function handle_command(cmd, config, messages)
     print("  /reset          Clear history without archiving")
     print("  /hist           Show message count in current session")
     print("  /version        Show installed agent version")
+    print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
+    print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")

@@ -25,6 +25,7 @@ local MODULES = {
   "agent.execute",
   "agent.chat",
   "agent.subagent",
+  "agent.debug",
 }
 
 -- Tool plugin modules (same canonical order as agent.tools BUILTIN).
