@@ -1,8 +1,10 @@
 -- ═══════════════════════════════════════════════════════════════
 -- OC Agent 安装脚本（小型引导程序）
 -- 用法（任选其一，游戏内 OpenOS shell 执行）：
---   1) wget 下载:   wget https://raw.githubusercontent.com/xs4444/oc-agent/main/install.lua install.lua
---   2) 或 jsDelivr: wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@main/install.lua install.lua
+--   1) jsDelivr CDN（国内可达，推荐）:
+--      wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@master/install.lua install.lua
+--   2) GitHub raw（需服务器可访问 GitHub）:
+--      wget https://raw.githubusercontent.com/xs4444/oc-agent/master/install.lua install.lua
 --   然后:           lua install.lua
 --   可选参数:       lua install.lua [目录] [ref]
 --                   ref 默认 main，可用 <sha> 精确锁版（v2 新增）
@@ -13,19 +15,20 @@
 --     按清单字节数校验，失败重试 ×3，已下载文件幂等覆盖
 --   * 回退模式（v1 兼容）: 清单下载/解析失败时，下载单文件 agent.lua
 --     到当前目录（老路径完全可用）
---   * 双源 fallback（GitHub raw + jsDelivr CDN）
+--   * 双源 fallback（jsDelivr CDN 优先 + GitHub raw 备用）
 --   * 自动探测可写目录 / 命令行指定目录
 --   * 可选: 写子代理配置文件（subagent = true）
 -- ═══════════════════════════════════════════════════════════════
 
--- 命令行参数: [1]=目标目录, [2]=Git ref（默认 main，可用 <sha>）
+-- 命令行参数: [1]=目标目录, [2]=Git ref（默认 master，可用 <sha>）
 local DEST_DIR = select(1, ...)
 local REF = select(2, ...)
-if not REF or REF == "" then REF = "main" end
+if not REF or REF == "" then REF = "master" end
 
+-- jsDelivr 排首位（国内可达性好），GitHub raw 作为 fallback
 local SOURCES = {
-  "https://raw.githubusercontent.com/xs4444/oc-agent/" .. REF,
   "https://cdn.jsdelivr.net/gh/xs4444/oc-agent@" .. REF,
+  "https://raw.githubusercontent.com/xs4444/oc-agent/" .. REF,
 }
 local EXPECTED_MIN = 60000  -- 回退模式: 单文件 agent.lua 应至少 60KB
 
