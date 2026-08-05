@@ -31,10 +31,10 @@ agent.lua 已发布到 GitHub（xs4444/oc-agent），游戏内一条命令安装
 
 ```bash
 # 方式 1: jsDelivr CDN（国内可达性好，推荐）
-wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@main/install.lua install.lua
+wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@master/install.lua install.lua
 
 # 方式 2: GitHub raw（需要服务器能访问 GitHub）
-wget https://raw.githubusercontent.com/xs4444/oc-agent/main/install.lua install.lua
+wget https://raw.githubusercontent.com/xs4444/oc-agent/master/install.lua install.lua
 
 # 运行安装器（自动下载 agent.lua + 校验；回答 y 配置为子代理）
 lua install.lua
