@@ -114,7 +114,7 @@ local function download_verified(relpath, dest, expected, attempts)
   local source_count = #SOURCES
   for attempt = 1, attempts do
     local i = ((attempt - 1) % source_count) + 1
-    local url = SOURCES[i] .. "/" .. relpath
+    local url = SOURCES[i] .. "/src/agent/" .. relpath
     print("  尝试源 " .. i .. "/" .. source_count .. " (第 " .. attempt .. " 次): " .. url)
     local body, err = fetch(url)
     if body and #body == expected then
