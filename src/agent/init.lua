@@ -228,7 +228,18 @@ local function handle_command(cmd, config, messages)
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
   elseif command == "/help" then
-    print("Commands: /model /key /url /tavily /new /compact /reset /hist /tools /help /exit")
+    print("Commands:")
+    print("  /model <name>   Switch LLM model (e.g. deepseek-v4-flash-free)")
+    print("  /key <api_key>  Set API key (empty = free model, no key needed)")
+    print("  /url <endpoint> Switch API endpoint (OpenAI-compatible)")
+    print("  /tavily <key>   Enable Tavily web search (better than default HN search)")
+    print("  /new            Archive current session, start fresh conversation")
+    print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
+    print("  /reset          Clear history without archiving")
+    print("  /hist           Show message count in current session")
+    print("  /tools          List available tools the AI can use")
+    print("  /help           Show this help")
+    print("  /exit           Quit the agent")
   elseif command == "/exit" then
     return true, config, messages
   else
