@@ -328,6 +328,38 @@ function mock_internet.request(url, data, headers, method)
   error("internet.mock: cannot handle " .. url)
 end
 
+-- OpenOS thread mock (used by agent.tools.shell's shell_execute timeout guard).
+-- The real thread library runs the function in a cooperative child thread and
+-- waitForAll honors a timeout; this mock runs synchronously and always reports
+-- the thread as dead, so local tests exercise the thread branch (require
+-- succeeds) without ever really blocking. The true timeout path (thread stays
+-- alive past the deadline, killed via t:kill()) must be validated on real OC /
+-- ocvm.
+local mock_thread = {}
+function mock_thread.create(fp, ...)
+  -- synchronous execution; stores result in the thread object
+  local t = {}
+  local args = {...}
+  -- select("#", ...) counts varargs on both Lua 5.3 (OC) and 5.4 (test env);
+  -- table.maxn was removed in 5.4.
+  local n = select("#", ...)
+  local ok, res = pcall(fp, table.unpack(args, 1, n))
+  t.result = ok and res or nil
+  t.err = ok and nil or res
+  t.status_ = "dead"
+  function t:kill() self.status_ = "dead" end
+  return t
+end
+function mock_thread.waitForAll(threads, timeout)
+  for _, t in ipairs(threads) do
+    if t.status_ ~= "dead" then return nil, "thread join timed out" end
+  end
+  return true
+end
+function mock_thread.waitForAny(threads, timeout)
+  return mock_thread.waitForAll(threads, timeout)
+end
+
 -- Register mocks globally for agent.lua to use
 local M = {
   component = mock_component,
@@ -337,6 +369,7 @@ local M = {
   internet = mock_internet,
   serialization = mock_serialization,
   event = mock_event,
+  thread = mock_thread,
 }
 
 -- component.modem — real OC exposes primary component proxies like this
