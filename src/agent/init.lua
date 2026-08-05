@@ -223,6 +223,15 @@ local function handle_command(cmd, config, messages)
     print("History cleared")
   elseif command == "/hist" then
     print(#messages .. " messages in history")
+  elseif command == "/version" then
+    -- 读取安装时写入的 version.txt（install.lua 生成）
+    local vf = io.open(AGENT_DIR .. "/version.txt", "r")
+    if vf then
+      print("Agent version: " .. (vf:read("*a"):gsub("%s", "") or "?"))
+      vf:close()
+    else
+      print("Agent version: (未记录 — 请重新运行 update.lua 安装)")
+    end
   elseif command == "/tools" then
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
@@ -237,6 +246,7 @@ local function handle_command(cmd, config, messages)
     print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
     print("  /reset          Clear history without archiving")
     print("  /hist           Show message count in current session")
+    print("  /version        Show installed agent version")
     print("  /tools          List available tools the AI can use")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
