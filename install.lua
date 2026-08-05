@@ -157,8 +157,12 @@ local function parse_manifest(body)
       files[relpath] = tonumber(size)
     end
   end
+  -- 同时提取 version 字符串（JSON 回退时保留，供安装后显示）
+  local ver = body:match('"version"%s*:%s*"([^"]+)"')
   if next(files) then
-    return { files = files }
+    local m = { files = files }
+    if ver then m.version = ver end
+    return m
   end
   return nil
 end
@@ -172,6 +176,7 @@ for i, base in ipairs(SOURCES) do
     print("  清单下载成功: " .. #body .. " 字节")
     manifest = parse_manifest(body)
     if manifest then
+      print("  最新版本: " .. tostring(manifest.version or "?"))
       break
     else
       print("  清单解析失败，尝试下一个源")
@@ -227,6 +232,15 @@ if manifest then
     print("有 " .. failed .. " 个文件下载失败。请检查网络后重新运行 install.lua；")
     print("已下载的文件会被幂等覆盖，无需清理。")
     return
+  end
+
+  -- 记录已安装版本（update.lua 据此判断是否需要更新）
+  do
+    local vf = io.open(AGENT_DIR .. "/version.txt", "w")
+    if vf then
+      vf:write(tostring(manifest.version or "?"))
+      vf:close()
+    end
   end
 
   ask_subagent()
