@@ -231,15 +231,38 @@ if manifest then
 
   ask_subagent()
 
+  -- ── PATH 集成: 创建 /home/bin/agent 启动器（OpenOS 默认 PATH 含 /home/bin）──
+  local launcher_ok = false
+  local launcher_path = "/home/bin/agent.lua"
+  do
+    local mk_ok, mk_err = pcall(function()
+      local fs_mod = require("filesystem")
+      fs_mod.makeDirectory("/home/bin")
+    end)
+    local lf = io.open(launcher_path, "w")
+    if lf then
+      lf:write("-- agent launcher (created by install.lua)\n")
+      lf:write("AGENT_DIR = " .. string.format("%q", AGENT_DIR) .. "\n")
+      lf:write("package.path = " .. string.format("%q", AGENT_DIR .. "/../?.lua;") .. " .. (package.path or '')\n")
+      lf:write("local chunk = assert(loadfile(AGENT_DIR .. '/agent.lua'))\n")
+      lf:write("chunk(...)\n")
+      lf:close()
+      launcher_ok = true
+    end
+  end
+
   print("")
   print("安装完成！")
   print("  模块数: " .. installed .. " 个（版本 " .. tostring(manifest.version or "?") .. "）")
   print("  安装路径: " .. AGENT_DIR)
   print("  启动方式:")
-  print("    cd " .. AGENT_DIR)
-  print("    lua agent.lua")
-  print("  （或绝对路径: lua " .. AGENT_DIR .. "/agent.lua）")
-  print("  更新方式:  重新运行本脚本即可覆盖为最新版")
+  print("    agent                    -- 任意目录直接运行（PATH 集成）")
+  print("    agent -- --subagent      -- 子代理模式")
+  if not launcher_ok then
+    print("  ⚠️  无法写入 " .. launcher_path .. "（PATH 启动器创建失败）")
+    print("     可手动: lua " .. AGENT_DIR .. "/agent.lua")
+  end
+  print("  更新方式:  lua update.lua")
 else
   -- ── 回退模式 (v1 单文件流程，完全兼容) ─────────────────
   print("")

@@ -37,8 +37,21 @@ local function build_system_prompt()
   local address = safe_call(computer.address) or "unknown"
   local uptime = safe_call(computer.uptime) or 0
   local free_mem = safe_call(computer.freeMemory) or 0
+  -- Working directory (agent 所在的工作区): OpenOS shell cwd, 或 AGENT_DIR
+  local cwd
+  do
+    local ok_sh, sh = pcall(require, "shell")
+    if ok_sh and type(sh.getWorkingDirectory) == "function" then
+      local ok_cwd, c = pcall(sh.getWorkingDirectory)
+      if ok_cwd then cwd = c end
+    end
+    if not cwd or cwd == "" then
+      cwd = (type(AGENT_DIR) == "string" and AGENT_DIR ~= "") and AGENT_DIR or "/"
+    end
+  end
 
   return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+    .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
     .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
     .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
     .. "- Read first N lines of a file: use read_file with offset=1 and limit=N (no 'head -N')\n"
