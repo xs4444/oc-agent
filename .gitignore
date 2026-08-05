@@ -27,3 +27,6 @@ wiki/markdown/
 /*.png
 old_agent.lua
 test_harness/perf_result.txt
+agent_config.txt
+perf_result.txt
+backup-*.rar
