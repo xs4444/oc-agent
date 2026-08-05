@@ -208,8 +208,8 @@ if manifest then
   table.sort(relpaths)
 
   print("")
-  print("按清单安装 " .. #relpaths .. " 个模块到 " .. AGENT_DIR)
-  local installed, failed = 0, 0
+  print("按清单检查 " .. #relpaths .. " 个模块（增量更新，未变动的文件跳过）")
+  local installed, skipped, failed = 0, 0, 0
   for _, relpath in ipairs(relpaths) do
     local expected = manifest.files[relpath]
     local dest
@@ -218,12 +218,22 @@ if manifest then
     else
       dest = AGENT_DIR .. "/" .. relpath
     end
-    print("下载 " .. relpath .. " (期望 " .. expected .. " 字节)")
-    local ok = download_verified(relpath, dest, expected, 3)
-    if ok then
-      installed = installed + 1
+    -- 增量判断: 本地文件已存在且字节数 == manifest 期望值 → 跳过
+    local up_to_date = false
+    do
+      local ok_size, sz = pcall(fs.size, dest)
+      if ok_size and sz == expected then up_to_date = true end
+    end
+    if up_to_date then
+      skipped = skipped + 1
     else
-      failed = failed + 1
+      print("更新 " .. relpath .. " (期望 " .. expected .. " 字节)")
+      local ok = download_verified(relpath, dest, expected, 3)
+      if ok then
+        installed = installed + 1
+      else
+        failed = failed + 1
+      end
     end
   end
 
@@ -268,6 +278,7 @@ if manifest then
   print("")
   print("安装完成！")
   print("  模块数: " .. installed .. " 个（版本 " .. tostring(manifest.version or "?") .. "）")
+  print("  本次更新: " .. installed .. " 个文件" .. (skipped > 0 and ("，" .. skipped .. " 个未变化已跳过") or ""))
   print("  安装路径: " .. AGENT_DIR)
   print("  启动方式:")
   print("    agent                    -- 任意目录直接运行（PATH 集成）")
