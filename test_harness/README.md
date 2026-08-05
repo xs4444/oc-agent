@@ -50,7 +50,14 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 
 任务编号：1=基础对话 2=文件读写 3=组件链(list→doc→invoke) 4=execute_lua 计算 5=多组件查询
 
-### 历史诊断（开发期产物，保留参考）
+| `modular_ocvm_test.lua` | **模块化 e2e**：验证多文件 require 链 + 插件自举闭环（写模块→注册→调用→坏模块跳过） | 22 项 |
+| `perf_test.lua` | **工具调用性能监测**：循环 json_query/calc/text_ops/文件工具 N 次，对比新旧版本耗时 | `lua perf_test.lua <agent.lua路径> [循环次数]` |
+
+### 插件/自举测试
+
+| 脚本 | 用途 |
+|------|------|
+| `plugin_test.lua` | **插件注册测试**：临时目录写假模块 → scan_dir 注册 → 调用 → 坏模块跳过（12 项） |
 
 `debug_*.lua`（io/print 行为探查）、`diag_go.lua`（HTTP 原始响应）、`trace*.lua`（逐步追踪）、`test_main.lua`（main() 崩溃捕获）
 
@@ -64,6 +71,10 @@ python ../tools/ocvm_test.py <测试脚本.lua> [脚本参数...]
 python ../tools/ocvm_test.py search_test.lua
 python ../tools/ocvm_test.py newfeat_test.lua
 python ../tools/ocvm_test.py filetools_test.lua
+
+# 性能对比（本地 mock 环境测相对差异）
+../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" perf_test.lua ../old_agent.lua 2>&1 | grep iters
+../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" perf_test.lua ../agent.lua 2>&1 | grep iters
 
 # 手动方式（ocvm，挂载名每次重启会变，先 ls /mnt 确认）：
 # 在 OpenOS shell 中：
