@@ -2224,7 +2224,6 @@ local function process_exchange(messages, config, user_input, persist, session)
       if fn then
         local tool_name = fn.name or "?"
         local tool_args = fn.arguments
-        print("[tool] " .. tool_name)
         local ok_call, result = pcall(execute_tool, tool_name, tool_args)
         if not ok_call then
           result = "Error: " .. tostring(result)
@@ -2232,6 +2231,27 @@ local function process_exchange(messages, config, user_input, persist, session)
         if type(result) == "string" and #result > MAX_TOOL_RESULT then
           result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
         end
+
+        -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
+        local KEY_FIELD = {
+          read_file="path", write_file="path", edit_file="path", append_file="path",
+          list_directory="path", shell_execute="command", component_doc="address",
+          component_invoke="method", web_search="query", subagent_call="task",
+          calc="expression", json_query="path", text_ops="op", component_list="filter",
+        }
+        local param_str = ""
+        local kf = KEY_FIELD[tool_name]
+        if kf and tool_args then
+          param_str = tool_args:match('"' .. kf .. '"%s*:%s*"([^"]*)"')
+                   or tool_args:match('"' .. kf .. '"%s*:%s*(%d+)') or ""
+          if #param_str > 30 then param_str = param_str:sub(1, 28) .. ".." end
+        end
+        local result_brief = ""
+        if type(result) == "string" then
+          result_brief = result:gsub("\n", " | "):sub(1, 60)
+          if #result > 60 then result_brief = result_brief .. "..." end
+        end
+        print("[" .. tool_name .. (param_str ~= "" and (" " .. param_str) or "") .. "] " .. result_brief)
         local tool_msg = {
           role = "tool",
           tool_call_id = tc.id,
