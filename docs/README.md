@@ -33,5 +33,8 @@ docs/
 - **健壮性**：迭代器错误捕获、参数容错、yield 保护、内存三重裁剪、HTTP 自动重试（均源于模拟器/真实环境实测发现）
 - **持久化**：append-only JSONL 会话日志（替代整表重写）+ anchored summary 增量压缩 + 会话归档
 - **安装方式**：从"loot 磁盘"改为 GitHub 自动安装（install.lua 引导器，jsDelivr CDN + GitHub raw 双源）
+- **工具调用性能优化**：deps 表模块级缓存（每次调用省去 2 次 require + 1 次表构造），LuaJ 环境下性能回归接近旧版 upvalue 直调
+- **推理过程显示**：支持 DeepSeek 模型的 `reasoning_content` 字段，思考链先于回答打印
+- **弱模型容错**：nil 保护 + pcall 包裹工具调用，格式错误的 tool_calls 不崩溃
 
 核心架构（两级循环 + 工具契约 + 动态系统提示）与设计文档一致。

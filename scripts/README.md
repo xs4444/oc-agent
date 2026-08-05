@@ -1,8 +1,13 @@
-# scripts — 一次性工具脚本
+# scripts — 构建与工具脚本
 
-开发过程中使用的转换/下载工具。多为一次性运行，保留作参考。
+## 构建脚本
 
-## 脚本说明
+| 脚本 | 用途 | 用法 |
+|------|------|------|
+| `build_single.lua` | **单文件构建**：将 `src/agent/` 模块树用 `package.preload` 拼接为单文件 `agent.lua`（分发用） | `lua scripts/build_single.lua` |
+| `make_manifest.lua` | **安装清单生成**：扫描 `src/agent/` 模块，生成 `files.json`（安装器校验用，按 LF 归一化字节数） | `lua scripts/make_manifest.lua` |
+
+## 一次性工具
 
 | 脚本 | 用途 | 备注 |
 |------|------|------|
@@ -12,8 +17,10 @@
 ## 运行
 
 ```bash
-python doku2md.py           # 转换 wiki/raw/ → wiki/markdown/
-python download_images.py   # 下载 wiki 图片
+lua scripts/build_single.lua            # 构建 agent.lua
+lua scripts/make_manifest.lua           # 生成 files.json
+python scripts/doku2md.py               # 转换 wiki/raw/ → wiki/markdown/
+python scripts/download_images.py       # 下载 wiki 图片
 ```
 
-两者均为一次性产物生成工具；日常 agent 开发查阅文档直接看 `wiki/reference/`（手工精选版，比机器转换版更精炼）。
+构建脚本是日常开发的一部分（`build_single.lua` 每次模块变更后运行），一次性工具保留作参考。
