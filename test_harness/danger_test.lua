@@ -133,17 +133,19 @@ test("loop script created", io.open(loop_file, "r") ~= nil)
 -- 语法验证（只编译不执行）
 local chk = loadfile(loop_file)
 test("loop script is valid Lua (compiles)", chk ~= nil, tostring(chk))
--- 执行：mock shell 替换为限时版（真实死循环在 mock 中会永久挂起，
+-- 执行：io.popen 替换为限时版（真实死循环在 mock 中会永久挂起，
 -- 替换为"超时返回"模拟 OC 中命令卡死的恢复路径）。
 -- 注意：oc_mock 的 thread 是同步 mock，shell_execute 会走到 thread 分支
 -- 但不会真正超时；真实超时踢出路径需在 ocvm/真机验证。
-local orig_execute = oc_mock.shell.execute
-oc_mock.shell.execute = function(cmd)
-  -- 模拟执行死循环：永不返回 → 这里模拟系统超时踢出
-  return false, "timeout: command exceeded 2s budget"
+local orig_popen = io.popen
+io.popen = function(cmd, mode)
+  if cmd and cmd:find("loop") then
+    return nil  -- 模拟执行失败（死循环被系统踢出）
+  end
+  return orig_popen(cmd, mode)
 end
 local r3 = run_tool("shell_execute", {command = "lua " .. loop_file, timeout = 0.5})
-oc_mock.shell.execute = orig_execute
+io.popen = orig_popen
 print("  (mock-limited) tool returned: " .. tostring(r3))
 -- 关键断言：shell_execute 带 timeout 保护（thread + waitForAll + kill），
 -- 命令卡死/超时后 agent 不崩溃、返回字符串结果

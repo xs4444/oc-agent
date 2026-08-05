@@ -23,18 +23,27 @@ local function exec(name, args, deps)
     local ok, result = pcall(function()
       local thread_ok, thread = pcall(require, "thread")
       if not thread_ok then
-        -- no thread library (mock/legacy): direct execution
-        local sh = require("shell")
-        return sh.execute(args.command)
+        -- no thread library (mock/legacy): direct execution with popen capture
+        local handle = io.popen(args.command .. " 2>&1")
+        if not handle then return "Error: failed to execute command" end
+        local output = handle:read("*a")
+        handle:close()
+        return output ~= "" and output or "(no output)"
       end
       local sh = require("shell")
       local done = false
       local out = nil
       local t = thread.create(function()
         local okc, res = pcall(function()
-          return sh.execute(args.command)
+          -- Capture stdout+stderr via io.popen instead of shell.execute
+          -- (shell.execute returns only exit status, not output)
+          local handle = io.popen(args.command .. " 2>&1")
+          if not handle then return "Error: failed to execute command" end
+          local output = handle:read("*a")
+          handle:close()
+          return output ~= "" and output or "(no output)"
         end)
-        out = okc and tostring(res) or ("Error: " .. tostring(res))
+        out = okc and res or ("Error: " .. tostring(res))
         done = true
       end)
       local wok, werr = thread.waitForAll({t}, timeout)
