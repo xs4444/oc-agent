@@ -10,14 +10,18 @@
 
 local json = require("agent.json")
 
--- 脱敏: 只保留首 4 + 尾 4 字符
+-- 脱敏: token 类完全遮蔽；key 类保留首 4 + 尾 4
 local function mask(s)
   if not s or s == "" then return "(未设置)" end
   if #s <= 8 then return "***" end
   return s:sub(1, 4) .. "***" .. s:sub(-4)
 end
+local function mask_token(s)
+  if not s or s == "" then return "(未设置)" end
+  return "(已设置 " .. #s .. " 字符)"
+end
 
--- 单条消息 → 紧凑单行（截断长内容）
+-- 单条消息 → 紧凑单行（tool 结果截断放宽到 1000 字符）
 local function msg_line(msg)
   if type(msg) ~= "table" then return tostring(msg) end
   local role = msg.role or "?"
@@ -25,7 +29,7 @@ local function msg_line(msg)
   if msg.tool_call_id then parts[#parts + 1] = "(" .. msg.tool_call_id .. ")" end
   if msg.content and msg.content ~= "" then
     local c = tostring(msg.content):gsub("\n", " "):gsub("\r", "")
-    if #c > 200 then c = c:sub(1, 197) .. "..." end
+    if #c > 1000 then c = c:sub(1, 997) .. "..." end
     parts[#parts + 1] = c
   end
   if msg.tool_calls then
@@ -43,7 +47,19 @@ local function collect(config, history)
   local lines = {}
 
   lines[#lines + 1] = "=== OC Agent Debug Report ==="
-  lines[#lines + 1] = "Generated: " .. (os.date and os.date("%Y-%m-%d %H:%M:%S") or "?")
+  -- 时间: os.date 在无 RTC 时返回 epoch (1970)，此时回退用 uptime
+  do
+    local ts
+    local ok_d, d = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+    if ok_d and d and d:match("^20%d%d%-") then
+      ts = d
+    else
+      local ok_c, comp = pcall(require, "computer")
+      local ok_u, u = ok_c and pcall(comp.uptime)
+      ts = "uptime " .. (ok_u and string.format("%.0f", u) .. "s" or "?")
+    end
+    lines[#lines + 1] = "Generated: " .. ts
+  end
   lines[#lines + 1] = ""
 
   -- 版本
@@ -69,14 +85,14 @@ local function collect(config, history)
   lines[#lines + 1] = "Computer address: " .. (ok_addr and tostring(addr) or "?")
   lines[#lines + 1] = ""
 
-  -- 配置（脱敏）
+  -- 配置（脱敏：api_key/tavily_key 首尾4位，gist_token 完全遮蔽）
   lines[#lines + 1] = "--- Config ---"
   local cfg = config or {}
   lines[#lines + 1] = "model: " .. tostring(cfg.model or "?")
   lines[#lines + 1] = "api_url: " .. tostring(cfg.api_url or "?")
   lines[#lines + 1] = "api_key: " .. mask(cfg.api_key)
   lines[#lines + 1] = "tavily_key: " .. mask(cfg.tavily_key)
-  lines[#lines + 1] = "gist_token: " .. mask(cfg.gist_token)
+  lines[#lines + 1] = "gist_token: " .. mask_token(cfg.gist_token)
   lines[#lines + 1] = "subagent: " .. tostring(cfg.subagent or false)
   lines[#lines + 1] = ""
 
