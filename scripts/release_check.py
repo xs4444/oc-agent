@@ -89,13 +89,15 @@ def main():
                            cwd=ROOT, capture_output=True, text=True)
         check(f"{name} 语法", r.returncode == 0, r.stderr.strip()[:120] if r.returncode else "")
 
-    # 4) git 干净度（允许未跟踪新文件与 files.json 本身）
+    # 4) git 干净度（允许未跟踪新文件、files.json、wiki/ lane 改动）
     dirty = []
     for line in git(["status", "--short"]).splitlines():
         if line.startswith("??"):
             continue
         if "files.json" in line:
             continue
+        if "wiki/" in line:
+            continue  # wiki lane 独立工作流，不属于 agent 发版范围
         dirty.append(line.strip())
     check("无意外未提交改动", not dirty, "; ".join(dirty)[:200] if dirty else "")
 
