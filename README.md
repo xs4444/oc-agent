@@ -25,8 +25,9 @@
 - **对话压缩**：历史超限时自动用 LLM 生成摘要替换旧消息（保留最近 4 条），失败回退裁剪；`/compact` 手动触发
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **诊断上报**：`/debug` 收集版本+脱敏配置+最近历史 → 本地文件 + 可选上传 GitHub Gist（`/gist-token <token>` 配置，scope: gist）
-- **增量更新**：`lua update.lua` 只下载有变动的文件（按 files.json 字节对比跳过），版本号带时间戳可区分
-- **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
+ - **增量更新**：`lua update.lua` 只下载有变动的文件（按 files.json 字节对比跳过），版本号带时间戳可区分
+ - **离线文档**：`lua docs.lua` 可选下载 GTNH wiki markdown 离线包（纯文本 269 页 ~0.9MB，解压到挂载盘 `/mnt/<x>/doc`，按 docs.json 版本对比跳过重复下载；纯 Lua ustar 解包，不依赖 tar 命令）
+ - **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
 
 ## 部署（GitHub 自动安装，无需粘贴）
 
