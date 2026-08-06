@@ -1,25 +1,26 @@
-# tools — Windows 辅助脚本
+# tools — 开发辅助工具
 
-Windows 主机上的辅助工具：游戏交互截图/按键 + ocvm 测试驱动。
-
-## 脚本说明
-
-| 脚本 | 用途 | 用法 |
+| 工具 | 用途 | 用法 |
 |------|------|------|
-| `capture_minecraft.py` | 捕获指定 Minecraft 窗口（按标题匹配 "GT: New Horizons" 等），非全屏 | `python capture_minecraft.py [输出.png]` |
-| `capture_screen.py` | 全屏截图 | `python capture_screen.py [输出.png]` |
-| `type_to_oc.py` | 向游戏窗口模拟按键（向 OC 终端输入命令）| `python type_to_oc.py "<文本>"` |
-| `ocvm_test.py` | **ocvm 测试驱动**：自动重启虚拟机 → 等 OpenOS 启动 → 上传 agent.lua+测试脚本 → 探测挂载 → 运行 → 拉取结果 | `python ocvm_test.py <测试脚本.lua> [参数...]`（需 SSH 到测试服务器，地址/凭据经环境变量 `OCVM_HOST`/`OCVM_USER`/`OCVM_PASS` 传入，不硬编码） |
+| `ocvm_test.py` | ocvm 模拟器测试驱动（重启 VM → 上传 → 运行 → 拉结果）。`EXTRA_FILES` 环境变量上传额外文件；测试结果自动保存到 `test_harness/results/` | `python tools/ocvm_test.py <脚本.lua> [参数...]` |
+| `ssh_ubuntu.py` | 一键执行 Ubuntu 服务器 (192.168.31.75) 命令（paramiko）。凭据可用 `UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS` 覆盖 | `python tools/ssh_ubuntu.py "cmd"` |
+| `ssh_win.py` | 一键执行 windowsCo (frp-say.com:56056) 命令（SSH 密钥）。`--ps` 用 PowerShell（中文路径安全） | `python tools/ssh_win.py "cmd" [--ps]` |
+| `gist.py` | GitHub gist 工具：列表 / 最新报告 / 指定 ID 拉取（`/debug` 报告用）。token 走 `GH_TOKEN` 环境变量 | `python tools/gist.py latest -o report.txt` |
 
-## 典型工作流
+## 典型组合
 
-1. `capture_minecraft.py game.png` — 看游戏/OC 终端当前状态
-2. 根据截图决定下一步，用 `type_to_oc.py` 向 OC 终端输入命令
-3. 再次截图验证结果
-4. `python ocvm_test.py test_harness/newfeat_test.lua` — 模拟器内跑 agent 测试
+```bash
+# 发版全流程
+python scripts/build_all.py            # 构建 + 清单 + 117 项回归
+python scripts/release_check.py        # 安全检查（全 PASS 才能发）
+git commit ... && git tag v0.3.4 && git push origin master v0.3.4
+python scripts/watch_release.py --tag v0.3.4   # 挂机等 jsDelivr 索引
 
-## 注意
+# 模拟器测试 + 结果
+EXTRA_FILES=../docs_pack/oc-docs.tar python tools/ocvm_test.py test_docs_lua.lua
+# 结果自动存到 test_harness/results/test_docs_lua_result.txt
 
-- 依赖 Pillow：`pip install Pillow`；`ocvm_test.py` 依赖 paramiko
-- 窗口捕获用 Win32 API（ctypes），无需额外库
-- `ocvm_test.py` 解决 ocvm 挂载短名每次重启变化的问题（marker 探测自动定位含 agent.lua 的挂载）
+# 拉取最新 /debug 报告
+export GH_TOKEN=ghp_xxx
+python tools/gist.py latest -o debug_report.txt
+```
