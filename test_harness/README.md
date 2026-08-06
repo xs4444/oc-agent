@@ -9,7 +9,7 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 ../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" run_tests.lua
 ```
 
-预期输出：`FINAL: 122 pass, 0 fail out of 122 tests`
+预期输出：`FINAL: 117 pass, 0 fail out of 117 tests`
 
 ## 脚本分类
 
@@ -17,8 +17,11 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 
 | 脚本 | 用途 |
 |------|------|
-| `oc_mock.lua` | OC API 模拟层（component/computer/filesystem/shell/internet/serialization/**event/modem**），`package.loaded` 注入 `require`；含 chat/completions 端点 mock 与 modem 环路事件队列 |
-| `run_tests.lua` | 主回归：JSON 编解码 + 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化**（122 项） |
+| `oc_mock.lua` | OC API 模拟层（component/computer/filesystem/shell/internet/serialization/**event/modem/thread**），`package.loaded` 注入 `require`；含 chat/completions 端点 mock 与 modem 环路事件队列 |
+| `run_tests.lua` | 主回归：JSON 编解码 + 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（117 项） |
+| `plugin_test.lua` | 插件注册：临时目录写假模块 → scan_dir 注册 → 调用 → 坏模块跳过（12 项） |
+| `danger_test.lua` | **高危场景鲁棒性**（21 项）：自修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用，全部隔离临时目录安全模拟 |
+| `perf_test.lua` | 工具调用性能对比：循环 json_query/calc/text_ops/文件工具 N 次，比较新旧版本耗时 |
 
 ### 模拟器内验证（部署到 ocvm / OCEmu 的 /mnt/<mount>/ 后运行）
 
@@ -51,15 +54,8 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 任务编号：1=基础对话 2=文件读写 3=组件链(list→doc→invoke) 4=execute_lua 计算 5=多组件查询
 
 | `modular_ocvm_test.lua` | **模块化 e2e**：验证多文件 require 链 + 插件自举闭环（写模块→注册→调用→坏模块跳过） | 22 项 |
-| `perf_test.lua` | **工具调用性能监测**：循环 json_query/calc/text_ops/文件工具 N 次，对比新旧版本耗时 | `lua perf_test.lua <agent.lua路径> [循环次数]` |
-
-### 高危场景测试（本地 mock 安全模拟，隔离临时目录）
-
-| 脚本 | 用途 |
-|------|------|
-| `danger_test.lua` | **7 类高危场景**（21 项）：自我修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用，全部在 danger_tmp/ 隔离目录模拟 |
-| `shell_timeout_test.lua` | **ocvm/OCEmu 真机超时验证**（9 项）：阻塞命令 3s 超时 kill → agent 恢复 → 正常命令不受影响。⚠️ 纯 CPU 死循环（永不 yield）在协作式调度下无法被 Lua 层中断（平台限制） |
-| `thread_diag_test.lua` | **thread 库诊断**：确认 ocvm 上 `require("thread")` + waitForAll 超时行为（定位协作式调度限制用） |
+| `shell_timeout_test.lua` | **shell_execute 超时真机验证**（ocvm/OCEmu，9 项）：挂起命令 3s 超时 kill → agent 恢复 → 正常命令不受影响 |
+| `thread_diag_test.lua` | **协作式调度诊断**：确认纯 CPU 死循环（`while true do end` 永不 yield）在 OpenOS 中饿死主线程，任何 Lua 层超时无法中断（平台限制，真实 OC 同样如此） |
 
 ### 插件/自举测试
 
@@ -98,5 +94,6 @@ lua /mnt/<挂载短名>/search_test.lua /mnt/<挂载短名> <api_key> <model> <a
 ## 测试约定
 
 - agent.lua 加载时 `_TEST_MODE = true` 跳过 `main()`，暴露 `agent_test` 钩子表（chat/http_post/build_system_prompt/trim_history/compact_history/should_compact/summarize_history/process_exchange/wait_modem_message/load_history/append_history/rebuild_history/set_history_path/TOOLS）
+- TOOLS 断言：`run_tests.lua` 定义 `EXPECTED_TOOLS` 显式清单（15 项），双向校验（无缺失 + 无多余）——**新增工具必须在清单登记**，否则测试失败
 - 脚本内不用 `arg` 全局（OpenOS 的 lua 无此变量），参数用 `{...}` vararg
 - 结果实时写入文件（OpenOS 崩溃时保留部分结果）
