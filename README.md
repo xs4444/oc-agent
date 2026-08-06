@@ -12,7 +12,7 @@
 
 ## 功能一览
 
-- **13 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute` + **`subagent_call`（14 个）**
+- **15 个 LLM 工具**：文件族 `read_file`（offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory`；数据族 `json_query` / `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）；硬件族 `component_list` / `component_doc` / `component_invoke`；网络族 `web_search` / `shell_execute`（io.popen 捕获输出 + 超时 kill）/ `subagent_call`；交互 `ask_user`（仿 opencode question，向用户提问，选项编号选择或自定义输入）
 - **子代理**：`subagent_call(address, task, role?, session?, context?, timeout?)` 通过游戏内网卡（modem 组件）把任务委派给其他 OC 计算机上运行的 `agent.lua -- --subagent`——每台子代理拥有独立内存和磁盘，主代理可并行调度；跨机器经 ocvm 双实例实测通过（SUBAGENT_PONG 往返）
 - **子代理会话复用**：`session` 参数延续子代理对话（同 id 恢复磁盘上的会话历史，省略则全新会话）；busy 状态机防止同会话并发（对齐 opencode 的 Active/Reusable 会话模型）
 - **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
@@ -27,26 +27,23 @@
 
 ## 部署（GitHub 自动安装，无需粘贴）
 
-agent.lua 已发布到 GitHub（xs4444/oc-agent），游戏内一条命令安装：
+agent.lua 已发布到 GitHub（xs4444/oc-agent，master 分支），游戏内一条命令安装：
 
 ```bash
-# 方式 1: jsDelivr CDN（国内可达性好，推荐）
+# 方式 1（推荐）: 下载 update.lua 一键更新器（永不需要更新自身，自动查最新 tag）
+wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@master/update.lua update.lua
+lua update.lua                    # 下载最新 install.lua 并执行
+
+# 方式 2: 直接下载安装器
 wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@master/install.lua install.lua
-
-# 方式 2: GitHub raw（需要服务器能访问 GitHub）
-wget https://raw.githubusercontent.com/xs4444/oc-agent/master/install.lua install.lua
-
-# 运行安装器（自动下载 agent.lua + 校验；回答 y 配置为子代理）
 lua install.lua
-
-# 启动
-lua agent.lua                  # 主代理
-lua agent.lua -- --subagent    # 子代理（监听 modem 9090）
 ```
 
 - 安装器自动检测可写目录（/home 只读时用挂载盘），支持 `lua install.lua /mnt/xxx` 指定目录
-- 更新：重新运行 install.lua 即覆盖为最新版（jsDelivr CDN 缓存可能延迟，必要时用 commit hash URL）
-- 手动方式（备用）：将 `agent.lua` 上传到 OC 计算机（wget / pastebin / 手动复制）
+- 安装完成后创建 `/home/bin/agent` 启动器（OpenOS 默认 PATH 含 /home/bin），**任意目录输入 `agent` 即可启动**（`agent -- --subagent` 子代理模式）
+- 更新：`lua update.lua`——显示当前/最新版本，**增量更新**（字节数一致的文件跳过，只下载变动模块）
+- 版本：manifest 版本号 `YYYY-MM-DDTHHMM` 写入 `agent/version.txt`，游戏内 `/version` 可查
+- 手动方式（备用）：将文件上传到 OC 计算机
 
 > 首次引导直接回车接受默认（免费模型，无需 API key）；`/home` 只读时配置自动写入挂载盘。
 
@@ -59,6 +56,13 @@ lua agent.lua -- --subagent    # 子代理（监听 modem 9090）
 /new                  -- 归档当前会话到 /home/sessions/ 并开新会话
 /compact              -- 手动压缩对话（LLM 摘要 + 保留最近 4 条）
 /reset                -- 清空对话历史（不归档）
+/hist                 -- 显示当前会话消息数
+/version              -- 显示已安装版本
+/debug                -- 收集诊断报告（版本+脱敏配置+最近历史），写入 debug_report.txt 并可选上传 GitHub Gist
+/gist-token <token>   -- 保存 GitHub token（scope: gist），/debug 自动上传诊断报告
+/tools                -- 列出工具
+/help                 -- 命令帮助
+/exit                 -- 退出
 ```
 
 ## 子代理部署（多台 OC 组网）

@@ -53,6 +53,14 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 | `modular_ocvm_test.lua` | **模块化 e2e**：验证多文件 require 链 + 插件自举闭环（写模块→注册→调用→坏模块跳过） | 22 项 |
 | `perf_test.lua` | **工具调用性能监测**：循环 json_query/calc/text_ops/文件工具 N 次，对比新旧版本耗时 | `lua perf_test.lua <agent.lua路径> [循环次数]` |
 
+### 高危场景测试（本地 mock 安全模拟，隔离临时目录）
+
+| 脚本 | 用途 |
+|------|------|
+| `danger_test.lua` | **7 类高危场景**（21 项）：自我修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用，全部在 danger_tmp/ 隔离目录模拟 |
+| `shell_timeout_test.lua` | **ocvm/OCEmu 真机超时验证**（9 项）：阻塞命令 3s 超时 kill → agent 恢复 → 正常命令不受影响。⚠️ 纯 CPU 死循环（永不 yield）在协作式调度下无法被 Lua 层中断（平台限制） |
+| `thread_diag_test.lua` | **thread 库诊断**：确认 ocvm 上 `require("thread")` + waitForAll 超时行为（定位协作式调度限制用） |
+
 ### 插件/自举测试
 
 | 脚本 | 用途 |
