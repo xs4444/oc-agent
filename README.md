@@ -26,7 +26,11 @@
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **诊断上报**：`/debug` 收集版本+脱敏配置+最近历史 → 本地文件 + 可选上传 GitHub Gist（`/gist-token <token>` 配置，scope: gist）
  - **增量更新**：`lua update.lua` 只下载有变动的文件（按 files.json 字节对比跳过），版本号带时间戳可区分
- - **离线文档**：`lua docs.lua` 可选下载 GTNH wiki markdown 离线包（纯文本 269 页 ~0.9MB，解压到挂载盘 `/mnt/<x>/doc`，按 docs.json 版本对比跳过重复下载；纯 Lua ustar 解包，不依赖 tar 命令）
+ - **离线文档**：`lua docs.lua` 可选下载 GTNH wiki markdown 离线包（纯文本 269 页 ~0.9MB，解压到挂载盘 `/mnt/<x>/doc`，按 docs.json 版本对比跳过重复下载；纯 Lua ustar 解包，不依赖 tar 命令）。**交互引导**：自动识别已安装位置 + 候选盘（容量/系统盘排除），选择安装或卸载；子命令 `status` / `uninstall` / `<路径>` 直接安装
+ - **上下文仪表盘**：`/ctx` 显示上次请求真实 tokens（provider 上报 usage）+ 窗口百分比 + ANSI 进度条（绿/黄/红按使用率分级）+ 消息构成估算（system/对话/工具结果）+ 压缩状态；每次 LLM 响应后自动显示一行 `[ctx] 3,558 / 128,000 tokens (2.8%) █░░...`（`ctx_auto=false` 关闭）；窗口大小 `context_window` 可配置（默认 128000）
+ - **400 防护**：请求前 token 预算（估算超窗口 80% 自动压缩；压缩失败 LLM 已超限时强制裁剪保留最近）；HTTP 400 仅当估算确实超限（>85%）才裁剪重试，其他原因（reasoning/格式/限流）保留现场报错
+ - **reasoning_content 传回**：DeepSeek/Kimi thinking mode 的思考内容随历史完整传回（网关要求，缺失返回 400）；JSON 编码器对全部控制字符转义为 `\u00XX`（裸控制字符 = 非法 JSON → 400）
+ - **多行输入**：`/ml` 逐行收集到独立行 `EOF` 合并为一条消息发送（粘贴多行代码不再被逐行误发成多条命令；OC 无 bracketed paste，opencode TUI 多行粘贴的等价物）
  - **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
 
 ## 部署（GitHub 自动安装，无需粘贴）
@@ -46,6 +50,7 @@ lua update.lua
 - 安装器自动检测可写目录（/home 只读时用挂载盘），支持 `lua install.lua /mnt/xxx <ref>` 指定目录与版本
 - 安装后创建 PATH 启动器 `/home/bin/agent`（OpenOS 默认 PATH 含 /home/bin），任意目录直接 `agent` 启动
 - 手动方式（备用）：`wget https://cdn.jsdelivr.net/gh/xs4444/oc-agent@v0.3.0/install.lua install.lua` 后 `lua install.lua`
+- 离线文档：更新后 `lua docs.lua` 交互引导安装（选数据盘，自动排除系统盘）；`lua docs.lua status` 查看状态，`uninstall` 卸载
 
 > 首次引导直接回车接受默认（免费模型，无需 API key）；`/home` 只读时配置自动写入挂载盘。
 
@@ -60,6 +65,8 @@ lua update.lua
 /reset                -- 清空对话历史（不归档）
 /hist                 -- 查看当前会话消息数
 /version              -- 显示已安装 agent 版本
+/ctx                  -- 上下文使用仪表盘（tokens + 百分比 + 进度条 + 构成）
+/ml                   -- 多行输入（粘贴代码：逐行收集到 EOF 行）
 /tools                -- 列出全部工具及说明
 /debug                -- 生成诊断报告（本地 + 可选上传 Gist）
 /gist-token <token>   -- 保存 GitHub token（scope: gist）供 /debug 上传
@@ -89,12 +96,16 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 ├── agent.lua              # 主程序（构建产物，单文件含全部模块）
 ├── install.lua            # 安装器（多文件安装 + 增量更新 + PATH 集成）
 ├── update.lua             # 一键更新（查最新 tag → 增量更新，永不需更新自身）
-├── files.json             # 安装清单（16 个模块路径 + 字节数 + 版本号）
+├── docs.lua               # 离线文档安装器（交互引导选盘/卸载 + 纯 Lua ustar 解包）
+├── files.json             # 安装清单（18 个分发文件 + 字节数 + 版本号）
+├── docs_pack/             # 离线文档包（oc-docs.tar 910KB + docs.json 元数据，make_docs_pack.py 生成）
 ├── README.md
-├── src/agent/             # 模块化源码（9 核心 + 7 工具模块）
-│   ├── init.lua           # 入口（REPL/子代理/命令/ask_user 注入）
-│   ├── chat.lua           # LLM 客户端 + 系统提示（含 OpenOS 命令引导）
+├── src/agent/             # 模块化源码（9 核心 + 8 工具模块）
+│   ├── init.lua           # 入口（REPL/子代理/命令 /ctx /ml/ask_user 注入/400 防护）
+│   ├── chat.lua           # LLM 客户端 + 系统提示（工具清单/上下文管理引导）
+│   ├── config.lua         # 配置（context_window/ctx_auto 默认值）
 │   ├── debug.lua          # 诊断报告收集 + Gist 上传
+│   ├── json.lua           # JSON 编解码（全控制字符转义）
 │   ├── tools.lua          # 工具注册表（BUILTIN + 插件扫描）
 │   └── tools/             # 工具模块（file/data/component/search/shell/subagent/question）
 ├── docs/                  # 设计文档与实现计划 → docs/README.md
@@ -102,9 +113,11 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   └── superpowers/
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
-│   ├── run_tests.lua      # 本地回归测试（117 项）
+│   ├── run_tests.lua      # 本地回归测试（142 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入）
 │   ├── danger_test.lua    # 高危场景测试（21 项：自改/坏插件/死循环/磁盘/配置/自删/递归）
 │   ├── shell_timeout_test.lua  # ocvm/OCEmu 真机 shell 超时验证
+│   ├── reasoning_e2e_test.lua  # reasoning_content 传回真机 e2e（工具链无 400）
+│   ├── test_docs_interact.lua  # docs.lua 交互引导全流程（安装/卸载/状态）
 │   └── ...                # 子代理/能力边界/内存/搜索/文件工具测试
 ├── emulators/             # 第三方 OC 模拟器 → emulators/README.md
 │   ├── OCEmu/             # 真实 OC machine.lua 沙箱（Lua 5.2）
@@ -114,9 +127,19 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── raw/               # DokuWiki 原始文本（215 页）
 │   ├── markdown/          # Markdown 转换版（40+ 页，含 GTNH 指南）
 │   └── reference/         # agent 开发精选 API 参考（35 文件）
-├── tools/                 # Windows 辅助脚本（截图/按键/ocvm 测试驱动）→ tools/README.md
-├── scripts/               # 构建脚本（build_single/make_manifest）+ 一次性工具 → scripts/README.md
+├── tools/                 # Windows 辅助脚本 → tools/README.md
+│   ├── ocvm_test.py       # ocvm 测试驱动（EXTRA_FILES 上传 + 结果自动保存）
+│   ├── ssh_ubuntu.py      # Ubuntu 测试服务器一键执行
+│   ├── ssh_win.py         # windowsCo 一键执行（密钥认证，--ps 中文路径）
+│   └── gist.py            # /debug 报告拉取（list/latest/fetch）
+├── scripts/               # 构建与发版脚本 → scripts/README.md
+│   ├── build_all.py       # 构建+清单+142 项回归一键
+│   ├── release_check.py   # 发版安全检查（版本 bump/清单/字节/语法）
+│   ├── watch_release.py   # jsDelivr 索引监控（索引后提示可更新）
+│   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
+│   └── build_single.lua / make_manifest.lua
 ├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）→ lua_portable/README.md
+├── repos/                 # 外部源码研究（gitignored）
 ├── opencomputers/         # GTNH OpenComputers fork 源码（参考）
 ├── oc-ai/                 # DonChong2000/oc-ai 源码（参考）
 ├── pi/                    # pi.dev agent 源码（架构参考）
@@ -137,15 +160,17 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 ```
 
 测试要点：
-- 本地：`lua_portable/bin/lua.exe test_harness/run_tests.lua`（117 项回归）+ `danger_test.lua`（21 项高危场景）
-- 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果）
+- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**142 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集）+ `danger_test.lua`（21 项高危场景）
+- 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
-- LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）
-- 远程诊断：游戏内 `/debug` 上传诊断报告到 Gist，供远程排查
+- LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
+- 发版链路：`build_all.py` → `release_check.py`（全 PASS 才能打 tag）→ `watch_release.py --tag vX.Y.Z`（监控 jsDelivr 索引，索引后服务器 `lua update.lua`）
+- 远程诊断：游戏内 `/debug` 上传诊断报告到 Gist（`tools/gist.py latest` 拉取）
 
 ## 已知限制
 
-- **上下文受 OC 内存限制**：2 个 T3.5（2MB）下历史预算 50KB（≈12-25K token）。200K 上下文需要 4MB+ 且需给 JSON 编码器加 yield 改造
+- **上下文受 OC 内存限制**：2 个 T3.5（2MB）下历史预算 50KB（≈12-25K token）。窗口大小在 config 的 `context_window` 配置（默认 128000，按模型实际窗口调整）；`/ctx` 实时查看使用率，超 80% 自动压缩
 - **`collectgarbage` 不可用**：无法手动触发 GC，依赖 Lua 自动增量回收（已实测无泄漏）
 - **搜索覆盖**：HN Algolia 仅英文技术内容；Tavily 需注册 key
 - **公共服务器限制**：OC 网络黑名单/白名单、HTTP 开关可能影响外联
+- **无 RTC**：`/debug` 报告时间用 uptime 回退（`os.date` 无 RTC 时返回 1970），接入游戏内时间同步后可显示真实时间

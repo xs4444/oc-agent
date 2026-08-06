@@ -30,3 +30,5 @@ test_harness/perf_result.txt
 agent_config.txt
 perf_result.txt
 backup-*.rar
+repos/
+test_harness/results/
