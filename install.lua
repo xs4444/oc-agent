@@ -110,11 +110,14 @@ print("===============")
 print("目标目录: " .. DEST_DIR .. "   ref: " .. REF)
 
 -- 下载并校验单个文件: attempts 次尝试（按源轮换），字节数必须 == expected
-local function download_verified(relpath, dest, expected, attempts)
+-- url_prefix: 仓库内相对路径前缀（src/agent 模块用 "/src/agent/"；根目录
+-- 工具如 docs.lua 用 "/"）
+local function download_verified(relpath, dest, expected, attempts, url_prefix)
   local source_count = #SOURCES
+  url_prefix = url_prefix or "/src/agent/"
   for attempt = 1, attempts do
     local i = ((attempt - 1) % source_count) + 1
-    local url = SOURCES[i] .. "/src/agent/" .. relpath
+    local url = SOURCES[i] .. url_prefix .. relpath
     print("  尝试源 " .. i .. "/" .. source_count .. " (第 " .. attempt .. " 次): " .. url)
     local body, err = fetch(url)
     if body then
@@ -228,7 +231,9 @@ if manifest then
       skipped = skipped + 1
     else
       print("更新 " .. relpath .. " (期望 " .. expected .. " 字节)")
-      local ok = download_verified(relpath, dest, expected, 3)
+      -- 根目录工具（docs.lua）用根前缀下载
+      local prefix = (relpath == "docs.lua") and "/" or nil
+      local ok = download_verified(relpath, dest, expected, 3, prefix)
       if ok then
         installed = installed + 1
       else
