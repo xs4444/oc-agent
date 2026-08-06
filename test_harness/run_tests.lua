@@ -132,6 +132,22 @@ test_roundtrip("string", "hello")
 test_roundtrip("empty string", "")
 test_roundtrip("string with escapes", 'hello\nworld\t"quoted"\\backslash')
 
+-- 控制字符必须转义为 \u00XX（否则裸控制字符 = 非法 JSON → 服务端 HTTP 400）
+do
+  local ctrl = "a" .. string.char(1) .. "\27" .. string.char(0) .. "b"
+  local enc = json.encode(ctrl)
+  if enc == '"a\\u0001\\u001b\\u0000b"' then
+    pass = pass + 1; print("  ✓ json control chars escaped")
+  else
+    fail = fail + 1; print("  ✗ json control chars escaped: " .. tostring(enc))
+  end
+  if enc:find("[%c]") == nil then
+    pass = pass + 1; print("  ✓ json no raw control chars")
+  else
+    fail = fail + 1; print("  ✗ json no raw control chars: " .. tostring(enc))
+  end
+end
+
 -- Arrays
 test_roundtrip("empty array", {})
 test_roundtrip("number array", {1, 2, 3})
