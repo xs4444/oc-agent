@@ -1228,8 +1228,9 @@ local function collect(config, history)
     if ok_d and d and d:match("^20%d%d%-") then
       ts = d
     else
-      local ok_c, comp = pcall(require, "computer")
-      local ok_u, u = ok_c and pcall(comp.uptime)
+      -- 用全局 computer（与下方 Uptime 行一致；require 的表调用在某些
+      -- 环境返回 nil，导致显示 "uptime ?"）
+      local ok_u, u = pcall(computer.uptime)
       ts = "uptime " .. ((ok_u and u and string.format("%.0f", u) .. "s") or "?")
     end
     lines[#lines + 1] = "Generated: " .. ts
