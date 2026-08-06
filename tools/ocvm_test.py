@@ -173,6 +173,11 @@ def main():
     agent = os.path.normpath(agent)
     files = [agent] if os.path.exists(agent) else []
     files.append(os.path.abspath(script_path))
+    # EXTRA_FILES: 逗号分隔的额外上传文件（如离线文档包 oc-docs.tar）
+    for extra in os.environ.get("EXTRA_FILES", "").split(","):
+        extra = extra.strip()
+        if extra and os.path.exists(extra):
+            files.append(os.path.abspath(extra))
     d.upload(files)
     mount = d.find_agent_mount()
     if not mount:
