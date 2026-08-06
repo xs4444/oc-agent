@@ -6,7 +6,7 @@
     "execute.lua": 2769,
     "http.lua": 2992,
     "init.lua": 35197,
-    "json.lua": 5892,
+    "json.lua": 6280,
     "session.lua": 10052,
     "subagent.lua": 4121,
     "tools.lua": 5705,
@@ -19,5 +19,5 @@
     "tools/subagent.lua": 5015,
     "docs.lua": 14689
   },
-  "version": "2026-08-06T2048"
+  "version": "2026-08-06T2057"
 }

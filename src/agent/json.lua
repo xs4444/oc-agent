@@ -10,6 +10,17 @@
 
 json = {}
 
+-- JSON 字符串转义（模块级映射，避免每次 encode 重建表）
+-- 除 \ " \n \r \t 外，所有控制字符（\x00-\x1f、\x7f）必须转义为 \u00XX，
+-- 否则裸控制字符产出非法 JSON，服务端解析失败返回 HTTP 400
+local ESCAPES = {
+  ["\\"] = "\\\\",
+  ['"'] = '\\"',
+  ["\n"] = "\\n",
+  ["\r"] = "\\r",
+  ["\t"] = "\\t",
+}
+
 function json.encode(val)
   local t = type(val)
   if val == nil then return "null" end
@@ -21,10 +32,11 @@ function json.encode(val)
     return tostring(val)
   end
   if t == "string" then
-    local s = val:gsub("[\\\"\n\r\t]", {
-      ["\\"] = "\\\\", ['"'] = '\\"',
-      ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t"
-    })
+    local s = val:gsub("[\\\"%c]", function(c)
+      local esc = ESCAPES[c]
+      if esc then return esc end
+      return string.format("\\u%04x", c:byte())
+    end)
     return '"' .. s .. '"'
   end
   if t == "table" then
