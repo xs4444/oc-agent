@@ -36,6 +36,7 @@ local TOOL_MODULES = {
   "agent.tools.search",
   "agent.tools.shell",
   "agent.tools.subagent",
+  "agent.tools.question",
 }
 
 local function read_file(path)
