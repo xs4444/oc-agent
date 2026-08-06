@@ -83,16 +83,16 @@ local res_calc = shell("echo calc-after-timeout", 5)
 check("agent functional after timeout", type(res_calc) == "string" and res_calc ~= "", res_calc)
 
 -- ── 4. 正常命令对照 ─────────────────────────────────────────────
--- 注：OpenOS 的 shell.execute 返回退出状态（true/false），stdout 直接
--- 打到屏幕不捕获，因此断言成功状态而非命令输出内容。
+-- 注：shell_execute 经 io.popen 捕获 stdout+stderr（不再只返回
+-- true/false 退出状态），因此断言返回内容包含命令输出。
 local t1 = uptime()
 local res_ok = shell("echo hello-normal-command", 5)
 local elapsed_ok = uptime() - t1
-check("normal command returns quickly", type(res_ok) == "string" and res_ok == "true" and elapsed_ok < 5, tostring(res_ok) .. " (" .. string.format("%.1f", elapsed_ok) .. "s)")
+check("normal command returns quickly", type(res_ok) == "string" and res_ok:find("hello%-normal%-command") ~= nil and elapsed_ok < 5, tostring(res_ok) .. " (" .. string.format("%.1f", elapsed_ok) .. "s)")
 
 -- ── 5. 无 timeout 参数默认值（快速命令不受影响）─────────────────
 local res_def = shell("echo no-timeout-arg", nil)
-check("default timeout path works", type(res_def) == "string" and res_def == "true", res_def)
+check("default timeout path works", type(res_def) == "string" and res_def:find("no%-timeout%-arg") ~= nil, res_def)
 
 -- 清理
 os.remove(hang_path)
