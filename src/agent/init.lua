@@ -256,6 +256,33 @@ local function cmd_ctx(config, messages, usage_override)
   print("压缩: " .. (ok_sc and sc and "即将触发（超过阈值，可 /compact）" or "未触发") .. " | /ctx 参考 opencode TUI 的 usage 显示")
 end
 
+-- 多行输入收集: 逐行 io.read，直到独立行 EOF（或 Ctrl+D → nil）取消。
+-- 对应 opencode TUI 的多行粘贴场景——OC 端无 bracketed paste，
+-- ocvm 精简 OpenOS 也无 term.paste 处理，逐行收集最稳（粘贴多行时
+-- 每行被提交为一行，这里合并为一条消息）。返回文本或 nil（取消/空）。
+local function collect_multiline()
+  print("--- 多行输入模式: 逐行收集，单独一行 EOF 结束，Ctrl+D 取消 ---")
+  local lines = {}
+  while true do
+    io.write("...> ")
+    local line = io.read()
+    if not line then
+      print("(已取消)")
+      return nil
+    end
+    line = line:gsub("\r", ""):gsub("\n", "")
+    if line == "EOF" then
+      break
+    end
+    lines[#lines + 1] = line
+  end
+  if #lines == 0 then
+    print("未收集任何内容。")
+    return nil
+  end
+  return table.concat(lines, "\n")
+end
+
 local function handle_command(cmd, config, messages)
   local parts = {}
   for w in cmd:gmatch("%S+") do parts[#parts + 1] = w end
@@ -409,6 +436,16 @@ local function handle_command(cmd, config, messages)
     end
   elseif command == "/ctx" then
     cmd_ctx(config, messages)
+  elseif command == "/ml" then
+    -- 多行输入（粘贴多行代码场景）: 收集到 EOF 后作为一条消息发送
+    local text = collect_multiline()
+    if text then
+      print("已收集，发送给 AI...")
+      local result = process_exchange(messages, config, text, true)
+      if result and result.error then
+        print("[error] " .. result.error)
+      end
+    end
   elseif command == "/help" then
     print("Commands:")
     print("  /model <name>   Switch LLM model (e.g. deepseek-v4-flash-free)")
@@ -424,6 +461,7 @@ local function handle_command(cmd, config, messages)
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
     print("  /ctx            Show context usage (tokens + progress bar, like opencode TUI)")
+    print("  /ml             Multi-line input (paste code: collect until EOF line)")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
   elseif command == "/exit" then
@@ -821,6 +859,7 @@ if _TEST_MODE then
     estimate_tokens = estimate_tokens,
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
+    collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,
     TOOLS = TOOLS,
