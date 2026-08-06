@@ -675,6 +675,7 @@ local BUILTIN = {
   "agent.tools.search",
   "agent.tools.shell",
   "agent.tools.subagent",
+  "agent.tools.question",
 }
 
 -- Names already loaded by the BUILTIN loop (below). scan_dir skips these
@@ -2066,6 +2067,49 @@ end
 return {tools = tools, exec = exec}
 end
 
+-- agent.agent.tools.question (embedded module)
+package.preload["agent.tools.question"] = function()
+-- ═══════════════════════════════════════════════════════════════
+-- agent.tools.question — ask_user 工具（仿 opencode question）。
+--
+-- LLM 在对话过程中向用户提问（澄清需求/提供选项），REPL 模式下
+-- 阻塞等待用户输入（io.read），答案作为 tool 结果喂回 LLM。
+-- subagent 模式无终端，返回不可用错误。
+--
+-- 实现要点：真正的读输入逻辑由 init.lua 注入（deps.ask_user），
+-- 因为只有 REPL 主循环知道当前是否有终端；本模块只负责声明和
+-- 转发。deps.ask_user(args) 返回字符串答案。
+-- ═══════════════════════════════════════════════════════════════
+
+local tools = {
+  {type="function", ["function"]={
+    name="ask_user",
+    description="Ask the user a question during the conversation. Use when you need to clarify requirements, get decisions on choices, or offer options before proceeding. Options are shown as a numbered list; the user picks one or more numbers (or types a custom answer). Returns the user's answer as text.",
+    parameters={type="object", properties={
+      question={type="string", description="Complete question to ask"},
+      options={type="array", items={type="string"}, description="Optional numbered choices to present"},
+      multiple={type="boolean", description="Allow selecting multiple options (default false)"}
+    }, required={"question"}}
+  }},
+}
+
+local function exec(name, args, deps)
+  if name == "ask_user" then
+    local ask = deps and deps.ask_user
+    if not ask then
+      return "Error: ask_user unavailable (no terminal in this mode)"
+    end
+    local ok, res = pcall(ask, args)
+    if ok then return res end
+    return "Error: " .. tostring(res)
+  end
+
+  return nil  -- not handled by this module
+end
+
+return {tools = tools, exec = exec}
+end
+
 -- ═══════════════════════════════════════════════════════════════
 -- Entry: src/agent/init.lua (inlined verbatim)
 -- ═══════════════════════════════════════════════════════════════
@@ -2189,6 +2233,44 @@ local DEPS = {
   subagent_reply_port = SUBAGENT_REPLY_PORT,
   subagent_timeout = SUBAGENT_TIMEOUT,
 }
+
+-- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
+-- 实现读取用户输入（io.read），把答案返回给工具调用链。
+local function ask_user_repl(args)
+  local q = (args and args.question) or "?"
+  print("")
+  print("[ask_user] " .. q)
+  local opts = args and args.options
+  if opts and #opts > 0 then
+    for i, o in ipairs(opts) do
+      print("  " .. i .. ") " .. tostring(o))
+    end
+    print("输入编号（多个用逗号分隔），或直接输入自定义回答，回车结束:")
+  end
+  io.write("> ")
+  local answer = io.read()
+  if not answer then return "(用户未回答)" end
+  answer = answer:gsub("\n", ""):gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if answer == "" then return "(用户未回答)" end
+  -- 编号 → 选项文本（支持 1,2,3 多选）
+  if opts and #opts > 0 then
+    local sel = {}
+    local ok_nums = true
+    for n in answer:gmatch("%d+") do
+      local idx = tonumber(n)
+      if idx >= 1 and idx <= #opts then
+        sel[#sel + 1] = tostring(opts[idx])
+      else
+        ok_nums = false
+      end
+    end
+    if #sel > 0 and ok_nums then
+      return "用户选择: " .. table.concat(sel, ", ")
+    end
+  end
+  return "用户回答: " .. answer
+end
+DEPS.ask_user = ask_user_repl
 
 -- ── Section 4: Tool Execution ──────────────────────────────────
 -- Tool implementations live in src/agent/tools/*.lua (registered in
@@ -2507,6 +2589,8 @@ local function main(config, ...)
   -- full agent loop, replies over modem. No interactive REPL.
   local arg1 = ...
   if arg1 == "--subagent" then
+    -- No terminal: ask_user cannot block on io.read here
+    DEPS.ask_user = nil
     local port_arg = select(2, ...)
     local listen_port = (port_arg and tonumber(port_arg)) or SUBAGENT_LISTEN_PORT
     local modem = component.modem

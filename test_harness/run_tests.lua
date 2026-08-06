@@ -457,7 +457,7 @@ test("TOOLS no execute_lua", tools_have["execute_lua"] ~= true)
 test("TOOLS has edit_file", tools_have["edit_file"] == true)
 test("TOOLS has append_file", tools_have["append_file"] == true)
 test("TOOLS has subagent_call", tools_have["subagent_call"] == true)
-test("TOOLS count is 14", #agent_test.TOOLS == 14,
+test("TOOLS count is 15", #agent_test.TOOLS == 15,
   "count=" .. tostring(#agent_test.TOOLS))
 
 print("")
