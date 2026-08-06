@@ -445,19 +445,31 @@ test("system prompt has calc", sp:find("calc") ~= nil)
 test("system prompt has text_ops", sp:find("text_ops") ~= nil)
 test("system prompt no execute_lua", sp:find("execute_lua") == nil)
 
--- TOOLS list: execute_lua removed, new tools present
+-- TOOLS list: 显式期望清单，双向断言（无缺失、无多余）。
+-- 新增工具时必须在此清单中登记，否则测试失败。
+local EXPECTED_TOOLS = {
+  "read_file", "write_file", "edit_file", "append_file", "list_directory",
+  "json_query", "calc", "text_ops",
+  "component_list", "component_doc", "component_invoke",
+  "web_search", "shell_execute", "subagent_call", "ask_user",
+}
 local tools_have = {}
 for _, t in ipairs(agent_test.TOOLS) do
   tools_have[t["function"].name] = true
 end
-test("TOOLS has json_query", tools_have["json_query"] == true)
-test("TOOLS has calc", tools_have["calc"] == true)
-test("TOOLS has text_ops", tools_have["text_ops"] == true)
-test("TOOLS no execute_lua", tools_have["execute_lua"] ~= true)
-test("TOOLS has edit_file", tools_have["edit_file"] == true)
-test("TOOLS has append_file", tools_have["append_file"] == true)
-test("TOOLS has subagent_call", tools_have["subagent_call"] == true)
-test("TOOLS count is 15", #agent_test.TOOLS == 15,
+local tools_missing, tools_extra = {}, {}
+for _, name in ipairs(EXPECTED_TOOLS) do
+  if not tools_have[name] then tools_missing[#tools_missing + 1] = name end
+end
+for name in pairs(tools_have) do
+  local found = false
+  for _, e in ipairs(EXPECTED_TOOLS) do if e == name then found = true break end end
+  if not found then tools_extra[#tools_extra + 1] = name end
+end
+test("TOOLS 无缺失: " .. table.concat(EXPECTED_TOOLS, ","),
+  #tools_missing == 0, "missing: " .. table.concat(tools_missing, ","))
+test("TOOLS 无多余", #tools_extra == 0, "extra: " .. table.concat(tools_extra, ","))
+test("TOOLS count = " .. #EXPECTED_TOOLS, #agent_test.TOOLS == #EXPECTED_TOOLS,
   "count=" .. tostring(#agent_test.TOOLS))
 
 print("")
