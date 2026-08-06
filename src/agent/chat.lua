@@ -95,6 +95,10 @@ local function build_system_prompt()
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
+    .. "Context management: your context window is finite. To avoid HTTP 400 errors (context overflow):\n"
+    .. "- Read files with read_file using offset/limit slices — never read the same large file repeatedly, and don't dump whole files into the conversation\n"
+    .. "- Keep outputs and tool results concise; prefer json_query/text_ops for extraction\n"
+    .. "- If a request fails with HTTP 400, the agent auto-compacts the history and retries; continue from the summary instead of re-reading everything\n\n"
     .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
     .. (doc_path and ("Offline GTNH wiki documentation is installed at " .. doc_path .. " (api/, component/, tutorial/, gtnh/ etc). When you need component method signatures, mod API details, or GTNH integration facts, read the relevant .md file with read_file (explore with list_directory) — prefer it over web_search.\n\n") or "")
     .. "When exploring hardware, use this workflow:\n"

@@ -24,6 +24,10 @@ import re
 import os
 import paramiko
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 HOST = os.environ.get("OCVM_HOST", "")
 USER = os.environ.get("OCVM_USER", "")
 PASS = os.environ.get("OCVM_PASS", "")
