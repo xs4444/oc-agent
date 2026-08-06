@@ -48,7 +48,11 @@ local function load()
   f:close()
   local ser = require("serialization")
   local ok, data = pcall(ser.unserialize, content)
-  if ok and type(data) == "table" then return data end
+  if ok and type(data) == "table" then
+    -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
+    if not data.context_window then data.context_window = 128000 end
+    return data
+  end
   return nil
 end
 

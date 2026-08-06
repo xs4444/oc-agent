@@ -165,7 +165,9 @@ local function chat(messages, config)
     content = msg.content,
     reasoning_content = msg.reasoning_content,
     tool_calls = msg.tool_calls,
-    finish_reason = choice.finish_reason
+    finish_reason = choice.finish_reason,
+    -- provider 上报的真实 usage（opencode TUI 同款数据源）
+    usage = data.usage,
   }
 end
 
