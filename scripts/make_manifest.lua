@@ -101,6 +101,19 @@ for _, rel in ipairs(relpaths) do
   total = total + #content
 end
 
+-- 根目录分发文件（install.lua 以 "/" 前缀下载，装到 agent 目录）
+for _, extra in ipairs({ "docs.lua" }) do
+  local content = lf_normalize(read_file(ROOT .. "/" .. extra))
+  local chunk, err = load(content, "@" .. extra)
+  if not chunk then
+    print("SYNTAX ERROR in " .. extra .. ":")
+    print(tostring(err))
+    os.exit(1)
+  end
+  entries[#entries + 1] = { rel = extra, bytes = #content }
+  total = total + #content
+end
+
 -- Build the JSON by hand (deterministic order for clean diffs).
 local out = {
   "{",

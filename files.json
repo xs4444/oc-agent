@@ -16,7 +16,8 @@
     "tools/question.lua": 2059,
     "tools/search.lua": 4566,
     "tools/shell.lua": 2722,
-    "tools/subagent.lua": 5015
+    "tools/subagent.lua": 5015,
+    "docs.lua": 6084
   },
-  "version": "2026-08-06T1207"
+  "version": "2026-08-06T1656"
 }
