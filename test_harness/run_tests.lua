@@ -515,6 +515,24 @@ do
   test("cmd_ctx shows window", out:find("128,000") ~= nil)
 end
 
+-- show_ctx_line: 运行时自动显示（每次响应后一行 [ctx] ...）
+do
+  local captured = {}
+  local orig_print = print
+  print = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+    captured[#captured + 1] = table.concat(parts, " ")
+  end
+  agent_test.show_ctx_line({prompt_tokens = 64000}, {context_window = 128000})
+  print = orig_print
+  local out = table.concat(captured, "\n")
+  test("show_ctx_line has ctx marker", out:find("%[ctx%]") ~= nil, out)
+  test("show_ctx_line has tokens+percent", out:find("64,000") ~= nil and out:find("50%.0%%") ~= nil, out)
+  test("show_ctx_line has progress bar", out:find("█") ~= nil, out)
+  test("show_ctx_line nil usage safe", not agent_test.show_ctx_line(nil, {}) or true)
+end
+
 print("")
 print("═══════════════════════════════════════")
 print("Context Budget / 400 Guard Tests")

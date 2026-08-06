@@ -51,6 +51,8 @@ local function load()
   if ok and type(data) == "table" then
     -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
     if not data.context_window then data.context_window = 128000 end
+    -- 运行时自动显示上下文（每次响应后一行 [ctx]），可设 false 关闭
+    if data.ctx_auto == nil then data.ctx_auto = true end
     return data
   end
   return nil

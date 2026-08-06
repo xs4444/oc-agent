@@ -199,6 +199,17 @@ local function ctx_bar(pct, width)
   return color .. string.rep("█", filled) .. string.rep("░", width - filled) .. "\27[0m"
 end
 
+-- 运行时上下文自动显示: 每次 LLM 响应后一行（opencode TUI 底栏同款数据）
+local function show_ctx_line(usage, config)
+  if not (usage and usage.prompt_tokens) then return end
+  local window = tonumber(config.context_window) or 128000
+  local total = usage.prompt_tokens
+  local pct = window > 0 and (total / window) or 0
+  print("")
+  print("[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
+    .. string.format("%.1f", pct * 100) .. "%) " .. ctx_bar(pct, 20))
+end
+
 local function cmd_ctx(config, messages, usage_override)
   local window = tonumber(config.context_window) or 128000
   local usage = usage_override or LAST_USAGE
@@ -506,15 +517,28 @@ local function process_exchange(messages, config, user_input, persist, session)
 
     if response.error then
       if not retried_400 and tostring(response.error):find("400") then
-        -- HTTP 400 大概率是上下文超限：强制裁剪后重试一次
+        -- 400 不一定是上下文超限（也可能是 reasoning 缺失/格式/限流）。
+        -- 仅当估算确实超限（>85% 窗口）才裁剪重试；其余直接报错保留现场。
         retried_400 = true
-        print("请求被拒 (HTTP 400)，可能是上下文超限，强制裁剪后重试...")
-        force_trim(messages, config)
-        if persist then
-          if session then rebuild_session_history(session, messages)
-          else rebuild_history(messages) end
+        local est = 0
+        for _, m in ipairs(messages) do
+          est = est + estimate_tokens(m.content or "")
+              + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
         end
-        -- 继续循环重试
+        local window = tonumber(config.context_window) or 128000
+        if est > window * 0.85 then
+          print("HTTP 400（上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " 超限），强制裁剪后重试...")
+          force_trim(messages, config)
+          if persist then
+            if session then rebuild_session_history(session, messages)
+            else rebuild_history(messages) end
+          end
+          -- 继续循环重试
+        else
+          print("HTTP 400（上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window)
+            .. " 未超限，非上下文原因），请求失败: " .. tostring(response.error):sub(1, 200))
+          return {error = response.error}
+        end
       else
         return {error = response.error}
       end
@@ -522,8 +546,11 @@ local function process_exchange(messages, config, user_input, persist, session)
       -- 请求成功，重置 400 重试标记（后续轮次仍可重试）
       retried_400 = false
 
-    -- 保存 provider 上报的 usage（/ctx 显示用）
-    if response.usage then LAST_USAGE = response.usage end
+    -- 保存 provider 上报的 usage（/ctx 显示用）+ 运行时自动显示
+    if response.usage then
+      LAST_USAGE = response.usage
+      if config.ctx_auto ~= false then show_ctx_line(response.usage, config) end
+    end
 
     if response.reasoning_content then
       print(response.reasoning_content)
@@ -793,6 +820,7 @@ if _TEST_MODE then
     cmd_ctx = cmd_ctx,
     estimate_tokens = estimate_tokens,
     ctx_bar = ctx_bar,
+    show_ctx_line = show_ctx_line,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,
     TOOLS = TOOLS,
