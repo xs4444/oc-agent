@@ -517,6 +517,38 @@ end
 
 print("")
 print("═══════════════════════════════════════")
+print("Context Budget / 400 Guard Tests")
+print("═══════════════════════════════════════")
+
+-- force_trim: 超限会话裁剪（防 400 死循环）
+local big_content = string.rep("hello world this is a test ", 3000)  -- 每条 ~90KB
+local msgs_big = {}
+for i = 1, 20 do
+  msgs_big[#msgs_big + 1] = {role = "user", content = big_content}
+  msgs_big[#msgs_big + 1] = {role = "assistant", content = big_content}
+end
+local cfg_small = {context_window = 40000}
+local est = agent_test.force_trim(msgs_big, cfg_small)
+test("force_trim cuts to min 4 msgs", #msgs_big == 4, "#=" .. tostring(#msgs_big))
+test("force_trim keeps system+recent", msgs_big[#msgs_big].role == "assistant")
+test("force_trim returns estimate", type(est) == "number" and est > 0)
+
+-- ensure_context_budget: 小会话不触发压缩
+local small = {{role = "user", content = "hi"}, {role = "assistant", content = "hello"}}
+local m2, e2 = agent_test.ensure_context_budget(small, cfg_small, false)
+test("ensure no-op on small session", #m2 == #small, "#=" .. tostring(#m2))
+
+-- ensure 大会话: 压缩或裁剪后消息数减少（mock 下 compact 成功）
+local m3 = {}
+for i = 1, 20 do
+  m3[#m3 + 1] = {role = "user", content = big_content}
+  m3[#m3 + 1] = {role = "assistant", content = big_content}
+end
+local m3r, e3 = agent_test.ensure_context_budget(m3, cfg_small, false)
+test("ensure reduces big session", #m3r < #m3, "#=" .. tostring(#m3r) .. " from " .. tostring(#m3))
+
+print("")
+print("═══════════════════════════════════════")
 print("Append-only Session Log Tests")
 print("═══════════════════════════════════════")
 

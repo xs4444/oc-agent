@@ -56,7 +56,7 @@ local function collect(config, history)
     else
       local ok_c, comp = pcall(require, "computer")
       local ok_u, u = ok_c and pcall(comp.uptime)
-      ts = "uptime " .. (ok_u and string.format("%.0f", u) .. "s" or "?")
+      ts = "uptime " .. ((ok_u and u and string.format("%.0f", u) .. "s") or "?")
     end
     lines[#lines + 1] = "Generated: " .. ts
   end
