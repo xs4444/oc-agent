@@ -2692,6 +2692,12 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
 
     local assistant_msg = {role = "assistant", content = response.content or ""}
+    -- reasoning_content 必须完整传回（DeepSeek/Kimi thinking mode 要求：
+    -- 网关校验后续请求中的 reasoning_content，缺失返回 400
+    -- "The reasoning_content in the thinking mode must be passed back"）
+    if response.reasoning_content and response.reasoning_content ~= "" then
+      assistant_msg.reasoning_content = response.reasoning_content
+    end
     if response.tool_calls then
       assistant_msg.tool_calls = response.tool_calls
     end
