@@ -54,7 +54,8 @@ local function read_version(dir)
 end
 
 local function human_size(n)
-  n = tonumber(n) or 0
+  n = tonumber(n)
+  if not n then return "?" end
   if n >= 1048576 then return string.format("%.1f MiB", n / 1048576) end
   if n >= 1024 then return string.format("%.1f KiB", n / 1024) end
   return n .. " B"
@@ -157,10 +158,20 @@ local function scan_installed()
   return found
 end
 
--- 扫描候选盘（/mnt 下可写目录）: 返回 {path=..., cap=...} 列表
+-- 扫描候选盘（/mnt 下可写目录）: 返回 {path=..., avail=..., system=...} 列表。
+-- 容量用 filesystem component API（fs.size 对挂载点无效）；识别系统盘
+-- （根 / 挂载的同一盘）并排除出候选，避免文档误装系统盘。
 local function scan_disks()
   local fs = require("filesystem")
   local disks = {}
+  -- 根盘 proxy（path == "/" 的挂载）——同盘即系统盘
+  local root_proxy
+  local ok_mounts, mounts = pcall(fs.mounts)
+  if ok_mounts then
+    for proxy, path in mounts do
+      if path == "/" then root_proxy = proxy break end
+    end
+  end
   local ok_ls, iter = pcall(fs.list, "/mnt")
   if ok_ls then
     for item in iter do
@@ -171,14 +182,27 @@ local function scan_disks()
         if probe then
           probe:close()
           os.remove(full .. "/.doc_probe")
-          local cap = nil
-          local ok_sz, sz = pcall(fs.size, full)
-          if ok_sz then cap = sz end
-          disks[#disks + 1] = {path = full, cap = cap}
+          -- 可用空间 = getCapacity - usedSpace（component API）
+          local avail = nil
+          local ok_get, proxy = pcall(fs.get, full)
+          if ok_get and proxy then
+            local ok_c, cap = pcall(proxy.getCapacity, proxy)
+            local ok_u, used = pcall(proxy.usedSpace, proxy)
+            if ok_c and type(cap) == "number" then
+              avail = cap - (ok_u and type(used) == "number" and used or 0)
+            end
+          end
+          local is_system = (root_proxy ~= nil and proxy == root_proxy)
+          disks[#disks + 1] = {path = full, avail = avail, system = is_system}
         end
       end
     end
   end
+  -- 按可用空间降序，数据盘在前
+  table.sort(disks, function(a, b)
+    if a.system ~= b.system then return not a.system end
+    return (a.avail or 0) > (b.avail or 0)
+  end)
   return disks
 end
 
@@ -267,7 +291,8 @@ local function interactive()
     for _, ins in ipairs(installed) do
       if ins.path == d.path .. "/doc" then tag = "（已安装）" end
     end
-    print("  [" .. i .. "] " .. d.path .. " — " .. human_size(d.cap) .. tag)
+    if d.system then tag = tag .. "（系统盘，不建议装文档）" end
+    print("  [" .. i .. "] " .. d.path .. " — 可用 " .. human_size(d.avail) .. tag)
   end
 
   print("")
@@ -317,12 +342,17 @@ local function interactive()
   end
 
   local dest
-  if #disks > 0 then
-    print("选择安装位置:")
-    for i, d in ipairs(disks) do
+  -- 安装目标只列数据盘（排除系统盘）
+  local data_disks = {}
+  for _, d in ipairs(disks) do
+    if not d.system then data_disks[#data_disks + 1] = d end
+  end
+  if #data_disks > 0 then
+    print("选择安装位置（数据盘）:")
+    for i, d in ipairs(data_disks) do
       local rec = ""
       if i == 1 then rec = "（推荐: 剩余空间最大）" end
-      print("  [" .. i .. "] " .. d.path .. "/doc — " .. human_size(d.cap) .. rec)
+      print("  [" .. i .. "] " .. d.path .. "/doc — 可用 " .. human_size(d.avail) .. rec)
     end
     print("  [0] 根目录 /doc（不推荐: 系统盘空间紧张）")
     io.write("选择 [1]: ")
@@ -331,9 +361,10 @@ local function interactive()
     if idx == 0 then
       dest = "/doc"
     else
-      dest = (disks[idx] and disks[idx].path or disks[1].path) .. "/doc"
+      dest = (data_disks[idx] and data_disks[idx].path or data_disks[1].path) .. "/doc"
     end
   else
+    print("未发现可写数据盘，将安装到根目录 /doc。")
     dest = "/doc"
   end
 
@@ -377,7 +408,7 @@ elseif mode == "status" then
     print("已安装: (无)")
   end
   for _, d in ipairs(scan_disks()) do
-    print("候选盘: " .. d.path .. " — " .. human_size(d.cap))
+    print("候选盘: " .. d.path .. " — 可用 " .. human_size(d.avail) .. (d.system and "（系统盘）" or ""))
   end
 elseif mode and mode:sub(1, 1) == "/" then
   -- 直接指定目录（旧用法兼容）
