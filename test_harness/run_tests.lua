@@ -533,6 +533,32 @@ do
   test("show_ctx_line nil usage safe", not agent_test.show_ctx_line(nil, {}) or true)
 end
 
+-- collect_multiline: 多行输入收集（/ml 命令核心，模拟 io.read 输入队列）
+do
+  local orig_read = io.read
+  local queue = {"line 1", "line 2", "line 3", "EOF"}
+  io.read = function() return table.remove(queue, 1) end
+  local text = agent_test.collect_multiline()
+  io.read = orig_read
+  test("collect_multiline joins lines", text == "line 1\nline 2\nline 3", tostring(text))
+end
+
+do
+  local orig_read = io.read
+  io.read = function() return nil end  -- Ctrl+D 取消
+  local text2 = agent_test.collect_multiline()
+  io.read = orig_read
+  test("collect_multiline cancel on nil", text2 == nil)
+end
+
+do
+  local orig_read = io.read
+  io.read = function() return "EOF" end  -- 直接 EOF，空收集
+  local text3 = agent_test.collect_multiline()
+  io.read = orig_read
+  test("collect_multiline empty on immediate EOF", text3 == nil)
+end
+
 print("")
 print("═══════════════════════════════════════")
 print("Context Budget / 400 Guard Tests")
