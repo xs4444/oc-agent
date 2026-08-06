@@ -41,5 +41,12 @@ docs/
 - **诊断上报 /debug**：收集版本+脱敏配置+最近 30 条历史 → 本地文件 + GitHub Gist 上传（`/gist-token` 配置，gist scope；token 完全遮蔽）
 - **高危场景测试**：danger_test.lua 21 项（自我修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用），本地安全模拟验证 agent 鲁棒性
 - **已知平台限制**：纯 CPU 死循环（永不 yield）在 OpenOS 协作式调度下饿死主线程，任何 Lua 层超时无法中断——真实 OC 有机器级看门狗（computer.timeout，默认 5s）兜底，ocvm 模拟器无此机制
+- **上下文仪表盘 /ctx**：显示 provider 上报的真实 tokens + 窗口百分比 + ANSI 进度条（绿/黄/红分级）+ 消息构成估算 + 压缩状态；每次响应后自动显示 `[ctx]` 一行（`ctx_auto=false` 可关）；`context_window` 配置（默认 128000）
+- **400 防护**：请求前 token 预算（超 80% 窗口自动压缩；压缩失败 LLM 已超限时强制裁剪保留最近）+ HTTP 400 条件重试（仅估算真超限才裁剪，其他原因保留现场）——修复"工具结果/上下文累积 → 400 死循环"
+- **reasoning_content 传回**：DeepSeek/Kimi thinking mode 的思考内容随历史完整传回（网关要求缺失即 400，官方 issue 机制）；此前只打印不存历史导致工具链延续 400
+- **JSON 控制字符转义**：全控制字符（\x00-\x1f、\x7f）转义为 \u00XX——裸控制字符产出非法 JSON，服务端 400（实测 0.7% 上下文时的 400 即此因）
+- **多行输入 /ml**：逐行收集到 EOF 合并为一条消息（粘贴多行代码场景；OC 无 bracketed paste，ocvm 精简 OpenOS 无 term.paste 处理，逐行最稳）
+- **离线文档 docs.lua**：GTNH wiki markdown 可选下载（纯 Lua ustar 解包，零依赖）；交互引导安装（候选盘容量/系统盘排除）+ 卸载 + status；docs.json 版本对比跳过重复下载；v0.3.3 起纳入分发清单（update.lua 自动更新）
+- **发版自动化**：build_all.py（构建+清单+142 项回归）→ release_check.py（版本 bump/清单/字节/语法检查）→ watch_release.py（jsDelivr 索引监控）——杜绝 v0.3.2 类"版本未 bump 服务器嗅探不到"事故
 
 核心架构（两级循环 + 工具契约 + 动态系统提示）与设计文档一致。

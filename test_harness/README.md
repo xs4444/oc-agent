@@ -7,9 +7,12 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 ```bash
 # 需在 test_harness/ 目录内运行（脚本用相对路径加载 ../agent.lua）
 ../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" run_tests.lua
+
+# 或从仓库根一键（构建 + 清单 + 对产物跑回归）：
+python scripts/build_all.py
 ```
 
-预期输出：`FINAL: 117 pass, 0 fail out of 117 tests`
+预期输出：`FINAL: 142 pass, 0 fail out of 142 tests`
 
 ## 脚本分类
 
@@ -18,7 +21,9 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 | 脚本 | 用途 |
 |------|------|
 | `oc_mock.lua` | OC API 模拟层（component/computer/filesystem/shell/internet/serialization/**event/modem/thread**），`package.loaded` 注入 `require`；含 chat/completions 端点 mock 与 modem 环路事件队列 |
-| `run_tests.lua` | 主回归：JSON 编解码 + 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（117 项） |
+| `run_tests.lua` | 主回归（**142 项**）：JSON 编解码（含**控制字符 \u00XX 转义**）+ 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（15 项）+ **/ctx 仪表盘**（tokens/进度条三色/构成）+ **400 防护**（预算压缩/强制裁剪）+ **多行输入收集** |
+| `wire_check.lua` | 本地 mock 捕获 chat() 请求体：核对 tools 数组声明（15 工具在列）+ 系统提示内容（ask_user/离线文档段存在性） |
+| `ustar_check.lua` | 离线文档包 ustar 解析器本地验证（269 条目 / 无 CRLF / 关键文件存在） |
 | `plugin_test.lua` | 插件注册：临时目录写假模块 → scan_dir 注册 → 调用 → 坏模块跳过（12 项） |
 | `danger_test.lua` | **高危场景鲁棒性**（21 项）：自修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用，全部隔离临时目录安全模拟 |
 | `perf_test.lua` | 工具调用性能对比：循环 json_query/calc/text_ops/文件工具 N 次，比较新旧版本耗时 |
@@ -54,7 +59,13 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 任务编号：1=基础对话 2=文件读写 3=组件链(list→doc→invoke) 4=execute_lua 计算 5=多组件查询
 
 | `modular_ocvm_test.lua` | **模块化 e2e**：验证多文件 require 链 + 插件自举闭环（写模块→注册→调用→坏模块跳过） | 22 项 |
-| `shell_timeout_test.lua` | **shell_execute 超时真机验证**（ocvm/OCEmu，9 项）：挂起命令 3s 超时 kill → agent 恢复 → 正常命令不受影响 |
+| `shell_timeout_test.lua` | **shell_execute 超时真机验证**（ocvm/OCEmu，9 项）：挂起命令 3s 超时 kill → agent 恢复 → 正常命令 stdout 捕获断言（io.popen 行为） |
+| `ask_user_test.lua` | **ask_user 工具 e2e**：提示词"尝试调用 ask_user 工具"→ 断言 AI 声明调用（deepseek-v4-flash 实测 PASS，question+options 参数正确） |
+| `reasoning_e2e_test.lua` | **reasoning_content 传回 e2e**：完整工具链（thinking 输出 + calc 调用 + 第二轮请求带 reasoning_content）→ 无 400（3/3） |
+| `json_ctrl_e2e_test.lua` | **JSON 控制字符修复 e2e**：tool 结果含 \x00/\x1b 的合法消息序列 → 真实端点 200（修复前 400） |
+| `ctx_display_test.lua` | **/ctx 渲染真机验证**：加载 + ANSI 进度条 + 消息构成输出（无网络依赖） |
+| `test_docs_lua.lua` | **docs.lua 端到端**（注入假网络）：版本对比跳过（tar 只下载一次）+ ustar 解压 269 文件 + version.txt |
+| `test_docs_interact.lua` | **docs.lua 交互引导全流程**（10 项）：路径安装/status 检测/交互选盘/交互卸载/卸载后确认 |
 | `thread_diag_test.lua` | **协作式调度诊断**：确认纯 CPU 死循环（`while true do end` 永不 yield）在 OpenOS 中饿死主线程，任何 Lua 层超时无法中断（平台限制，真实 OC 同样如此） |
 
 ### 插件/自举测试
@@ -76,6 +87,12 @@ python ../tools/ocvm_test.py search_test.lua
 python ../tools/ocvm_test.py newfeat_test.lua
 python ../tools/ocvm_test.py filetools_test.lua
 
+# 额外上传文件（docs.lua 安装包、离线文档 tar 等，逗号分隔）：
+EXTRA_FILES=../docs.lua,../docs_pack/oc-docs.tar,../docs_pack/docs.json \
+  python ../tools/ocvm_test.py test_docs_lua.lua
+
+# 结果自动保存到 test_harness/results/<脚本>_result.txt（屏幕输出 + 本地文件双份）
+
 # 性能对比（本地 mock 环境测相对差异）
 ../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" perf_test.lua ../old_agent.lua 2>&1 | grep iters
 ../lua_portable/bin/lua.exe -e "package.path = './?.lua;' .. (package.path or '')" perf_test.lua ../agent.lua 2>&1 | grep iters
@@ -93,7 +110,7 @@ lua /mnt/<挂载短名>/search_test.lua /mnt/<挂载短名> <api_key> <model> <a
 
 ## 测试约定
 
-- agent.lua 加载时 `_TEST_MODE = true` 跳过 `main()`，暴露 `agent_test` 钩子表（chat/http_post/build_system_prompt/trim_history/compact_history/should_compact/summarize_history/process_exchange/wait_modem_message/load_history/append_history/rebuild_history/set_history_path/TOOLS）
+- agent.lua 加载时 `_TEST_MODE = true` 跳过 `main()`，暴露 `agent_test` 钩子表（chat/http_post/build_system_prompt/trim_history/compact_history/should_compact/summarize_history/process_exchange/wait_modem_message/load_history/append_history/rebuild_history/set_history_path/cmd_ctx/estimate_tokens/ctx_bar/show_ctx_line/collect_multiline/ensure_context_budget/force_trim/TOOLS）
 - TOOLS 断言：`run_tests.lua` 定义 `EXPECTED_TOOLS` 显式清单（15 项），双向校验（无缺失 + 无多余）——**新增工具必须在清单登记**，否则测试失败
 - 脚本内不用 `arg` 全局（OpenOS 的 lua 无此变量），参数用 `{...}` vararg
-- 结果实时写入文件（OpenOS 崩溃时保留部分结果）
+- 结果实时写入文件（OpenOS 崩溃时保留部分结果）；ocvm 驱动自动保存副本到 `results/`（gitignored）
