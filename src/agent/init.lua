@@ -428,20 +428,70 @@ end
 -- user input, runs the LLM tool-calling loop, returns the final text
 -- (concatenated assistant content) and updates `messages`.
 
+-- 强制裁剪: 丢弃最早消息直到估算 tokens < 窗口 60% 或只剩 4 条。
+-- 用于压缩失败（LLM 已超限，summarize 同样 400）与 400 重试路径。
+-- 返回裁剪后的估算值。
+local function force_trim(messages, config)
+  local window = tonumber(config.context_window) or 128000
+  local target = window * 0.6
+  local est = 0
+  for _, m in ipairs(messages) do
+    est = est + estimate_tokens(m.content or "")
+        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+  end
+  while #messages > 4 and est > target do
+    est = est - estimate_tokens(messages[1].content or "")
+    table.remove(messages, 1)
+  end
+  return est
+end
+
+-- 请求前上下文预算: 估算 tokens 超窗口比例时先压缩；压缩失败（LLM 可能
+-- 已超限，summarize 同样 400）强制裁剪最早消息——防止 400 死循环。
+-- 返回 (新 messages, 估算 tokens)。
+local function ensure_context_budget(messages, config, persist, session)
+  local window = tonumber(config.context_window) or 128000
+  local function est_msgs(msgs)
+    local e = 0
+    for _, m in ipairs(msgs) do
+      e = e + estimate_tokens(m.content or "")
+          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+    end
+    return e
+  end
+  local function persist_msgs(msgs)
+    if persist then
+      if session then rebuild_session_history(session, msgs)
+      else rebuild_history(msgs) end
+    end
+  end
+
+  local est = est_msgs(messages)
+  -- 触发: 估算超窗口 80%，或消息条数超阈值
+  if est <= window * 0.8 and not should_compact(messages) then
+    return messages, est
+  end
+
+  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens，自动压缩...")
+  local compacted = compact_history(messages, config)
+  if compacted then
+    messages = compacted
+    persist_msgs(messages)
+    return messages, est_msgs(messages)
+  end
+
+  -- 压缩失败（LLM 超限）：强制裁剪最早对话消息
+  print("压缩失败（LLM 可能已超限），强制裁剪早期消息...")
+  force_trim(messages, config)
+  persist_msgs(messages)
+  return messages, est_msgs(messages)
+end
+
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
 
-  -- Auto-compact before trimming when history gets large
-  if should_compact(messages) then
-    local compacted = compact_history(messages, config)
-    if compacted then
-      messages = compacted
-      if persist then
-        if session then rebuild_session_history(session, messages)
-        else rebuild_history(messages) end
-      end
-    end
-  end
+  -- 请求前上下文预算（压缩/裁剪，防 400 死循环）
+  messages, _ = ensure_context_budget(messages, config, persist, session)
   messages = trim_history(messages)
   if persist then
     if session then append_session_history(session, messages[#messages])
@@ -449,13 +499,28 @@ local function process_exchange(messages, config, user_input, persist, session)
   end
 
   local final_text = {}
+  local retried_400 = false
   while true do
     io.write("Thinking...\n")
     local response = chat(messages, config)
 
     if response.error then
-      return {error = response.error}
-    end
+      if not retried_400 and tostring(response.error):find("400") then
+        -- HTTP 400 大概率是上下文超限：强制裁剪后重试一次
+        retried_400 = true
+        print("请求被拒 (HTTP 400)，可能是上下文超限，强制裁剪后重试...")
+        force_trim(messages, config)
+        if persist then
+          if session then rebuild_session_history(session, messages)
+          else rebuild_history(messages) end
+        end
+        -- 继续循环重试
+      else
+        return {error = response.error}
+      end
+    else
+      -- 请求成功，重置 400 重试标记（后续轮次仍可重试）
+      retried_400 = false
 
     -- 保存 provider 上报的 usage（/ctx 显示用）
     if response.usage then LAST_USAGE = response.usage end
@@ -536,6 +601,7 @@ local function process_exchange(messages, config, user_input, persist, session)
           else append_history(tool_msg) end
         end
       end
+    end
     end
   end
 
@@ -721,6 +787,8 @@ if _TEST_MODE then
     cmd_ctx = cmd_ctx,
     estimate_tokens = estimate_tokens,
     ctx_bar = ctx_bar,
+    ensure_context_budget = ensure_context_budget,
+    force_trim = force_trim,
     TOOLS = TOOLS,
   }
 end
