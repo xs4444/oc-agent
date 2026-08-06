@@ -37,6 +37,24 @@ local function build_system_prompt()
   local address = safe_call(computer.address) or "unknown"
   local uptime = safe_call(computer.uptime) or 0
   local free_mem = safe_call(computer.freeMemory) or 0
+  -- 离线文档探测: /mnt/<x>/doc/version.txt 存在即视为已安装（挂载短名每次
+  -- 重启会变，不能硬编码路径；仅几个 fs 调用，开销可忽略）
+  local doc_path
+  do
+    local ok_fs, fs = pcall(require, "filesystem")
+    if ok_fs and fs.list then
+      local ok_ls, iter = pcall(fs.list, "/mnt")
+      if ok_ls and type(iter) == "function" then
+        for item in iter do
+          local full = "/mnt/" .. tostring(item) .. "/doc"
+          if fs.exists(full .. "/version.txt") then
+            doc_path = full
+            break
+          end
+        end
+      end
+    end
+  end
   -- Working directory (agent 所在的工作区): OpenOS shell cwd, 或 AGENT_DIR
   local cwd
   do
@@ -78,6 +96,7 @@ local function build_system_prompt()
     .. "- shell_execute: Run an OpenOS shell command\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
     .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
+    .. (doc_path and ("Offline GTNH wiki documentation is installed at " .. doc_path .. " (api/, component/, tutorial/, gtnh/ etc). When you need component method signatures, mod API details, or GTNH integration facts, read the relevant .md file with read_file (explore with list_directory) — prefer it over web_search.\n\n") or "")
     .. "When exploring hardware, use this workflow:\n"
     .. "1. component_list to discover components\n"
     .. "2. component_doc(address) to learn what methods a component has\n"
