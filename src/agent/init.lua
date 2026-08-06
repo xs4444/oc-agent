@@ -167,6 +167,84 @@ end
 
 -- ── Section 7: REPL & Main Loop ────────────────────────────────
 
+-- 最近一次 LLM 响应的 usage（provider 上报；opencode TUI 同款数据源）
+local LAST_USAGE = nil
+
+-- 粗略 token 估算（无 tokenizer，仅显示用途）: 英文 ~4 字符/token，
+-- 中文按字节 3B/字 ≈ 0.45 token/字节
+local function estimate_tokens(s)
+  if not s then return 0 end
+  s = tostring(s)
+  local ascii, non_ascii = 0, 0
+  for i = 1, #s do
+    if s:byte(i) < 128 then ascii = ascii + 1 else non_ascii = non_ascii + 1 end
+  end
+  return math.floor(ascii / 4 + non_ascii * 0.45)
+end
+
+local function fmt_num(n)
+  local s = tostring(math.floor(n or 0))
+  local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+  return out:gsub("^,", "")
+end
+
+-- ANSI 进度条: pct 0..1，按使用率着色（绿/黄/红）
+local function ctx_bar(pct, width)
+  local filled = math.floor(pct * width + 0.5)
+  if filled < 0 then filled = 0 end
+  if filled > width then filled = width end
+  local color = "\27[32m"
+  if pct >= 0.85 then color = "\27[31m"
+  elseif pct >= 0.6 then color = "\27[33m" end
+  return color .. string.rep("█", filled) .. string.rep("░", width - filled) .. "\27[0m"
+end
+
+local function cmd_ctx(config, messages, usage_override)
+  local window = tonumber(config.context_window) or 128000
+  local usage = usage_override or LAST_USAGE
+  print("")
+  print("═══ 上下文使用 ═══")
+  if usage and usage.prompt_tokens then
+    local total = usage.prompt_tokens
+    local pct = window > 0 and (total / window) or 0
+    print("上次请求: " .. fmt_num(total) .. " tokens (" .. string.format("%.1f", pct * 100) .. "% of " .. fmt_num(window) .. ")")
+    print(ctx_bar(pct, 40) .. "  " .. string.format("%.1f%%", pct * 100))
+    if usage.completion_tokens then
+      print("输出: " .. fmt_num(usage.completion_tokens) .. " tokens")
+    end
+  else
+    print("尚无请求记录（发一条消息后刷新）")
+  end
+
+  -- 本次消息构成（估算）
+  local sys_tok, conv_tok, tool_tok = 0, 0, 0
+  local msg_count = 0
+  for _, m in ipairs(messages) do
+    msg_count = msg_count + 1
+    local extra = ""
+    if m.tool_calls then extra = tostring(m.tool_calls) end
+    local t = estimate_tokens(m.content or "") + estimate_tokens(extra)
+    if m.role == "system" then sys_tok = sys_tok + t
+    elseif m.role == "tool" then tool_tok = tool_tok + t
+    else conv_tok = conv_tok + t end
+  end
+  local est_total = sys_tok + conv_tok + tool_tok
+  print("")
+  print("┌─ 消息构成（估算，" .. msg_count .. " 条）──────")
+  local function line(label, tok)
+    local pct = est_total > 0 and (tok / est_total * 100) or 0
+    print("│ " .. label .. string.rep(" ", 14 - #label) .. fmt_num(tok) .. " tok  " .. string.format("%.0f%%", pct))
+  end
+  line("system", sys_tok)
+  line("对话", conv_tok)
+  line("工具结果", tool_tok)
+  print("└──────────────────────────────")
+  print("合计(估算): " .. fmt_num(est_total) .. " tok | 模型: " .. tostring(config.model or "?"))
+  -- 压缩状态
+  local ok_sc, sc = pcall(should_compact, messages)
+  print("压缩: " .. (ok_sc and sc and "即将触发（超过阈值，可 /compact）" or "未触发") .. " | /ctx 参考 opencode TUI 的 usage 显示")
+end
+
 local function handle_command(cmd, config, messages)
   local parts = {}
   for w in cmd:gmatch("%S+") do parts[#parts + 1] = w end
@@ -318,6 +396,8 @@ local function handle_command(cmd, config, messages)
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
+  elseif command == "/ctx" then
+    cmd_ctx(config, messages)
   elseif command == "/help" then
     print("Commands:")
     print("  /model <name>   Switch LLM model (e.g. deepseek-v4-flash-free)")
@@ -332,6 +412,7 @@ local function handle_command(cmd, config, messages)
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
+    print("  /ctx            Show context usage (tokens + progress bar, like opencode TUI)")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
   elseif command == "/exit" then
@@ -375,6 +456,9 @@ local function process_exchange(messages, config, user_input, persist, session)
     if response.error then
       return {error = response.error}
     end
+
+    -- 保存 provider 上报的 usage（/ctx 显示用）
+    if response.usage then LAST_USAGE = response.usage end
 
     if response.reasoning_content then
       print(response.reasoning_content)
@@ -634,6 +718,9 @@ if _TEST_MODE then
     set_history_path = function(p) session_mod.set_paths(p) end,
     process_exchange = process_exchange,
     wait_modem_message = subagent_mod.wait_modem_message,
+    cmd_ctx = cmd_ctx,
+    estimate_tokens = estimate_tokens,
+    ctx_bar = ctx_bar,
     TOOLS = TOOLS,
   }
 end

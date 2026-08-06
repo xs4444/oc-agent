@@ -474,6 +474,49 @@ test("TOOLS count = " .. #EXPECTED_TOOLS, #agent_test.TOOLS == #EXPECTED_TOOLS,
 
 print("")
 print("═══════════════════════════════════════")
+print("Context Usage (/ctx) Tests")
+print("═══════════════════════════════════════")
+
+-- estimate_tokens: 英文 ~4 字符/token，中文更高
+local et = agent_test.estimate_tokens
+test("estimate_tokens ascii", et("hello world this is a test") == 6, tostring(et("hello world this is a test")))
+test("estimate_tokens chinese > 0", et("你好，世界") > 0, tostring(et("你好，世界")))
+test("estimate_tokens nil-safe", et(nil) == 0 and et("") == 0)
+
+-- ctx_bar: 40 格 + ANSI 颜色（█/░ 为 3 字节 UTF-8）
+local bar = agent_test.ctx_bar
+local b1 = bar(0.1, 40)
+local b2 = bar(0.7, 40)
+local function bar_width(b) return #b:gsub("\27%[%d+m", "") / 3 end
+test("ctx_bar width 40", bar_width(b1) == 40, "#=" .. tostring(bar_width(b1)))
+test("ctx_bar green at 10%", b1:find("\27%[32m") ~= nil)
+test("ctx_bar yellow at 70%", b2:find("\27%[33m") ~= nil)
+test("ctx_bar red at 95%", agent_test.ctx_bar(0.95, 40):find("\27%[31m") ~= nil)
+
+-- cmd_ctx: 假 usage + 构造消息，输出含 tokens 与百分比
+do
+  local captured = {}
+  local orig_print = print
+  print = function(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+    captured[#captured + 1] = table.concat(parts, " ")
+  end
+  agent_test.cmd_ctx(
+    {context_window = 128000, model = "test-model"},
+    {{role = "system", content = "sys"}, {role = "user", content = "你好"}, {role = "tool", content = "result data"} , {role = "assistant", content = "ok"}},
+    {prompt_tokens = 64000, completion_tokens = 100}
+  )
+  print = orig_print
+  local out = table.concat(captured, "\n")
+  test("cmd_ctx shows tokens", out:find("64,000") ~= nil, out:sub(1, 120))
+  test("cmd_ctx shows percent", out:find("50%.0%%") ~= nil or out:find("50%") ~= nil, out:sub(1, 200))
+  test("cmd_ctx shows composition", out:find("消息构成") ~= nil)
+  test("cmd_ctx shows window", out:find("128,000") ~= nil)
+end
+
+print("")
+print("═══════════════════════════════════════")
 print("Append-only Session Log Tests")
 print("═══════════════════════════════════════")
 
