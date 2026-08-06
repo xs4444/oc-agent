@@ -196,6 +196,17 @@ def main():
     if result:
         print("=== RESULTS ===")
         print(result)
+        # 自动保存到本地 test_harness/results/<脚本名>_result.txt
+        try:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(script_path)), "results")
+            os.makedirs(out_dir, exist_ok=True)
+            stem = os.path.basename(script_path).rsplit(".", 1)[0]
+            local_path = os.path.join(out_dir, stem + "_result.txt")
+            with open(local_path, "w", encoding="utf-8") as lf:
+                lf.write(result)
+            print(f"[ocvm] result saved: {local_path}")
+        except Exception as e:
+            print(f"[ocvm] result save failed: {e}")
     else:
         print("[ocvm] NO RESULT FILE (timeout)")
         sys.exit(1)
