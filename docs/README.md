@@ -27,19 +27,19 @@ docs/
 
 - **新增工具**：`component_doc` / `component_invoke` / `web_search` / `json_query` / `calc` / `text_ops` / `edit_file` / `append_file` / `subagent_call` / `ask_user`（原计划 6 工具 → 现 15 工具）
 - **移除 execute_lua**：任意代码执行被数据处理工具集替代（安全 + 防 OOM）
-- **ask_user 交互工具**：仿 opencode question 工具（`F:\updateManager\opencode-src\packages\core\src\tool\question.ts`），REPL 模式 io.read 阻塞向用户提问（选项编号/自定义输入），subagent 模式自动禁用
 - **子代理**：modem 组网跨机器委派 + session 会话复用（参考 opencode 会话模型与 pi-subagents 角色设计）
 - **文件工具族**：read 行切片（offset/limit/tail）+ edit_file + append_file（内存恒定流式追加）
 - **默认模型**：从 OpenRouter/gpt-4o-mini 改为 OpenCode Zen 免费模型
 - **健壮性**：迭代器错误捕获、参数容错、yield 保护、内存三重裁剪、HTTP 自动重试（均源于模拟器/真实环境实测发现）
 - **持久化**：append-only JSONL 会话日志（替代整表重写）+ anchored summary 增量压缩 + 会话归档
-- **安装方式**：GitHub 自动安装（install.lua 引导器 + update.lua 一键更新，jsDelivr CDN 优先；tag 不可变 URL 根治 CDN 缓存过期；增量更新只下载变动文件）
+- **安装方式**：从"loot 磁盘"改为 GitHub 自动安装（update.lua 一键更新 → 查 jsDelivr data API 最新 tag → 不可变 tag URL 下载；install.lua 多文件安装 + 增量更新 + PATH 启动器）
 - **工具调用性能优化**：deps 表模块级缓存（每次调用省去 2 次 require + 1 次表构造），LuaJ 环境下性能回归接近旧版 upvalue 直调
 - **推理过程显示**：支持 DeepSeek 模型的 `reasoning_content` 字段，思考链先于回答打印
 - **弱模型容错**：nil 保护 + pcall 包裹工具调用，格式错误的 tool_calls 不崩溃
-- **shell_execute 输出捕获**：io.popen 捕获 stdout+stderr（原 shell.execute 只返回退出状态）；thread + waitForAll 超时 kill 防止挂起命令卡死 agent
-- **远程诊断**：`/debug` 收集版本+脱敏配置+最近历史 → 写 debug_report.txt + 可选上传 GitHub Gist（`/gist-token` 配置，token 完全遮蔽）
-- **PATH 集成**：安装后创建 `/home/bin/agent` 启动器，任意目录 `agent` 启动（OpenOS 默认 PATH 含 /home/bin）
-- **工具显示**：工具调用单行显示参数+结果摘要（适配 OpenOS 屏幕无法上翻的限制）
+- **shell_execute 输出捕获 + 超时**：io.popen 捕获 stdout+stderr（原来只返回退出状态布尔）；thread + waitForAll 超时保护（默认 60s，挂起命令自动 kill；ocvm/OCEmu 双模拟器真机验证 9/9）
+- **提问工具 ask_user**：仿 opencode question——对话中向用户提问（选项编号/自定义输入），REPL 阻塞等待，subagent 自动禁用
+- **诊断上报 /debug**：收集版本+脱敏配置+最近 30 条历史 → 本地文件 + GitHub Gist 上传（`/gist-token` 配置，gist scope；token 完全遮蔽）
+- **高危场景测试**：danger_test.lua 21 项（自我修改/坏插件/死循环/磁盘写满/配置损坏/删除自身/递归调用），本地安全模拟验证 agent 鲁棒性
+- **已知平台限制**：纯 CPU 死循环（永不 yield）在 OpenOS 协作式调度下饿死主线程，任何 Lua 层超时无法中断——真实 OC 有机器级看门狗（computer.timeout，默认 5s）兜底，ocvm 模拟器无此机制
 
 核心架构（两级循环 + 工具契约 + 动态系统提示）与设计文档一致。

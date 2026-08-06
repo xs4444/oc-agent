@@ -4,8 +4,10 @@
 
 | 脚本 | 用途 | 用法 |
 |------|------|------|
-| `build_single.lua` | **单文件构建**：将 `src/agent/` 模块树用 `package.preload` 拼接为单文件 `agent.lua`（分发用） | `lua scripts/build_single.lua` |
-| `make_manifest.lua` | **安装清单生成**：扫描 `src/agent/` 模块，生成 `files.json`（安装器校验用，按 LF 归一化字节数） | `lua scripts/make_manifest.lua` |
+| `build_single.lua` | **单文件构建**：将 `src/agent/` 模块树用 `package.preload` 拼接为单文件 `agent.lua`（分发用）。**模块清单硬编码**（9 核心 + 7 工具），新增模块必须登记 | `lua scripts/build_single.lua` |
+| `make_manifest.lua` | **安装清单生成**：扫描 `src/agent/` 模块，生成 `files.json`（安装器校验用，按 LF 归一化字节数；版本号含时间戳 `YYYY-MM-DDTHHMM` 便于区分同日构建） | `lua scripts/make_manifest.lua` |
+
+> ⚠️ 模块变更后**两个脚本都要运行**：`build_single.lua` 重建 agent.lua，`make_manifest.lua` 重新生成 files.json（字节数与版本同步，否则增量更新/字节校验会失败）。
 
 ## 一次性工具
 
