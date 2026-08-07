@@ -1,16 +1,16 @@
 {
   "files": {
-    "chat.lua": 12099,
+    "chat.lua": 12221,
     "config.lua": 3651,
     "debug.lua": 5669,
     "execute.lua": 2769,
     "http.lua": 5265,
-    "init.lua": 42804,
+    "init.lua": 46089,
     "json.lua": 6280,
-    "session.lua": 14871,
+    "session.lua": 16951,
     "subagent.lua": 4121,
     "tools.lua": 5730,
-    "tools/compact.lua": 2988,
+    "tools/compact.lua": 3242,
     "tools/component.lua": 4960,
     "tools/data.lua": 9636,
     "tools/file.lua": 7685,
@@ -18,8 +18,8 @@
     "tools/search.lua": 4566,
     "tools/shell.lua": 5346,
     "tools/subagent.lua": 5015,
-    "tui.lua": 17613,
+    "tui.lua": 19521,
     "docs.lua": 14689
   },
-  "version": "2026-08-07T1920"
+  "version": "2026-08-07T2047"
 }

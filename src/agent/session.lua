@@ -73,15 +73,19 @@ local function trim_history(messages)
     end
     messages = trimmed
   end
-  -- Then cap by total bytes (drop oldest until under budget); 同样保留
-  -- messages[1]，从第 2 条开始丢
+  -- Then cap by total bytes; 优先丢折叠段消息（已进摘要，删除无损——
+  -- 投影式压缩的渐进内存回收），其次从头丢；保留 messages[1] 与最近消息
   while #messages > 3 do  -- keep the first message + the last 2 (current exchange)
     local total = 0
     for _, m in ipairs(messages) do
       total = total + msg_bytes(m)
     end
     if total <= MAX_HISTORY_BYTES then break end
-    table.remove(messages, 2)
+    local target = nil
+    for i = 2, #messages - 2 do
+      if messages[i].folded then target = i break end
+    end
+    table.remove(messages, target or 2)
   end
   return messages
 end
@@ -185,12 +189,11 @@ local function expand_keep_markers(summary, transcript_parts)
   end))
 end
 
--- Compact: replace older messages with an LLM summary, keep recent verbatim.
--- Anchored: if the history already starts with a summary (system message),
--- the new summary is an UPDATE of it (opencode-style), preserving old facts.
--- 保留策略（opencode-acp 双轨）: 至少 COMPACT_KEEP 条，估算 token 不足
--- COMPACT_KEEP_MIN_TOKENS 时向前补充，封顶 COMPACT_KEEP_MAX 条。
--- Returns new message list on success, nil on failure (caller falls back to trim).
+-- Compact（投影式，reasonix projection 精神）: 折叠段消息**不删除**——
+-- 标记 folded=true（请求构造/估算跳过，trim 优先清理），头部插入摘要消息。
+-- 历史在 append-only JSONL 中完整保留（可追溯/可回退）；折叠段最终被
+-- trim 渐进回收（内存受 MAX_HISTORY_BYTES 约束）。旧摘要消息被新摘要
+-- 取代（锚定更新语义不变）。请求构造跳过 folded → 模型只见摘要+保留段。
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
   local keep = COMPACT_KEEP
@@ -211,7 +214,7 @@ local function compact_history(messages, config)
       local s = m.content:match("^%[对话摘要%] (.*)$")
       if s then
         previous_summary = s
-        -- drop the old summary message from the transcript (it's passed separately)
+        -- drop the old summary message from the fold (it's passed separately)
       else
         old[#old + 1] = m
       end
@@ -224,11 +227,23 @@ local function compact_history(messages, config)
   -- KEEP 标记展开（与 summarize 同源 transcript 序号）
   summary = expand_keep_markers(summary, build_transcript(old).parts)
 
+  -- 投影式: 折叠段标记 folded（旧摘要消息被取代，直接移除），头部插摘要
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
+  for i = 1, #messages - keep do
+    local m = messages[i]
+    if not (m.role == "system" and type(m.content) == "string"
+        and m.content:match("^%[对话摘要%]")) then
+      m.folded = true
+      result[#result + 1] = m
+    end
+  end
   for i = #messages - keep + 1, #messages do
     result[#result + 1] = messages[i]
   end
-  return result
+  -- 就地替换（调用方持有同一表引用）
+  for i = #messages, 1, -1 do messages[i] = nil end
+  for i = 1, #result do messages[i] = result[i] end
+  return messages
 end
 
 -- 压缩触发判定（tokens 上限阈值驱动，用户要求按 context_window 比例）:
@@ -243,9 +258,11 @@ local function should_compact(messages, window)
   if w <= 0 then return false end
   local est = 0
   for _, m in ipairs(messages) do
-    est = est + estimate_tokens(m.content or "")
-        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
-    if est >= w * COMPACT_WINDOW_RATIO then return true end
+    if not m.folded then
+      est = est + estimate_tokens(m.content or "")
+          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      if est >= w * COMPACT_WINDOW_RATIO then return true end
+    end
   end
   return false
 end
@@ -316,6 +333,41 @@ local function set_paths(p)
   history_path = p
 end
 
+-- 当前会话文件路径（/hist 显示会话名用）
+local function current_path()
+  return history_path
+end
+
+-- 会话列表（类 opencode /session）: 扫描目录下 *.jsonl 会话文件
+--（/new 归档的 .txt 是归档而非会话，不列入）。dir 缺省用配置的
+-- sessions 目录（测试可注入临时目录）。
+-- 返回 {{name, count, modified}, ...} 按 modified 倒序。
+local function list_sessions(dir)
+  local fs = require("filesystem")
+  local base = dir or sessions_dir
+  -- pcall 兼容两环境: 真实 OC 对不存在路径抛错，测试 mock 返回空迭代器
+  local ok_l, iter = pcall(fs.list, base)
+  if not ok_l or type(iter) ~= "function" then return {} end
+  local out = {}
+  for name in iter do
+    if name:sub(-6) == ".jsonl" then
+      local path = base .. "/" .. name
+      local count = 0
+      local f = io.open(path, "r")
+      if f then
+        for _ in f:lines() do count = count + 1 end
+        f:close()
+      end
+      local modified = 0
+      local ok_m, m = pcall(fs.lastModified, path)
+      if ok_m and m then modified = m end
+      out[#out + 1] = {name = name:sub(1, -7), count = count, modified = modified}
+    end
+  end
+  table.sort(out, function(a, b) return a.modified > b.modified end)
+  return out
+end
+
 -- Inject the chat client (agent.lua calls this after Section 5 defines
 -- chat). Needed by summarize_history's LLM call.
 local function set_chat(fn)
@@ -332,6 +384,8 @@ return {
   summarize_history = summarize_history,
   set_paths = set_paths,
   set_chat = set_chat,
+  current_path = current_path,
+  list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
 }

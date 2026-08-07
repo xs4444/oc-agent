@@ -520,15 +520,19 @@ local function trim_history(messages)
     end
     messages = trimmed
   end
-  -- Then cap by total bytes (drop oldest until under budget); 同样保留
-  -- messages[1]，从第 2 条开始丢
+  -- Then cap by total bytes; 优先丢折叠段消息（已进摘要，删除无损——
+  -- 投影式压缩的渐进内存回收），其次从头丢；保留 messages[1] 与最近消息
   while #messages > 3 do  -- keep the first message + the last 2 (current exchange)
     local total = 0
     for _, m in ipairs(messages) do
       total = total + msg_bytes(m)
     end
     if total <= MAX_HISTORY_BYTES then break end
-    table.remove(messages, 2)
+    local target = nil
+    for i = 2, #messages - 2 do
+      if messages[i].folded then target = i break end
+    end
+    table.remove(messages, target or 2)
   end
   return messages
 end
@@ -632,12 +636,11 @@ local function expand_keep_markers(summary, transcript_parts)
   end))
 end
 
--- Compact: replace older messages with an LLM summary, keep recent verbatim.
--- Anchored: if the history already starts with a summary (system message),
--- the new summary is an UPDATE of it (opencode-style), preserving old facts.
--- 保留策略（opencode-acp 双轨）: 至少 COMPACT_KEEP 条，估算 token 不足
--- COMPACT_KEEP_MIN_TOKENS 时向前补充，封顶 COMPACT_KEEP_MAX 条。
--- Returns new message list on success, nil on failure (caller falls back to trim).
+-- Compact（投影式，reasonix projection 精神）: 折叠段消息**不删除**——
+-- 标记 folded=true（请求构造/估算跳过，trim 优先清理），头部插入摘要消息。
+-- 历史在 append-only JSONL 中完整保留（可追溯/可回退）；折叠段最终被
+-- trim 渐进回收（内存受 MAX_HISTORY_BYTES 约束）。旧摘要消息被新摘要
+-- 取代（锚定更新语义不变）。请求构造跳过 folded → 模型只见摘要+保留段。
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
   local keep = COMPACT_KEEP
@@ -658,7 +661,7 @@ local function compact_history(messages, config)
       local s = m.content:match("^%[对话摘要%] (.*)$")
       if s then
         previous_summary = s
-        -- drop the old summary message from the transcript (it's passed separately)
+        -- drop the old summary message from the fold (it's passed separately)
       else
         old[#old + 1] = m
       end
@@ -671,11 +674,23 @@ local function compact_history(messages, config)
   -- KEEP 标记展开（与 summarize 同源 transcript 序号）
   summary = expand_keep_markers(summary, build_transcript(old).parts)
 
+  -- 投影式: 折叠段标记 folded（旧摘要消息被取代，直接移除），头部插摘要
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
+  for i = 1, #messages - keep do
+    local m = messages[i]
+    if not (m.role == "system" and type(m.content) == "string"
+        and m.content:match("^%[对话摘要%]")) then
+      m.folded = true
+      result[#result + 1] = m
+    end
+  end
   for i = #messages - keep + 1, #messages do
     result[#result + 1] = messages[i]
   end
-  return result
+  -- 就地替换（调用方持有同一表引用）
+  for i = #messages, 1, -1 do messages[i] = nil end
+  for i = 1, #result do messages[i] = result[i] end
+  return messages
 end
 
 -- 压缩触发判定（tokens 上限阈值驱动，用户要求按 context_window 比例）:
@@ -690,9 +705,11 @@ local function should_compact(messages, window)
   if w <= 0 then return false end
   local est = 0
   for _, m in ipairs(messages) do
-    est = est + estimate_tokens(m.content or "")
-        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
-    if est >= w * COMPACT_WINDOW_RATIO then return true end
+    if not m.folded then
+      est = est + estimate_tokens(m.content or "")
+          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      if est >= w * COMPACT_WINDOW_RATIO then return true end
+    end
   end
   return false
 end
@@ -763,6 +780,41 @@ local function set_paths(p)
   history_path = p
 end
 
+-- 当前会话文件路径（/hist 显示会话名用）
+local function current_path()
+  return history_path
+end
+
+-- 会话列表（类 opencode /session）: 扫描目录下 *.jsonl 会话文件
+--（/new 归档的 .txt 是归档而非会话，不列入）。dir 缺省用配置的
+-- sessions 目录（测试可注入临时目录）。
+-- 返回 {{name, count, modified}, ...} 按 modified 倒序。
+local function list_sessions(dir)
+  local fs = require("filesystem")
+  local base = dir or sessions_dir
+  -- pcall 兼容两环境: 真实 OC 对不存在路径抛错，测试 mock 返回空迭代器
+  local ok_l, iter = pcall(fs.list, base)
+  if not ok_l or type(iter) ~= "function" then return {} end
+  local out = {}
+  for name in iter do
+    if name:sub(-6) == ".jsonl" then
+      local path = base .. "/" .. name
+      local count = 0
+      local f = io.open(path, "r")
+      if f then
+        for _ in f:lines() do count = count + 1 end
+        f:close()
+      end
+      local modified = 0
+      local ok_m, m = pcall(fs.lastModified, path)
+      if ok_m and m then modified = m end
+      out[#out + 1] = {name = name:sub(1, -7), count = count, modified = modified}
+    end
+  end
+  table.sort(out, function(a, b) return a.modified > b.modified end)
+  return out
+end
+
 -- Inject the chat client (agent.lua calls this after Section 5 defines
 -- chat). Needed by summarize_history's LLM call.
 local function set_chat(fn)
@@ -779,6 +831,8 @@ return {
   summarize_history = summarize_history,
   set_paths = set_paths,
   set_chat = set_chat,
+  current_path = current_path,
+  list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
 }
@@ -1175,7 +1229,10 @@ local function chat(messages, config)
   local api_messages = {}
   api_messages[#api_messages + 1] = {role = "system", content = system_prompt}
   for _, msg in ipairs(messages) do
-    api_messages[#api_messages + 1] = msg
+    -- 投影式压缩（reasonix projection 精神）: folded 折叠段不进请求
+    if not msg.folded then
+      api_messages[#api_messages + 1] = msg
+    end
   end
   -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
   -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容
@@ -1523,11 +1580,13 @@ if not ok_t then term = {} end
 if not ok_e then event = {} end
 if not ok_k then keyboard = {} end
 
--- UTF-8 安全长度/截断（自足实现，不依赖 unicode 库——ocvm 精简 OpenOS
--- 的 unicode 库与 agent 环境存在兼容风险；纯 Lua 计数稳定）
+-- UTF-8 显示宽度（OC 等宽屏: ASCII 1 列, CJK/多字节 2 列——中文按 1 字符
+-- 计算会导致换行/光标/截断全部错位，长中文行溢出炸布局）
 local function ulen(s)
   local n = 0
-  for _ in tostring(s):gmatch("[^\128-\191]") do n = n + 1 end
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    if ch:byte(1) < 128 then n = n + 1 else n = n + 2 end
+  end
   return n
 end
 local function usub(s, i, j)
@@ -1632,6 +1691,14 @@ function tui.drawStatus()
   g.setForeground(tui.colors.statusText)
   g.fill(1, y, state.width, 1, " ")
   g.set(2, y, state.status)
+  -- 多行输入指示（粘贴多行时: 显示行数，提示 Enter 提交全部）
+  if state.inputBuffer and state.inputBuffer:find("\n", 1, true) then
+    local n = 0
+    for _ in state.inputBuffer:gmatch("\n") do n = n + 1 end
+    g.setForeground(tui.colors.tool)
+    g.set(ulen(state.status) + 4, y, "ML:" .. tostring(n + 1) .. " (Enter=send)")
+    g.setForeground(tui.colors.statusText)
+  end
   if state.statusData then
     local data = state.statusData()
     if data and data ~= "" then
@@ -1777,29 +1844,52 @@ function tui.scrollToTop()
   pcall(tui.redrawContent)
 end
 
--- 绘制输入行（底部: 提示符 + 文本 + 反色块光标 + Tab 候选提示）
+-- 翻页步长（半屏）——/up /down 命令与 PgUp/PgDn 失效时的兜底
+function tui.pageStep()
+  return math.max(1, state.height - 4)
+end
+
+-- 多行 buffer 支持: 粘贴内容（含 \n）完整保留，输入行只显示最后一行，
+-- 编辑限定在最后一行（跨行编辑不做），Enter 提交整个多行内容。
+-- 返回 buffer 中最后一个 \n 的【字符】位置（无则 0）——与 inputCursor
+-- 的字符语义一致（usub 操作字符，避免中文混用时字节/字符错位）。
+local function lastLineStart(buffer)
+  local idx = 0
+  local pos = 0
+  for ch in tostring(buffer):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    pos = pos + 1
+    if ch == "\n" then idx = pos end
+  end
+  return idx
+end
+
+-- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示）
 function tui.drawInput()
   local g = component.gpu
   local y = state.height
   g.setBackground(tui.colors.background)
   g.fill(1, y, state.width, 1, " ")
+  local line_start = lastLineStart(state.inputBuffer)
+  local multiline = line_start > 0
   g.setForeground(tui.colors.prompt)
-  g.set(2, y, "> ")
+  g.set(2, y, multiline and ">> " or "> ")
   g.setForeground(tui.colors.foreground)
-  local inputStart = 4
+  local inputStart = multiline and 5 or 4
   local maxWidth = state.width - inputStart - 1
-  local displayText = state.inputBuffer
-  local visibleCursorPos = state.inputCursor
+  -- 只显示最后一行（历史行提交时在内容区打印）
+  local displayText = multiline and usub(state.inputBuffer, line_start + 1)
+    or state.inputBuffer
+  local cursorInLine = math.max(0, state.inputCursor - line_start)
+  -- 光标 x 位置按显示宽度（中文占 2 列，字符索引会错位）
+  local cursorX = inputStart + ulen(usub(displayText, 1, cursorInLine))
   if ulen(displayText) > maxWidth then
-    local start = math.max(1, state.inputCursor - maxWidth + 10)
-    displayText = usub(state.inputBuffer, start, start + maxWidth - 1)
-    visibleCursorPos = state.inputCursor - (start - 1)
+    local start = math.max(1, cursorInLine - maxWidth + 10)
+    displayText = usub(displayText, start, start + maxWidth - 1)
   end
   g.set(inputStart, y, displayText)
   -- 反色块光标
-  local cursorX = inputStart + visibleCursorPos
   if cursorX <= state.width - 1 then
-    local ch = usub(state.inputBuffer, state.inputCursor + 1, state.inputCursor + 1)
+    local ch = usub(displayText, cursorInLine + 1, cursorInLine + 1)
     if ch == "" then ch = " " end
     g.setBackground(tui.colors.foreground)
     g.setForeground(tui.colors.background)
@@ -1889,45 +1979,46 @@ function tui.readInput()
       return nil
     elseif ev == "key_down" then
       local ch = char or 0
+      local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
       if ch == 13 then -- Enter
         local line = state.inputBuffer
         if line ~= "" then
           state.cmdHistory[#state.cmdHistory + 1] = line
           if #state.cmdHistory > 50 then table.remove(state.cmdHistory, 1) end
+          tui.print("> " .. line, tui.colors.user)
         end
         state.cmdHistoryIndex = 0
         state.savedInput = ""
         state.completionCycle = nil
-        tui.print("> " .. line, tui.colors.user)
         return line
-      elseif ch == 8 or code == 14 then -- Backspace
-        if state.inputCursor > 0 then
+      elseif ch == 8 or code == 14 then -- Backspace（限最后一行，不删 \n）
+        if state.inputCursor > line_start then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
             .. usub(state.inputBuffer, state.inputCursor + 1)
           state.inputCursor = state.inputCursor - 1
           state.completionCycle = nil
         end
-      elseif code == 203 then -- Left
-        if state.inputCursor > 0 then state.inputCursor = state.inputCursor - 1 end
+      elseif code == 203 then -- Left（不跨行）
+        if state.inputCursor > line_start then state.inputCursor = state.inputCursor - 1 end
         state.completionCycle = nil
       elseif code == 205 then -- Right
         if state.inputCursor < ulen(state.inputBuffer) then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
-      elseif code == 199 then -- Home
-        state.inputCursor = 0
-      elseif code == 207 then -- End
+      elseif code == 199 then -- Home（行首）
+        state.inputCursor = line_start
+      elseif code == 207 then -- End（buffer 尾 = 最后一行尾）
         state.inputCursor = ulen(state.inputBuffer)
-      elseif code == 211 then -- Delete
+      elseif code == 211 then -- Delete（最后一行内）
         local len = ulen(state.inputBuffer)
         if state.inputCursor < len then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
             .. usub(state.inputBuffer, state.inputCursor + 2)
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: 历史上翻
-        if #state.cmdHistory > 0 then
+      elseif code == 200 then -- Up: 历史上翻（多行 buffer 时禁用——防覆盖粘贴内容）
+        if line_start == 0 and #state.cmdHistory > 0 then
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -1935,8 +2026,8 @@ function tui.readInput()
             state.inputCursor = ulen(state.inputBuffer)
           end
         end
-      elseif code == 208 then -- Down: 历史下翻
-        if state.cmdHistoryIndex > 0 then
+      elseif code == 208 then -- Down: 历史下翻（多行时禁用）
+        if line_start == 0 and state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             state.inputBuffer = state.savedInput
@@ -2927,22 +3018,26 @@ local function exec(name, args, deps)
     return "history too short to compact (" .. tostring(messages and #messages or 0) .. " messages)"
   end
   local config = deps.load_config and deps.load_config() or {}
+  local old_count = #messages
   local compacted = deps.compact_history(messages, config)
   if not compacted then
     return "compaction failed (summarizer unavailable or error)"
   end
-  local old_count = #messages
-  -- 就地替换消息列表: process_exchange 的工具循环继续基于压缩后历史工作
-  for i = old_count, 1, -1 do messages[i] = nil end
-  for i = 1, #compacted do messages[i] = compacted[i] end
+  -- 投影式压缩（reasonix projection 精神）: compact_history 已就地完成——
+  -- 折叠段标记 folded + 头部插入摘要，messages 与 compacted 是同一表，
+  -- 无需替换。折叠段仍在内存（trim 渐进回收）与 JSONL 历史中（可追溯）。
+  local folded_count = 0
+  for _, m in ipairs(messages) do
+    if m.folded then folded_count = folded_count + 1 end
+  end
   local rebuild = deps.rebuild_current
   if type(rebuild) == "function" then
     local ok, err = pcall(rebuild, messages)
     if not ok then print("[compact] rebuild failed: " .. tostring(err)) end
   end
   return string.format(
-    "history compacted: %d old messages replaced by an LLM summary; %d recent messages kept verbatim; first message (cache anchor) preserved.",
-    old_count - #compacted + 1, #compacted - 1)
+    "history compacted: %d old messages folded into an LLM summary (projection — originals stay in the session log, trimmed later); %d messages kept verbatim; first message (cache anchor) preserved.",
+    folded_count, old_count - folded_count)
 end
 
 return {tools = tools, exec = exec}
@@ -3382,8 +3477,62 @@ local function handle_command(cmd, config, messages)
     messages = {}
     rebuild_history(messages)
     print("History cleared")
+  elseif command == "/sessions" then
+    local list = session_mod.list_sessions()
+    if #list == 0 then
+      print("No saved sessions (use /session <name> to create one)")
+    else
+      print("Sessions (" .. #list .. "):")
+      for _, s in ipairs(list) do
+        print("  " .. s.name .. "  (" .. s.count .. " msgs)")
+      end
+    end
+  elseif command == "/session" then
+    -- 类 opencode /session: 切换/创建命名会话（JSONL），default 回主会话
+    if not parts[2] then
+      print("Usage: /session <name>  |  /sessions  |  /session default")
+    else
+      local target = parts[2]
+      if target == "default" then
+        session_mod.set_paths(HISTORY_PATH)
+        messages = session_mod.load_history()
+        print("Session: default (" .. #messages .. " msgs)")
+      else
+        local safe = target:gsub("[^%w_%-]", "_"):sub(1, 64)
+        local fs = require("filesystem")
+        local ok_dir, dir_err = pcall(fs.makeDirectory, SESSIONS_DIR)
+        if not ok_dir then
+          print("Session dir unavailable: " .. tostring(dir_err))
+        else
+          session_mod.set_paths(SESSIONS_DIR .. "/" .. safe .. ".jsonl")
+          messages = session_mod.load_history()
+          print("Session: " .. safe .. " (" .. #messages .. " msgs)")
+        end
+      end
+    end
+  elseif command == "/up" or command == "/pgup" then
+    -- 翻页命令（PgUp/PgDn 在部分键盘/远程环境不产生键码时的兜底）
+    if UI_HOOKS.scrollUp then
+      UI_HOOKS.scrollUp(tonumber(parts[2]))
+    else
+      print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)")
+    end
+  elseif command == "/down" or command == "/pgdn" then
+    if UI_HOOKS.scrollDown then
+      UI_HOOKS.scrollDown(tonumber(parts[2]))
+    else
+      print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)")
+    end
+  elseif command == "/top" then
+    if UI_HOOKS.scrollToTop then UI_HOOKS.scrollToTop()
+    else print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)") end
+  elseif command == "/bottom" then
+    if UI_HOOKS.scrollToBottom then UI_HOOKS.scrollToBottom()
+    else print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)") end
   elseif command == "/hist" then
-    print(#messages .. " messages in history")
+    local p = session_mod.current_path()
+    local name = p:match("([^/\\]+)%.jsonl$") or "default"
+    print(name .. ": " .. #messages .. " messages")
   elseif command == "/version" then
     -- 读取安装时写入的 version.txt（install.lua 生成）
     local vf = io.open(AGENT_DIR .. "/version.txt", "r")
@@ -3462,7 +3611,10 @@ local function handle_command(cmd, config, messages)
     print("  /new            Archive current session, start fresh conversation")
     print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
     print("  /reset          Clear history without archiving")
-    print("  /hist           Show message count in current session")
+    print("  /hist           Show current session name and message count")
+    print("  /sessions       List saved sessions")
+    print("  /session <name> Switch to (or create) a named session; default = main")
+    print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
@@ -3513,8 +3665,11 @@ local function ensure_context_budget(messages, config, persist, session)
   local function est_msgs(msgs)
     local e = 0
     for _, m in ipairs(msgs) do
-      e = e + estimate_tokens(m.content or "")
-          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      -- 投影式压缩: folded 折叠段不进请求也不计估算
+      if not m.folded then
+        e = e + estimate_tokens(m.content or "")
+            + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      end
     end
     return e
   end
@@ -3563,8 +3718,10 @@ local function process_exchange(messages, config, user_input, persist, session)
   local window_now = tonumber(config.context_window) or 128000
   local est_now = 0
   for _, m in ipairs(messages) do
-    est_now = est_now + estimate_tokens(m.content or "")
-        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+    if not m.folded then
+      est_now = est_now + estimate_tokens(m.content or "")
+          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+    end
   end
   chat_mod.set_runtime_extra(function()
     local pct = window_now > 0 and (est_now / window_now * 100) or 0
@@ -3857,6 +4014,7 @@ end
       end)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
+        "/sessions", "/session", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
@@ -3865,6 +4023,15 @@ end
       ui.setCompletions(comps)
       UI_INPUT = function() return ui.readInput() end
       UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+      -- 翻页命令钩子（PgUp/PgDn 在部分键盘/远程环境不产生键码 → /up /down 兜底）
+      UI_HOOKS.scrollUp = function(n)
+        ui.scrollUp(n or ui.pageStep() or 1)
+      end
+      UI_HOOKS.scrollDown = function(n)
+        ui.scrollDown(n or ui.pageStep() or 1)
+      end
+      UI_HOOKS.scrollToTop = function() ui.scrollToTop() end
+      UI_HOOKS.scrollToBottom = function() ui.scrollToBottom() end
     end
   end
 
@@ -3972,6 +4139,9 @@ if _TEST_MODE then
     append_history = append_history,
     rebuild_history = rebuild_history,
     set_history_path = function(p) session_mod.set_paths(p) end,
+    list_sessions = session_mod.list_sessions,
+    current_session_path = session_mod.current_path,
+    handle_command = handle_command,
     process_exchange = process_exchange,
     wait_modem_message = subagent_mod.wait_modem_message,
     cmd_ctx = cmd_ctx,

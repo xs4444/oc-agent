@@ -428,6 +428,7 @@ local big = {}
 for i = 1, 30 do
   big[#big + 1] = {role = "user", content = "message number " .. i}
 end
+local big_n = #big  -- 投影式就地修改，快照压缩前长度
 local compacted = compact_history(big, {model = "m", api_key = ""})
 test("compact_history succeeds", compacted ~= nil, "compacted=nil")
 if compacted then
@@ -435,9 +436,16 @@ if compacted then
     and tostring(compacted[1].content):find("对话摘要") ~= nil)
   test("compact keeps last messages", compacted[#compacted].content == "message number 30"
     and compacted[#compacted - 1].content == "message number 29")
-  -- 保留策略双轨: 小消息时向前补充到 token 保底（封顶 8 条）
-test("compact shrinks count", #compacted <= 9, "#=" .. tostring(#compacted))
-test("compact token floor keeps more small messages", #compacted >= 5, "#=" .. tostring(#compacted))
+  -- 投影式压缩（reasonix projection 精神）: 折叠段不删除——folded 标记，
+  -- 头部插摘要。30 条小消息 → keep 8 → 折叠 22
+  local folded_count = 0
+  for _, m in ipairs(compacted) do
+    if m.folded then folded_count = folded_count + 1 end
+  end
+  test("compact projects fold (no deletion)", #compacted == big_n + 1
+    and folded_count == big_n - 8,
+    "#=" .. tostring(#compacted) .. " folded=" .. tostring(folded_count))
+  test("compact token floor keeps more small messages", #compacted >= 5, "#=" .. tostring(#compacted))
 end
 
 -- should_compact trigger thresholds（窗口比例 0.6 驱动 + 条数 48 兜底）
@@ -620,14 +628,22 @@ local small = {{role = "user", content = "hi"}, {role = "assistant", content = "
 local m2, e2 = agent_test.ensure_context_budget(small, cfg_small, false)
 test("ensure no-op on small session", #m2 == #small, "#=" .. tostring(#m2))
 
--- ensure 大会话: 压缩或裁剪后消息数减少（mock 下 compact 成功）
+-- ensure 大会话: 投影式压缩（mock 下 compact 成功）——折叠段标记 + est 下降
 local m3 = {}
 for i = 1, 20 do
   m3[#m3 + 1] = {role = "user", content = big_content}
   m3[#m3 + 1] = {role = "assistant", content = big_content}
 end
+local m3_n = #m3  -- 投影式就地修改，快照压缩前长度
+local m3_before = 0
+for _, m in ipairs(m3) do
+  m3_before = m3_before + agent_test.estimate_tokens(m.content or "")
+end
 local m3r, e3 = agent_test.ensure_context_budget(m3, cfg_small, false)
-test("ensure reduces big session", #m3r < #m3, "#=" .. tostring(#m3r) .. " from " .. tostring(#m3))
+test("ensure projects fold on big session",
+  m3r[1].role == "system" and tostring(m3r[1].content):find("对话摘要") ~= nil
+  and e3 < m3_before and #m3r == m3_n + 1,
+  "#=" .. tostring(#m3r) .. " est " .. tostring(e3) .. " from " .. tostring(m3_before))
 
 print("")
 print("═══════════════════════════════════════")
@@ -988,7 +1004,7 @@ local e_after, e_est = agent_test.ensure_context_budget(e_msgs,
 test("ensure no auto-compact at 60-80% (model-driven)",
   #e_after == 10, "#=" .. tostring(#e_after) .. " est=" .. tostring(e_est))
 
--- compact_history 工具: 模型驱动压缩（KEEP 标记 + 就地替换 + 持久化）
+-- compact_history 工具: 模型驱动压缩（KEEP 标记 + 投影式就地 + 持久化）
 local tool_ctx = {}
 for i = 1, 15 do
   tool_ctx[#tool_ctx + 1] = {role = "user", content = "tool ctx " .. i}
@@ -1002,9 +1018,15 @@ local compact_result = execute_tool("compact_history", json.encode({}))
 agent_test.set_chat(agent_test.chat)
 agent_test.set_context_getter(nil)
 agent_test.set_rebuild_current(nil)
-test("compact tool compresses history in place",
-  #tool_ctx <= 9 and tool_ctx[1].content:find("tool summary", 1, true) ~= nil,
-  "n=" .. tostring(#tool_ctx) .. " result=" .. tostring(compact_result):sub(1, 120))
+local tool_folded = 0
+for _, m in ipairs(tool_ctx) do
+  if m.folded then tool_folded = tool_folded + 1 end
+end
+test("compact tool projects fold in place",
+  tool_ctx[1].content:find("tool summary", 1, true) ~= nil
+  and #tool_ctx == 16 and tool_folded == 7,  -- 15 条 + 摘要；折叠 15-8=7
+  "n=" .. tostring(#tool_ctx) .. " folded=" .. tostring(tool_folded)
+  .. " result=" .. tostring(compact_result):sub(1, 120))
 test("compact tool rebuilds history file", rebuilt ~= nil and #rebuilt == #tool_ctx)
 test("compact tool returns report", type(compact_result) == "string"
   and compact_result:find("compacted", 1, true) ~= nil,
@@ -1032,6 +1054,46 @@ test("runtime block carries context usage",
 -- system prompt 含 compact 指令
 test("system prompt instructs compact_history",
   sys_a:find("compact_history", 1, true) ~= nil)
+
+-- 投影式压缩: chat 请求构造跳过 folded 折叠段（模型只见摘要+保留段）
+local proj_msgs = {
+  {role = "system", content = "[对话摘要] summary here"},
+  {role = "user", content = "old folded msg", folded = true},
+  {role = "user", content = "active msg"},
+}
+local proj_captured = nil
+local real_req2 = internet.request
+internet.request = function(url, data, headers, method)
+  proj_captured = data
+  return real_req2(url, data, headers, method)
+end
+local proj_resp = agent_test.chat(proj_msgs,
+  {api_key = "test", model = "mock", api_url = "https://example.test/chat/completions"})
+internet.request = real_req2
+local ok_pb, proj_body = pcall(json.decode, proj_captured or "")
+test("chat skips folded messages in request",
+  ok_pb and type(proj_body) == "table" and #proj_body.messages == 4
+  and proj_body.messages[3].content == "active msg"
+  and proj_body.messages[4].content:find("runtime status", 1, true) ~= nil,
+  "resp=" .. tostring(proj_resp and proj_resp.content or proj_resp))
+
+-- 投影式压缩: trim 优先回收折叠段（已进摘要，删除无损），保留段保住
+local trim_proj = {
+  {role = "user", content = "head anchor"},
+  {role = "system", content = "[对话摘要] s"},
+  {role = "user", content = string.rep("x", 55000), folded = true},
+  {role = "user", content = string.rep("y", 55000), folded = true},
+  {role = "user", content = string.rep("z", 55000), folded = true},
+  {role = "user", content = string.rep("w", 55000), folded = true},
+  {role = "user", content = "recent 1"},
+  {role = "user", content = "recent 2"},
+}
+local trim_proj_out = agent_test.trim_history(trim_proj)
+test("trim reclaims folded segments first",
+  trim_proj_out[1].content == "head anchor"
+  and trim_proj_out[#trim_proj_out].content == "recent 2"
+  and #trim_proj_out == 7,  -- 220K 超预算 → 删 1 条折叠（55000）→ 165K 内
+  "#=" .. tostring(#trim_proj_out))
 
 print("")
 print("═══════════════════════════════════════")
@@ -1121,6 +1183,63 @@ if ok_tui and type(tui_mod) == "table" then
   -- 清理
   pcall(tui_mod.cleanup)
 end
+
+print("")
+print("═══════════════════════════════════════")
+print("Sessions & Scroll Command Tests")
+print("═══════════════════════════════════════")
+
+-- list_sessions: 扫描会话目录的 *.jsonl（/new 归档 .txt 不列入）
+local sdir = "test_sessions_tmp"
+os.execute("mkdir " .. sdir .. " 2>nul")
+local s_a = io.open(sdir .. "/alpha.jsonl", "w")
+s_a:write(json.encode({role = "user", content = "a1"}) .. "\n")
+s_a:write(json.encode({role = "assistant", content = "a2"}) .. "\n")
+s_a:close()
+local s_b = io.open(sdir .. "/beta.jsonl", "w")
+s_b:write(json.encode({role = "user", content = "b1"}) .. "\n")
+s_b:close()
+io.open(sdir .. "/archive.txt", "w"):write("ignored"):close()
+local sess_list = agent_test.list_sessions(sdir)
+test("list_sessions finds jsonl sessions", #sess_list == 2,
+  "#=" .. tostring(#sess_list))
+test("list_sessions counts messages",
+  sess_list[1].name == "alpha" and sess_list[1].count == 2
+  or sess_list[1].name == "beta" and sess_list[1].count == 1,
+  sess_list[1].name .. "=" .. tostring(sess_list[1].count))
+
+-- 切换核心机制: set_paths → load_history 加载新会话
+local orig_path = agent_test.current_session_path()
+agent_test.set_history_path(sdir .. "/beta.jsonl")
+local beta_msgs = agent_test.load_history()
+test("session switch loads new history",
+  #beta_msgs == 1 and beta_msgs[1].content == "b1",
+  "#=" .. tostring(#beta_msgs))
+agent_test.set_history_path(orig_path)
+
+-- handle_command: /sessions 输出 + /session 切换 + 翻页命令不崩
+local cmd_cfg = {model = "m", api_key = ""}
+local cmd_msgs = {{role = "user", content = "hello"}}
+local exit1, c1, m1 = agent_test.handle_command("/sessions", cmd_cfg, cmd_msgs)
+test("/sessions lists sessions", not exit1 and type(m1) == "table"
+  and m1 == cmd_msgs, tostring(exit1))
+local exit2, c2, m2 = agent_test.handle_command("/session", cmd_cfg, cmd_msgs)
+test("/session usage without name", not exit2 and c2 == cmd_cfg and m2 == cmd_msgs)
+local exit3, c3, m3 = agent_test.handle_command("/session default", cmd_cfg, cmd_msgs)
+test("/session default resets path", not exit3 and c3 == cmd_cfg and type(m3) == "table",
+  "m3=" .. tostring(type(m3)))
+agent_test.set_history_path(orig_path)
+local exit4 = agent_test.handle_command("/up", cmd_cfg, cmd_msgs)
+test("/up without TUI prints hint", not exit4)
+local exit5 = agent_test.handle_command("/pgdn", cmd_cfg, cmd_msgs)
+test("/pgdn without TUI prints hint", not exit5)
+local exit6 = agent_test.handle_command("/top", cmd_cfg, cmd_msgs)
+test("/top without TUI prints hint", not exit6)
+-- 清理
+os.remove(sdir .. "/alpha.jsonl")
+os.remove(sdir .. "/beta.jsonl")
+os.remove(sdir .. "/archive.txt")
+os.execute("rmdir " .. sdir .. " 2>nul")
 
 print("")
 print("═══════════════════════════════════════")

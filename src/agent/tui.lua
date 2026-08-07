@@ -22,11 +22,13 @@ if not ok_t then term = {} end
 if not ok_e then event = {} end
 if not ok_k then keyboard = {} end
 
--- UTF-8 安全长度/截断（自足实现，不依赖 unicode 库——ocvm 精简 OpenOS
--- 的 unicode 库与 agent 环境存在兼容风险；纯 Lua 计数稳定）
+-- UTF-8 显示宽度（OC 等宽屏: ASCII 1 列, CJK/多字节 2 列——中文按 1 字符
+-- 计算会导致换行/光标/截断全部错位，长中文行溢出炸布局）
 local function ulen(s)
   local n = 0
-  for _ in tostring(s):gmatch("[^\128-\191]") do n = n + 1 end
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    if ch:byte(1) < 128 then n = n + 1 else n = n + 2 end
+  end
   return n
 end
 local function usub(s, i, j)
@@ -131,6 +133,14 @@ function tui.drawStatus()
   g.setForeground(tui.colors.statusText)
   g.fill(1, y, state.width, 1, " ")
   g.set(2, y, state.status)
+  -- 多行输入指示（粘贴多行时: 显示行数，提示 Enter 提交全部）
+  if state.inputBuffer and state.inputBuffer:find("\n", 1, true) then
+    local n = 0
+    for _ in state.inputBuffer:gmatch("\n") do n = n + 1 end
+    g.setForeground(tui.colors.tool)
+    g.set(ulen(state.status) + 4, y, "ML:" .. tostring(n + 1) .. " (Enter=send)")
+    g.setForeground(tui.colors.statusText)
+  end
   if state.statusData then
     local data = state.statusData()
     if data and data ~= "" then
@@ -276,29 +286,52 @@ function tui.scrollToTop()
   pcall(tui.redrawContent)
 end
 
--- 绘制输入行（底部: 提示符 + 文本 + 反色块光标 + Tab 候选提示）
+-- 翻页步长（半屏）——/up /down 命令与 PgUp/PgDn 失效时的兜底
+function tui.pageStep()
+  return math.max(1, state.height - 4)
+end
+
+-- 多行 buffer 支持: 粘贴内容（含 \n）完整保留，输入行只显示最后一行，
+-- 编辑限定在最后一行（跨行编辑不做），Enter 提交整个多行内容。
+-- 返回 buffer 中最后一个 \n 的【字符】位置（无则 0）——与 inputCursor
+-- 的字符语义一致（usub 操作字符，避免中文混用时字节/字符错位）。
+local function lastLineStart(buffer)
+  local idx = 0
+  local pos = 0
+  for ch in tostring(buffer):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    pos = pos + 1
+    if ch == "\n" then idx = pos end
+  end
+  return idx
+end
+
+-- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示）
 function tui.drawInput()
   local g = component.gpu
   local y = state.height
   g.setBackground(tui.colors.background)
   g.fill(1, y, state.width, 1, " ")
+  local line_start = lastLineStart(state.inputBuffer)
+  local multiline = line_start > 0
   g.setForeground(tui.colors.prompt)
-  g.set(2, y, "> ")
+  g.set(2, y, multiline and ">> " or "> ")
   g.setForeground(tui.colors.foreground)
-  local inputStart = 4
+  local inputStart = multiline and 5 or 4
   local maxWidth = state.width - inputStart - 1
-  local displayText = state.inputBuffer
-  local visibleCursorPos = state.inputCursor
+  -- 只显示最后一行（历史行提交时在内容区打印）
+  local displayText = multiline and usub(state.inputBuffer, line_start + 1)
+    or state.inputBuffer
+  local cursorInLine = math.max(0, state.inputCursor - line_start)
+  -- 光标 x 位置按显示宽度（中文占 2 列，字符索引会错位）
+  local cursorX = inputStart + ulen(usub(displayText, 1, cursorInLine))
   if ulen(displayText) > maxWidth then
-    local start = math.max(1, state.inputCursor - maxWidth + 10)
-    displayText = usub(state.inputBuffer, start, start + maxWidth - 1)
-    visibleCursorPos = state.inputCursor - (start - 1)
+    local start = math.max(1, cursorInLine - maxWidth + 10)
+    displayText = usub(displayText, start, start + maxWidth - 1)
   end
   g.set(inputStart, y, displayText)
   -- 反色块光标
-  local cursorX = inputStart + visibleCursorPos
   if cursorX <= state.width - 1 then
-    local ch = usub(state.inputBuffer, state.inputCursor + 1, state.inputCursor + 1)
+    local ch = usub(displayText, cursorInLine + 1, cursorInLine + 1)
     if ch == "" then ch = " " end
     g.setBackground(tui.colors.foreground)
     g.setForeground(tui.colors.background)
@@ -388,45 +421,46 @@ function tui.readInput()
       return nil
     elseif ev == "key_down" then
       local ch = char or 0
+      local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
       if ch == 13 then -- Enter
         local line = state.inputBuffer
         if line ~= "" then
           state.cmdHistory[#state.cmdHistory + 1] = line
           if #state.cmdHistory > 50 then table.remove(state.cmdHistory, 1) end
+          tui.print("> " .. line, tui.colors.user)
         end
         state.cmdHistoryIndex = 0
         state.savedInput = ""
         state.completionCycle = nil
-        tui.print("> " .. line, tui.colors.user)
         return line
-      elseif ch == 8 or code == 14 then -- Backspace
-        if state.inputCursor > 0 then
+      elseif ch == 8 or code == 14 then -- Backspace（限最后一行，不删 \n）
+        if state.inputCursor > line_start then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
             .. usub(state.inputBuffer, state.inputCursor + 1)
           state.inputCursor = state.inputCursor - 1
           state.completionCycle = nil
         end
-      elseif code == 203 then -- Left
-        if state.inputCursor > 0 then state.inputCursor = state.inputCursor - 1 end
+      elseif code == 203 then -- Left（不跨行）
+        if state.inputCursor > line_start then state.inputCursor = state.inputCursor - 1 end
         state.completionCycle = nil
       elseif code == 205 then -- Right
         if state.inputCursor < ulen(state.inputBuffer) then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
-      elseif code == 199 then -- Home
-        state.inputCursor = 0
-      elseif code == 207 then -- End
+      elseif code == 199 then -- Home（行首）
+        state.inputCursor = line_start
+      elseif code == 207 then -- End（buffer 尾 = 最后一行尾）
         state.inputCursor = ulen(state.inputBuffer)
-      elseif code == 211 then -- Delete
+      elseif code == 211 then -- Delete（最后一行内）
         local len = ulen(state.inputBuffer)
         if state.inputCursor < len then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
             .. usub(state.inputBuffer, state.inputCursor + 2)
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: 历史上翻
-        if #state.cmdHistory > 0 then
+      elseif code == 200 then -- Up: 历史上翻（多行 buffer 时禁用——防覆盖粘贴内容）
+        if line_start == 0 and #state.cmdHistory > 0 then
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -434,8 +468,8 @@ function tui.readInput()
             state.inputCursor = ulen(state.inputBuffer)
           end
         end
-      elseif code == 208 then -- Down: 历史下翻
-        if state.cmdHistoryIndex > 0 then
+      elseif code == 208 then -- Down: 历史下翻（多行时禁用）
+        if line_start == 0 and state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             state.inputBuffer = state.savedInput
