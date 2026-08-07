@@ -158,7 +158,10 @@ local function chat(messages, config)
   local api_messages = {}
   api_messages[#api_messages + 1] = {role = "system", content = system_prompt}
   for _, msg in ipairs(messages) do
-    api_messages[#api_messages + 1] = msg
+    -- 投影式压缩（reasonix projection 精神）: folded 折叠段不进请求
+    if not msg.folded then
+      api_messages[#api_messages + 1] = msg
+    end
   end
   -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
   -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容

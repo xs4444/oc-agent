@@ -31,22 +31,26 @@ local function exec(name, args, deps)
     return "history too short to compact (" .. tostring(messages and #messages or 0) .. " messages)"
   end
   local config = deps.load_config and deps.load_config() or {}
+  local old_count = #messages
   local compacted = deps.compact_history(messages, config)
   if not compacted then
     return "compaction failed (summarizer unavailable or error)"
   end
-  local old_count = #messages
-  -- 就地替换消息列表: process_exchange 的工具循环继续基于压缩后历史工作
-  for i = old_count, 1, -1 do messages[i] = nil end
-  for i = 1, #compacted do messages[i] = compacted[i] end
+  -- 投影式压缩（reasonix projection 精神）: compact_history 已就地完成——
+  -- 折叠段标记 folded + 头部插入摘要，messages 与 compacted 是同一表，
+  -- 无需替换。折叠段仍在内存（trim 渐进回收）与 JSONL 历史中（可追溯）。
+  local folded_count = 0
+  for _, m in ipairs(messages) do
+    if m.folded then folded_count = folded_count + 1 end
+  end
   local rebuild = deps.rebuild_current
   if type(rebuild) == "function" then
     local ok, err = pcall(rebuild, messages)
     if not ok then print("[compact] rebuild failed: " .. tostring(err)) end
   end
   return string.format(
-    "history compacted: %d old messages replaced by an LLM summary; %d recent messages kept verbatim; first message (cache anchor) preserved.",
-    old_count - #compacted + 1, #compacted - 1)
+    "history compacted: %d old messages folded into an LLM summary (projection — originals stay in the session log, trimmed later); %d messages kept verbatim; first message (cache anchor) preserved.",
+    folded_count, old_count - folded_count)
 end
 
 return {tools = tools, exec = exec}

@@ -63,7 +63,11 @@ end
 local t0 = computer.uptime()
 local compacted = compact_history(big, config)
 if compacted then
-  log("compact OK: " .. #compacted .. " msgs (was 24), first role=" .. compacted[1].role)
+  local folded_n = 0
+  for _, m in ipairs(compacted) do
+    if m.folded then folded_n = folded_n + 1 end
+  end
+  log("compact OK: " .. #compacted .. " msgs total (was 24, folded=" .. folded_n .. "), first role=" .. compacted[1].role)
   log("summary: " .. tostring(compacted[1].content):sub(1, 200))
   log("last kept: " .. tostring(compacted[#compacted].content):sub(1, 60))
 else
