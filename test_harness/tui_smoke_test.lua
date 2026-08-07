@@ -69,6 +69,27 @@ local ok_init, init_err = pcall(function()
   tui.printRole("assistant", "运行在真实 GPU 上的 TUI 渲染测试")
   tui.print(string.rep("wrap test ", 40), tui.colors.dim)
   tui.printToolCall("shell_execute", '{"command":"echo hi"}')
+  -- 会话历史填充（进入 TUI 显示历史——截断/跳过 folded/摘要 dim）
+  local hist_msgs = {
+    {role = "system", content = "[对话摘要] 摘要内容测试"},
+    {role = "user", content = "历史问题测试"},
+    {role = "user", content = "折叠的旧消息", folded = true},
+    {role = "assistant", content = string.rep("很长的历史回答", 30)},
+  }
+  local hist_before = #tui.history()
+  pcall(function() tui.printHistory(hist_msgs) end)
+  local hist_after = #tui.history()
+  check("printHistory adds history entries", hist_after > hist_before,
+    "n=" .. tostring(hist_after - hist_before))
+  local hist_joined = ""
+  for i = hist_before + 1, hist_after do
+    hist_joined = hist_joined .. tui.history()[i].text
+  end
+  check("printHistory shows summary+user", hist_joined:find("对话摘要", 1, true) ~= nil
+    and hist_joined:find("历史问题测试", 1, true) ~= nil,
+    hist_joined:sub(1, 150))
+  check("printHistory skips folded", hist_joined:find("折叠的旧消息", 1, true) == nil,
+    hist_joined:sub(1, 150))
   -- 滚动 + 状态
   tui.scrollUp(2)
   tui.scrollToBottom()

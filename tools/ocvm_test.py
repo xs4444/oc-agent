@@ -39,7 +39,7 @@ VM_DIR = "~/oc-test/ocvm"
 TMP_DIR = "tmp_t"
 BOOT_WAIT = 50
 RESULT_POLL_INTERVAL = 5
-RESULT_TIMEOUT = 400
+RESULT_TIMEOUT = 90   # 结果文件轮询上限（测试脚本正常 30-60s 完成；卡住快速失败而不是傻等）
 
 # 测试脚本写结果文件的约定: <script>.txt 或 <script>_result.txt
 # (capability_one 例外, 写 cap_<task>.txt)
@@ -182,7 +182,9 @@ def main():
         print(__doc__)
         sys.exit(1)
     script_path = sys.argv[1]
-    script_args = " ".join(sys.argv[2:])
+    no_restart = "--no-restart" in sys.argv
+    script_args_list = [a for a in sys.argv[2:] if a != "--no-restart"]
+    script_args = " ".join(script_args_list)
     if not os.path.exists(script_path):
         print(f"test script not found: {script_path}")
         sys.exit(1)
@@ -192,7 +194,12 @@ def main():
     ssh.connect(HOST, username=USER, password=PASS, timeout=15)
 
     d = OcvmDriver(ssh)
-    d.restart_vm()
+    if no_restart:
+        # 复用运行中的 VM（省 ~1-2 分钟 boot）——测试脚本应幂等且不阻塞。
+        # 注意: 不能 kill tmux（那就是重启）；直接复用 ocvm_t 会话。
+        print("[ocvm] reusing running VM (--no-restart)")
+    else:
+        d.restart_vm()
     # 测试脚本依赖 agent.lua (dofile)，必须一起上传
     agent = os.path.join(os.path.dirname(os.path.abspath(script_path)), "..", "agent.lua")
     agent = os.path.normpath(agent)
@@ -206,10 +213,18 @@ def main():
     d.upload(files)
     mount = d.find_agent_mount()
     if not mount:
-        print("[ocvm] FAILED: no mount contains agent.lua")
-        print(d.screen()[-1500:])
-        ssh.close()
-        sys.exit(1)
+        if no_restart:
+            # 复用失败（如上一轮测试把 VM 卡在 TUI 输入循环，命令全进
+            # 输入框）→ 自动回退重启 + 重新上传（restart 会清 tmp_t）
+            print("[ocvm] running VM unusable (stuck?) — restarting")
+            d.restart_vm()
+            d.upload(files)
+            mount = d.find_agent_mount()
+        if not mount:
+            print("[ocvm] FAILED: no mount contains agent.lua")
+            print(d.screen()[-1500:])
+            ssh.close()
+            sys.exit(1)
     print(f"[ocvm] agent mount: {mount}")
 
     d.run_script(mount, script_path, script_args)
