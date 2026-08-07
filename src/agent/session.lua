@@ -86,11 +86,11 @@ local function trim_history(messages)
   return messages
 end
 
--- Ask the LLM to summarize older messages. Independent minimal request
--- (no tools, no system prompt) so it can't recurse into compaction.
--- Returns summary string or nil on any failure.
-local function summarize_history(messages, config, previous_summary)
-  local transcript_parts = {}
+-- 构建发送给摘要模型的 transcript，返回 {text, parts}——parts[i] 是 text
+-- 第 i 行对应的原始消息（KEEP 展开时按行号找回原文）。纯函数:
+-- compact_history 与 summarize_history 对同一批消息调用结果一致。
+local function build_transcript(messages)
+  local parts, text_parts = {}, {}
   for _, m in ipairs(messages) do
     local role = m.role or "?"
     local content = ""
@@ -106,22 +106,32 @@ local function summarize_history(messages, config, previous_summary)
       content = tostring(m.content):sub(1, 200)
     end
     if content ~= "" then
-      transcript_parts[#transcript_parts + 1] = role .. ": " .. content
+      parts[#parts + 1] = m
+      text_parts[#text_parts + 1] = string.format("[%d] %s: %s", #parts, role, content)
     end
   end
-  local transcript = table.concat(transcript_parts, "\n")
+  local text = table.concat(text_parts, "\n")
   -- Cap what we send to the summarizer
-  if #transcript > 12000 then
-    transcript = transcript:sub(1, 12000) .. "\n...[truncated]"
+  if #text > 12000 then
+    text = text:sub(1, 12000) .. "\n...[truncated]"
   end
+  return {text = text, parts = parts}
+end
+
+-- Ask the LLM to summarize older messages. Independent minimal request
+-- (no tools, no system prompt) so it can't recurse into compaction.
+-- Returns summary string or nil on any failure.
+local function summarize_history(messages, config, previous_summary)
+  local transcript = build_transcript(messages).text
 
   -- Anchored summary (opencode-style): when a previous summary exists, ask the
   -- model to UPDATE it instead of summarizing from scratch. Keeps older facts
-  -- stable and saves tokens.
-  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble."
+  -- stable and saves tokens. KEEP 指令（opencode-acp 移植）: 行号标记
+  -- 关键消息原文，压缩后由 expand_keep_markers 展开。
+  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
   local user_prompt
   if previous_summary and previous_summary ~= "" then
-    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary."
+    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
     user_prompt = "<previous-summary>\n" .. previous_summary .. "\n</previous-summary>\n\n<new-history>\n" .. transcript .. "\n</new-history>\n\nUpdate the summary."
   else
     user_prompt = "Summarize this conversation:\n\n" .. transcript
@@ -139,6 +149,40 @@ local function summarize_history(messages, config, previous_summary)
   local summary = response.content
   if not summary or summary == "" then return nil end
   return summary
+end
+
+-- KEEP 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
+-- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；越界引用保留原样并
+-- 警告（非阻塞质量门——引用解析率是压缩质量指标，失败不阻断压缩）。
+local KEEP_PATTERN = "%[%[KEEP:(%d+)%]%]"
+local KEEP_EMBED_MAX_CHARS = 1000
+
+local function expand_keep_markers(summary, transcript_parts)
+  return (summary:gsub(KEEP_PATTERN, function(idx_s)
+    local idx = tonumber(idx_s)
+    local m = transcript_parts and transcript_parts[idx]
+    if not m then
+      print("[compact] KEEP 引用越界: " .. idx_s)
+      return "[[KEEP:" .. idx_s .. "]]"
+    end
+    local content = ""
+    if type(m.content) == "string" then
+      content = m.content
+    elseif m.tool_calls then
+      local names = {}
+      for _, tc in ipairs(m.tool_calls) do
+        names[#names + 1] = (tc["function"] and tc["function"].name) or "?"
+      end
+      content = "[tool_calls: " .. table.concat(names, ", ") .. "]"
+    end
+    if #content > KEEP_EMBED_MAX_CHARS then
+      content = content:sub(1, KEEP_EMBED_MAX_CHARS)
+        .. "\n...[truncated, " .. #content .. " chars total]"
+    end
+    local label = m.role or "?"
+    return "\n--- [KEEP:" .. idx_s .. ": " .. label .. "] ---\n"
+      .. content .. "\n--- end ---\n"
+  end))
 end
 
 -- Compact: replace older messages with an LLM summary, keep recent verbatim.
@@ -177,6 +221,8 @@ local function compact_history(messages, config)
   end
   local summary = summarize_history(old, config, previous_summary)
   if not summary then return nil end
+  -- KEEP 标记展开（与 summarize 同源 transcript 序号）
+  summary = expand_keep_markers(summary, build_transcript(old).parts)
 
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
   for i = #messages - keep + 1, #messages do

@@ -114,7 +114,7 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   └── superpowers/
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
-│   ├── run_tests.lua      # 本地回归测试（167 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性）
+│   ├── run_tests.lua      # 本地回归测试（201 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性/KEEP 标记/模型驱动压缩/护栏/TUI）
 │   ├── danger_test.lua    # 高危场景测试（21 项：自改/坏插件/死循环/磁盘/配置/自删/递归）
 │   ├── shell_timeout_test.lua  # ocvm/OCEmu 真机 shell 超时验证
 │   ├── reasoning_e2e_test.lua  # reasoning_content 传回真机 e2e（工具链无 400）
@@ -134,7 +134,7 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── ssh_win.py         # windowsCo 一键执行（密钥认证，--ps 中文路径）
 │   └── gist.py            # /debug 报告拉取（list/latest/fetch）
 ├── scripts/               # 构建与发版脚本 → scripts/README.md
-│   ├── build_all.py       # 构建+清单+167 项回归一键
+│   ├── build_all.py       # 构建+清单+201 项回归一键
 │   ├── release_check.py   # 发版安全检查（版本 bump/清单/字节/语法）
 │   ├── watch_release.py   # jsDelivr 索引监控（索引后提示可更新）
 │   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
@@ -161,7 +161,7 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 ```
 
 测试要点：
-- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**167 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性）+ `danger_test.lua`（21 项高危场景）
+- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**201 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性/KEEP 标记/模型驱动压缩/护栏/TUI）+ `danger_test.lua`（21 项高危场景）
 - 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
 - LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400

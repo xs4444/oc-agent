@@ -1,0 +1,18 @@
+-- gpu_probe.lua: 最小 term/gpu API 二分（不加载 agent）
+print("A: start")
+local term = require("term")
+print("B: term require ok")
+term.clear()
+print("C: term.clear ok")
+local component = require("component")
+local gpu = component.gpu
+print("D: gpu get: " .. tostring(gpu))
+local ok, w, h = pcall(gpu.getResolution)
+print("E: resolution=" .. tostring(ok) .. " " .. tostring(w) .. "x" .. tostring(h))
+local ok2, d = pcall(gpu.getDepth)
+print("F: depth=" .. tostring(ok2) .. " " .. tostring(d))
+local ok3, e3 = pcall(function() gpu.fill(1, 1, 80, 1, " ") end)
+print("G: fill=" .. tostring(ok3) .. (ok3 and "" or (" " .. tostring(e3))))
+local ok4, e4 = pcall(function() gpu.set(2, 1, "hi") end)
+print("H: set=" .. tostring(ok4) .. (ok4 and "" or (" " .. tostring(e4))))
+print("DONE")

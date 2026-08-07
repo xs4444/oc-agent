@@ -73,14 +73,7 @@ local function build_system_prompt()
 
   CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
-    .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
-    .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
-    .. "- Read first N lines of a file: use read_file with offset=1 and limit=N (no 'head -N')\n"
-    .. "- Read last N lines: use read_file with offset=-N (no 'tail -N')\n"
-    .. "- Grep/search in files: use list_directory to find files, read_file to read, text_ops to search (no 'grep')\n"
-    .. "- Count file lines: read_file then text_ops op=length (no 'wc -l')\n"
-    .. "- List directory: list_directory tool (no 'ls' in shell; though 'ls' works in OpenOS, the tool is more reliable)\n\n"
-    .. "CRITICAL: Never run 'lua' or any command without arguments that starts an interactive/REPL session — it will block forever waiting for stdin input. Always pass a script: 'lua script.lua' or 'lua -e \"expression\"'.\n\n"
+    .. "shell_execute is guarded: Unix-only commands (uname, head, tail, grep, wc, curl, wget) and bare 'lua' (interactive REPL) are rejected with OpenOS equivalents in the error message. Shell syntax is OpenOS (Lua-based), not Linux.\n\n"
     .. "Available tools:\n"
     .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
     .. "- write_file: Write content to a file (new files or full rewrites)\n"
@@ -98,6 +91,7 @@ local function build_system_prompt()
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
+    .. "- compact_history: Compress old conversation messages into an LLM summary (recent messages stay verbatim). Call it when your runtime status shows context usage at 60% or more of the model window, or when the history holds many stale tool results. Key tool outputs and errors are preserved in the summary.\n\n"
     .. "Context management: your context window is finite. To avoid HTTP 400 errors (context overflow):\n"
     .. "- Read files with read_file using offset/limit slices — never read the same large file repeatedly, and don't dump whole files into the conversation\n"
     .. "- Keep outputs and tool results concise; prefer json_query/text_ops for extraction\n"
@@ -115,6 +109,14 @@ end
 -- 运行时状态块: 每次请求重新生成（uptime/freeMemory/组件列表会变），由
 -- chat() 追加为请求的最后一条消息——不入历史、不进缓存前缀。内容显式标记
 -- 为机器生成上下文，避免模型误当作用户输入。
+-- runtime_extra_fn: init.lua 注入的上下文占用提供者（模型驱动压缩反馈，
+-- opencode-acp 策略——模型"看见"占用才能决定何时调用 compact_history 工具）
+local runtime_extra_fn
+
+local function set_runtime_extra(fn)
+  runtime_extra_fn = fn
+end
+
 local function build_runtime_block()
   local computer = require("computer")
   local component = require("component")
@@ -126,10 +128,15 @@ local function build_runtime_block()
 
   local uptime = safe_call(computer.uptime) or 0
   local free_mem = safe_call(computer.freeMemory) or 0
-  return "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
+  local base = "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
     .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
     .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
     .. "Connected components:\n" .. table.concat(comp_list, "\n")
+  local extra = runtime_extra_fn and runtime_extra_fn()
+  if extra and extra ~= "" then
+    return base .. "\n" .. extra
+  end
+  return base
 end
 
 local function build_headers(config)
@@ -204,6 +211,7 @@ return {
   safe_call = safe_call,
   build_system_prompt = build_system_prompt,
   build_runtime_block = build_runtime_block,
+  set_runtime_extra = set_runtime_extra,
   build_headers = build_headers,
   chat = chat,
 }

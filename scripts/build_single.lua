@@ -26,6 +26,7 @@ local MODULES = {
   "agent.chat",
   "agent.subagent",
   "agent.debug",
+  "agent.tui",
 }
 
 -- Tool plugin modules (same canonical order as agent.tools BUILTIN).
@@ -37,6 +38,7 @@ local TOOL_MODULES = {
   "agent.tools.shell",
   "agent.tools.subagent",
   "agent.tools.question",
+  "agent.tools.compact",
 }
 
 local function read_file(path)
