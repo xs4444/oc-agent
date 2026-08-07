@@ -80,7 +80,21 @@ class OcvmDriver:
             self.run(f"tmux send-keys -t {SESSION} Enter", timeout=10)
 
     def restart_vm(self):
+        # 杀 tmux 会话 + 所有残留 ocvm 进程（kill-session 不保证子进程退出，
+        # 残留实例会与新实例争用资源导致 boot 失败/崩溃——2026-08-07 实测
+        # 服务器上同时存在 2 个 ocvm 进程）
         self.run(f"tmux kill-session -t {SESSION} 2>/dev/null")
+        self.run("pkill -f 'ocvm' 2>/dev/null; sleep 2")
+        # 兜底: 验证进程已清（pkill -f 可能因命令行形态不匹配而漏杀）
+        for _ in range(5):
+            status, out = self.run("ps aux | grep '[o]cvm' | grep -v grep | wc -l")
+            try:
+                n = int(out.strip() or "0")
+            except ValueError:
+                n = 0
+            if n == 0:
+                break
+            time.sleep(2)
         self.run(f"rm -rf {VM_DIR}/{TMP_DIR}; mkdir -p {VM_DIR}/{TMP_DIR}")
         self.run(f"cd {VM_DIR} && tmux new-session -d -s {SESSION} -x 200 -y 50 './ocvm {TMP_DIR}'", timeout=15)
         print(f"[ocvm] booting, waiting up to {BOOT_WAIT}s for OpenOS...")
@@ -110,7 +124,12 @@ class OcvmDriver:
         print(f"[ocvm] uploaded {len(files)} file(s) to {len(dirs)} mount(s)")
 
     def find_agent_mount(self):
-        """探测含 agent.lua 的挂载短名 (每次重启会变)。"""
+        """探测数据盘挂载短名 (每次重启会变)。
+
+        根盘 host 目录会被 upload 污染 (agent.lua ls/cat 可见) 但只读
+        → 脚本写结果文件失败。因此用**可写**实证: touch 成功才视为
+        数据盘命中。
+        """
         self.send("ls /mnt")
         time.sleep(2)
         s = self.screen()
@@ -126,12 +145,14 @@ class OcvmDriver:
         for t in cands:
             self.send(f"echo PROBE{t}")
             time.sleep(1)
-            self.send(f"ls /mnt/{t}/agent.lua")
-            time.sleep(1.5)
+            self.send(f"touch /mnt/{t}/.wtest 2>/dev/null && echo WRITE{t}")
+            time.sleep(2)
             s2 = self.screen()
-            idx = s2.rfind(f"PROBE{t}")
+            # 段定位用该候选自己的 touch 前缀（不能 rfind 通用前缀——
+            # 会取到最后一个候选的段，误判前一个候选）
+            idx = s2.rfind(f"touch /mnt/{t}/")
             seg = s2[idx:] if idx >= 0 else s2
-            if f"PROBE{t}" in seg and "cannot access" not in seg:
+            if f"WRITE{t}" in seg:
                 return t
         return None
 

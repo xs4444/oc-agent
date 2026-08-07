@@ -15,22 +15,32 @@ local ok_c, component = pcall(require, "component")
 local ok_t, term = pcall(require, "term")
 local ok_e, event = pcall(require, "event")
 local ok_k, keyboard = pcall(require, "keyboard")
-local ok_u, unicode = pcall(require, "unicode")
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
 if not ok_t then term = {} end
 if not ok_e then event = {} end
 if not ok_k then keyboard = {} end
-if not ok_u then unicode = nil end
 
+-- UTF-8 安全长度/截断（自足实现，不依赖 unicode 库——ocvm 精简 OpenOS
+-- 的 unicode 库与 agent 环境存在兼容风险；纯 Lua 计数稳定）
 local function ulen(s)
-  if unicode then return ulen(s) end
-  return tostring(s):len()
+  local n = 0
+  for _ in tostring(s):gmatch("[^\128-\191]") do n = n + 1 end
+  return n
 end
 local function usub(s, i, j)
-  if unicode then return usub(s, i, j) end
-  return tostring(s):sub(i, j)
+  local str = tostring(s)
+  local start_char, end_char = math.max(1, i or 1), j or -1
+  local out, count = {}, 0
+  for ch in str:gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    count = count + 1
+    if count >= start_char and (end_char < 0 or count <= end_char) then
+      out[#out + 1] = ch
+    end
+    if end_char >= 0 and count > end_char then break end
+  end
+  return table.concat(out)
 end
 
 local tui = {}
