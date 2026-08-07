@@ -283,7 +283,7 @@ local function cmd_ctx(config, messages, usage_override)
   print("└──────────────────────────────")
   print("合计(估算): " .. fmt_num(est_total) .. " tok | 模型: " .. tostring(config.model or "?"))
   -- 压缩状态
-  local ok_sc, sc = pcall(should_compact, messages)
+  local ok_sc, sc = pcall(should_compact, messages, window)
   print("压缩: " .. (ok_sc and sc and "即将触发（超过阈值，可 /compact）" or "未触发") .. " | /ctx 参考 opencode TUI 的 usage 显示")
 end
 
@@ -551,7 +551,7 @@ local function ensure_context_budget(messages, config, persist, session)
 
   local est = est_msgs(messages)
   -- 触发: 估算超窗口 80%，或消息条数超阈值
-  if est <= window * 0.8 and not should_compact(messages) then
+  if est <= window * 0.8 and not should_compact(messages, window) then
     return messages, est
   end
 

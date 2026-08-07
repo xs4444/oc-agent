@@ -11,7 +11,7 @@
 
 ```bash
 # 发版全流程
-python scripts/build_all.py            # 构建 + 清单 + 163 项回归
+python scripts/build_all.py            # 构建 + 清单 + 167 项回归
 python scripts/release_check.py        # 安全检查（全 PASS 才能发）
 git commit ... && git tag v0.3.4 && git push origin master v0.3.4
 python scripts/watch_release.py --tag v0.3.4   # 挂机等 jsDelivr 索引
