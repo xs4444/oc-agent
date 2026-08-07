@@ -117,7 +117,19 @@ local DEPS = {
   subagent_listen_port = SUBAGENT_LISTEN_PORT,
   subagent_reply_port = SUBAGENT_REPLY_PORT,
   subagent_timeout = SUBAGENT_TIMEOUT,
+  -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具依赖注入。
+  -- get_context/rebuild_current 由 process_exchange 每次调用时更新。
+  compact_history = session_mod.compact_history,
+  get_context = nil,
+  rebuild_current = nil,
 }
+
+-- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
+--   UI_INPUT:   输入函数（TUI readInput 或 nil → io.read）——ask_user /
+--               多行收集共用，避免工具循环内 io.read 破坏 TUI 界面。
+--   UI_HOOKS:   工具活动钩子（onToolCall → 状态栏 "Running X..."）。
+local UI_INPUT = nil
+local UI_HOOKS = {onToolCall = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -132,8 +144,14 @@ local function ask_user_repl(args)
     end
     print("输入编号（多个用逗号分隔），或直接输入自定义回答，回车结束:")
   end
-  io.write("> ")
-  local answer = io.read()
+  local answer
+  if UI_INPUT then
+    -- TUI 模式: 走 TUI 输入行（不破坏界面）
+    answer = UI_INPUT()
+  else
+    io.write("> ")
+    answer = io.read()
+  end
   if not answer then return "(用户未回答)" end
   answer = answer:gsub("\n", ""):gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
   if answer == "" then return "(用户未回答)" end
@@ -295,8 +313,13 @@ local function collect_multiline()
   print("--- 多行输入模式: 逐行收集，单独一行 EOF 结束，Ctrl+D 取消 ---")
   local lines = {}
   while true do
-    io.write("...> ")
-    local line = io.read()
+    local line
+    if UI_INPUT then
+      line = UI_INPUT()
+    else
+      io.write("...> ")
+      line = io.read()
+    end
     if not line then
       print("(已取消)")
       return nil
@@ -550,12 +573,14 @@ local function ensure_context_budget(messages, config, persist, session)
   end
 
   local est = est_msgs(messages)
-  -- 触发: 估算超窗口 80%，或消息条数超阈值
-  if est <= window * 0.8 and not should_compact(messages, window) then
+  -- 模型驱动压缩（opencode-acp 策略）: 常规压缩由模型调用 compact_history
+  -- 工具主动执行（占用反馈注入运行时尾部块）；此处仅保留 80% 窗口硬保护
+  -- 防 400/超限。should_compact 仅用于 /ctx 建议显示。
+  if est <= window * 0.8 then
     return messages, est
   end
 
-  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens，自动压缩...")
+  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens 超 80% 窗口，硬保护压缩...")
   local compacted = compact_history(messages, config)
   if compacted then
     messages = compacted
@@ -572,6 +597,28 @@ end
 
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
+
+  -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具通过 DEPS
+  -- 访问当前消息列表与当前会话的持久化函数（每次 exchange 更新）。
+  DEPS.get_context = function() return messages end
+  DEPS.rebuild_current = persist and function(msgs)
+    if session then rebuild_session_history(session, msgs)
+    else rebuild_history(msgs) end
+  end or nil
+  -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
+  -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
+  local window_now = tonumber(config.context_window) or 128000
+  local est_now = 0
+  for _, m in ipairs(messages) do
+    est_now = est_now + estimate_tokens(m.content or "")
+        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+  end
+  chat_mod.set_runtime_extra(function()
+    local pct = window_now > 0 and (est_now / window_now * 100) or 0
+    return "Context usage: " .. string.format("%.0f%%", pct)
+      .. " of model window (est. " .. fmt_num(est_now) .. "/" .. fmt_num(window_now)
+      .. " tokens). If >=60% or the history is long, call compact_history."
+  end)
 
   -- 请求前上下文预算（压缩/裁剪，防 400 死循环）
   messages, _ = ensure_context_budget(messages, config, persist, session)
@@ -658,6 +705,8 @@ local function process_exchange(messages, config, user_input, persist, session)
       if fn then
         local tool_name = fn.name or "?"
         local tool_args = fn.arguments
+        -- TUI: 状态栏显示正在运行的工具
+        if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
         local ok_call, result = pcall(execute_tool, tool_name, tool_args)
         if not ok_call then
           result = "Error: " .. tostring(result)
@@ -822,7 +871,82 @@ end
   print("OC Agent ready. Model: " .. config.model)
   print("Type /help for commands.")
 
+  -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
+  -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。
+  local ui = nil
+  local real_print = print
+  if component.isAvailable("gpu") and component.isAvailable("screen") and component.isAvailable("keyboard") then
+    local ok_tui, tui_mod = pcall(require, "agent.tui")
+    if ok_tui then
+      ui = tui_mod
+      local mono = config.monochrome
+      if not mono then
+        local ok_d, depth = pcall(component.gpu.getDepth)
+        mono = ok_d and depth == 1  -- 机器人 T1 GPU: 单色方案
+      end
+      ui.init(mono and {monochrome = true} or nil)
+      ui.print("OC Agent TUI ready. Model: " .. config.model)
+      ui.print("Type /help for commands.", ui.colors.dim)
+      -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
+      print = function(s) ui.print(s, ui.colors.dim) end
+      -- 状态栏右侧: 上下文占用 + 缓存命中 + 模型（opencode TUI 同款数据）
+      ui.setStatusData(function()
+        local parts = {}
+        if LAST_USAGE and LAST_USAGE.prompt_tokens then
+          local win = tonumber(config.context_window) or 128000
+          local pct = win > 0 and (LAST_USAGE.prompt_tokens / win * 100) or 0
+          parts[#parts + 1] = string.format("ctx %.0f%%", pct)
+          local hit, miss = cache_stats(LAST_USAGE)
+          if hit then parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100) end
+        end
+        parts[#parts + 1] = config.model
+        return table.concat(parts, "  ")
+      end)
+      -- Tab 补全: 命令 + 工具名
+      local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
+        "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
+        "/gist-token", "/exit"}
+      for _, t in ipairs(TOOLS) do
+        comps[#comps + 1] = t["function"].name
+      end
+      ui.setCompletions(comps)
+      UI_INPUT = function() return ui.readInput() end
+      UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+    end
+  end
+
   while true do
+    if ui then
+      -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
+      ui.setStatus("Ready")
+      local input = ui.readInput()
+      if input == nil then
+        ui.print("^C", ui.colors.dim)
+        goto continue
+      end
+      if input == "" then goto continue end
+
+      if input:sub(1, 1) == "/" then
+        local exit, c, m = handle_command(input, config, messages)
+        config, messages = c, m
+        if exit then ui.stop() break end
+        goto continue
+      end
+
+      term_history[#term_history + 1] = input
+      if #term_history > 50 then
+        table.remove(term_history, 1)  -- keep terminal history bounded
+      end
+
+      ui.setStatus("Thinking...")
+      local result = process_exchange(messages, config, input, true)
+      if result and result.error then
+        ui.printRole("error", result.error)
+      end
+      ui.print("", ui.colors.foreground)
+      goto continue
+    end
+
     io.write("> ")
     local input = io.read()
     if not input then break end
@@ -847,6 +971,12 @@ end
     end
 
     ::continue::
+  end
+
+  -- TUI 清理: 恢复全局 print 与终端状态
+  if ui then
+    print = real_print
+    ui.cleanup()
   end
 
   print("Goodbye!")
@@ -882,6 +1012,7 @@ if _TEST_MODE then
     build_runtime_block = chat_mod.build_runtime_block,
     trim_history = trim_history,
     compact_history = compact_history,
+    set_chat = session_mod.set_chat,
     should_compact = should_compact,
     summarize_history = summarize_history,
     load_history = load_history,
@@ -895,6 +1026,11 @@ if _TEST_MODE then
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
     cache_stats = cache_stats,
+    -- 测试钩子: 模型驱动压缩的上下文注入（对应 DEPS.get_context/rebuild_current
+    -- 与 chat_mod.set_runtime_extra，由 process_exchange 每次调用更新）
+    set_context_getter = function(fn) DEPS.get_context = fn end,
+    set_rebuild_current = function(fn) DEPS.rebuild_current = fn end,
+    set_runtime_extra = chat_mod.set_runtime_extra,
     collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,

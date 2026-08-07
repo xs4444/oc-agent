@@ -1,0 +1,13 @@
+-- cursor_probe.lua: term.setCursor / setCursorBlink 二分
+print("A: start")
+local term = require("term")
+local ok1, e1 = pcall(term.setCursor, 1, 25)
+print("B: setCursor=" .. tostring(ok1) .. (ok1 and "" or (" " .. tostring(e1))))
+local ok2, e2 = pcall(term.setCursorBlink, false)
+print("C: blink(false)=" .. tostring(ok2) .. (ok2 and "" or (" " .. tostring(e2))))
+local ok3, e3 = pcall(term.setCursorBlink, true)
+print("D: blink(true)=" .. tostring(ok3) .. (ok3 and "" or (" " .. tostring(e3))))
+print("E: before blink false")
+local ok4, e4 = pcall(term.setCursorBlink, false)
+print("F: blink(false) again=" .. tostring(ok4) .. (ok4 and "" or (" " .. tostring(e4))))
+print("G: DONE")

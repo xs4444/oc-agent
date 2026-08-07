@@ -533,11 +533,11 @@ local function trim_history(messages)
   return messages
 end
 
--- Ask the LLM to summarize older messages. Independent minimal request
--- (no tools, no system prompt) so it can't recurse into compaction.
--- Returns summary string or nil on any failure.
-local function summarize_history(messages, config, previous_summary)
-  local transcript_parts = {}
+-- 构建发送给摘要模型的 transcript，返回 {text, parts}——parts[i] 是 text
+-- 第 i 行对应的原始消息（KEEP 展开时按行号找回原文）。纯函数:
+-- compact_history 与 summarize_history 对同一批消息调用结果一致。
+local function build_transcript(messages)
+  local parts, text_parts = {}, {}
   for _, m in ipairs(messages) do
     local role = m.role or "?"
     local content = ""
@@ -553,22 +553,32 @@ local function summarize_history(messages, config, previous_summary)
       content = tostring(m.content):sub(1, 200)
     end
     if content ~= "" then
-      transcript_parts[#transcript_parts + 1] = role .. ": " .. content
+      parts[#parts + 1] = m
+      text_parts[#text_parts + 1] = string.format("[%d] %s: %s", #parts, role, content)
     end
   end
-  local transcript = table.concat(transcript_parts, "\n")
+  local text = table.concat(text_parts, "\n")
   -- Cap what we send to the summarizer
-  if #transcript > 12000 then
-    transcript = transcript:sub(1, 12000) .. "\n...[truncated]"
+  if #text > 12000 then
+    text = text:sub(1, 12000) .. "\n...[truncated]"
   end
+  return {text = text, parts = parts}
+end
+
+-- Ask the LLM to summarize older messages. Independent minimal request
+-- (no tools, no system prompt) so it can't recurse into compaction.
+-- Returns summary string or nil on any failure.
+local function summarize_history(messages, config, previous_summary)
+  local transcript = build_transcript(messages).text
 
   -- Anchored summary (opencode-style): when a previous summary exists, ask the
   -- model to UPDATE it instead of summarizing from scratch. Keeps older facts
-  -- stable and saves tokens.
-  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble."
+  -- stable and saves tokens. KEEP 指令（opencode-acp 移植）: 行号标记
+  -- 关键消息原文，压缩后由 expand_keep_markers 展开。
+  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
   local user_prompt
   if previous_summary and previous_summary ~= "" then
-    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary."
+    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
     user_prompt = "<previous-summary>\n" .. previous_summary .. "\n</previous-summary>\n\n<new-history>\n" .. transcript .. "\n</new-history>\n\nUpdate the summary."
   else
     user_prompt = "Summarize this conversation:\n\n" .. transcript
@@ -586,6 +596,40 @@ local function summarize_history(messages, config, previous_summary)
   local summary = response.content
   if not summary or summary == "" then return nil end
   return summary
+end
+
+-- KEEP 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
+-- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；越界引用保留原样并
+-- 警告（非阻塞质量门——引用解析率是压缩质量指标，失败不阻断压缩）。
+local KEEP_PATTERN = "%[%[KEEP:(%d+)%]%]"
+local KEEP_EMBED_MAX_CHARS = 1000
+
+local function expand_keep_markers(summary, transcript_parts)
+  return (summary:gsub(KEEP_PATTERN, function(idx_s)
+    local idx = tonumber(idx_s)
+    local m = transcript_parts and transcript_parts[idx]
+    if not m then
+      print("[compact] KEEP 引用越界: " .. idx_s)
+      return "[[KEEP:" .. idx_s .. "]]"
+    end
+    local content = ""
+    if type(m.content) == "string" then
+      content = m.content
+    elseif m.tool_calls then
+      local names = {}
+      for _, tc in ipairs(m.tool_calls) do
+        names[#names + 1] = (tc["function"] and tc["function"].name) or "?"
+      end
+      content = "[tool_calls: " .. table.concat(names, ", ") .. "]"
+    end
+    if #content > KEEP_EMBED_MAX_CHARS then
+      content = content:sub(1, KEEP_EMBED_MAX_CHARS)
+        .. "\n...[truncated, " .. #content .. " chars total]"
+    end
+    local label = m.role or "?"
+    return "\n--- [KEEP:" .. idx_s .. ": " .. label .. "] ---\n"
+      .. content .. "\n--- end ---\n"
+  end))
 end
 
 -- Compact: replace older messages with an LLM summary, keep recent verbatim.
@@ -624,6 +668,8 @@ local function compact_history(messages, config)
   end
   local summary = summarize_history(old, config, previous_summary)
   if not summary then return nil end
+  -- KEEP 标记展开（与 summarize 同源 transcript 序号）
+  summary = expand_keep_markers(summary, build_transcript(old).parts)
 
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
   for i = #messages - keep + 1, #messages do
@@ -778,6 +824,7 @@ local BUILTIN = {
   "agent.tools.shell",
   "agent.tools.subagent",
   "agent.tools.question",
+  "agent.tools.compact",
 }
 
 -- Names already loaded by the BUILTIN loop (below). scan_dir skips these
@@ -1043,14 +1090,7 @@ local function build_system_prompt()
 
   CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
-    .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
-    .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
-    .. "- Read first N lines of a file: use read_file with offset=1 and limit=N (no 'head -N')\n"
-    .. "- Read last N lines: use read_file with offset=-N (no 'tail -N')\n"
-    .. "- Grep/search in files: use list_directory to find files, read_file to read, text_ops to search (no 'grep')\n"
-    .. "- Count file lines: read_file then text_ops op=length (no 'wc -l')\n"
-    .. "- List directory: list_directory tool (no 'ls' in shell; though 'ls' works in OpenOS, the tool is more reliable)\n\n"
-    .. "CRITICAL: Never run 'lua' or any command without arguments that starts an interactive/REPL session — it will block forever waiting for stdin input. Always pass a script: 'lua script.lua' or 'lua -e \"expression\"'.\n\n"
+    .. "shell_execute is guarded: Unix-only commands (uname, head, tail, grep, wc, curl, wget) and bare 'lua' (interactive REPL) are rejected with OpenOS equivalents in the error message. Shell syntax is OpenOS (Lua-based), not Linux.\n\n"
     .. "Available tools:\n"
     .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
     .. "- write_file: Write content to a file (new files or full rewrites)\n"
@@ -1068,6 +1108,7 @@ local function build_system_prompt()
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
+    .. "- compact_history: Compress old conversation messages into an LLM summary (recent messages stay verbatim). Call it when your runtime status shows context usage at 60% or more of the model window, or when the history holds many stale tool results. Key tool outputs and errors are preserved in the summary.\n\n"
     .. "Context management: your context window is finite. To avoid HTTP 400 errors (context overflow):\n"
     .. "- Read files with read_file using offset/limit slices — never read the same large file repeatedly, and don't dump whole files into the conversation\n"
     .. "- Keep outputs and tool results concise; prefer json_query/text_ops for extraction\n"
@@ -1085,6 +1126,14 @@ end
 -- 运行时状态块: 每次请求重新生成（uptime/freeMemory/组件列表会变），由
 -- chat() 追加为请求的最后一条消息——不入历史、不进缓存前缀。内容显式标记
 -- 为机器生成上下文，避免模型误当作用户输入。
+-- runtime_extra_fn: init.lua 注入的上下文占用提供者（模型驱动压缩反馈，
+-- opencode-acp 策略——模型"看见"占用才能决定何时调用 compact_history 工具）
+local runtime_extra_fn
+
+local function set_runtime_extra(fn)
+  runtime_extra_fn = fn
+end
+
 local function build_runtime_block()
   local computer = require("computer")
   local component = require("component")
@@ -1096,10 +1145,15 @@ local function build_runtime_block()
 
   local uptime = safe_call(computer.uptime) or 0
   local free_mem = safe_call(computer.freeMemory) or 0
-  return "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
+  local base = "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
     .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
     .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
     .. "Connected components:\n" .. table.concat(comp_list, "\n")
+  local extra = runtime_extra_fn and runtime_extra_fn()
+  if extra and extra ~= "" then
+    return base .. "\n" .. extra
+  end
+  return base
 end
 
 local function build_headers(config)
@@ -1174,6 +1228,7 @@ return {
   safe_call = safe_call,
   build_system_prompt = build_system_prompt,
   build_runtime_block = build_runtime_block,
+  set_runtime_extra = set_runtime_extra,
   build_headers = build_headers,
   chat = chat,
 }
@@ -1440,6 +1495,514 @@ return {
   upload = upload,
   mask = mask,
 }
+end
+
+-- agent.agent.tui (embedded module)
+package.preload["agent.tui"] = function()
+-- ═══════════════════════════════════════════════════════════════
+-- agent.tui — OpenComputers 终端 UI（参考 DonChong2000/oc-ai 的
+-- lib/oc-code/tui.lua 架构）。
+--
+-- 四区布局: header(第1行) / 内容区(2..h-3) / 状态栏(h-1) / 输入行(h)。
+-- 单色模式: gpu.getDepth()==1 → monoColors（机器人 T1 GPU 1-bit 屏）。
+-- 所有 gpu 调用 pcall 包裹: 渲染异常不拖垮 agent（调用方回退 REPL）。
+-- 兼容接口（与 oc-ai runLoop 同构）: init/print/printRole/printToolCall/
+-- printToolResult/setStatus/readInput/scrollUp/scrollDown/scrollToBottom/
+-- isRunning/stop/clear/cleanup。扩展: setStatusData(fn)（状态栏右侧动态
+-- 数据: 上下文占用/cache）、setCompletions(list)（Tab 补全候选）。
+-- ═══════════════════════════════════════════════════════════════
+
+local ok_c, component = pcall(require, "component")
+local ok_t, term = pcall(require, "term")
+local ok_e, event = pcall(require, "event")
+local ok_k, keyboard = pcall(require, "keyboard")
+local ok_u, unicode = pcall(require, "unicode")
+-- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
+-- 仍可用（测试环境/机器人）。
+if not ok_c then component = {} end
+if not ok_t then term = {} end
+if not ok_e then event = {} end
+if not ok_k then keyboard = {} end
+if not ok_u then unicode = nil end
+
+local function ulen(s)
+  if unicode then return ulen(s) end
+  return tostring(s):len()
+end
+local function usub(s, i, j)
+  if unicode then return usub(s, i, j) end
+  return tostring(s):sub(i, j)
+end
+
+local tui = {}
+
+-- 彩色方案（暗底 + 角色色，opencode TUI 风格）
+tui.colors = {
+  background = 0x000000, foreground = 0xffffff,
+  status = 0x1b1b2f, statusText = 0x9aa0b0,
+  prompt = 0x4ec9b0, user = 0x8ab4f8, assistant = 0xffffff,
+  tool = 0xf0a35e, toolName = 0xffd966, error = 0xff6b6b, dim = 0x888888,
+}
+-- 单色方案（1-bit: 状态栏/输入行反白区分，其余正常）
+tui.monoColors = {
+  background = 0x000000, foreground = 0xffffff,
+  status = 0xffffff, statusText = 0x000000,
+  prompt = 0xffffff, user = 0xffffff, assistant = 0xffffff,
+  tool = 0xffffff, toolName = 0xffffff, error = 0xffffff, dim = 0xffffff,
+}
+
+local state = {}
+local completionHandlers = {}  -- {prefix = {candidates = {cmd, desc}...}}
+
+-- 解析: 按字节找分隔符（OC gpu 文本按字符定位，ansi 处理走 unicode）
+local function char_count_before(s, sub)
+  local idx = s:find(sub, 1, true)
+  if not idx then return ulen(s) end
+  return ulen(s:sub(1, idx - 1))
+end
+
+-- 初始化（config.monochrome 强制单色）
+function tui.init(config)
+  config = config or {}
+  if config.monochrome then tui.colors = tui.monoColors end
+  local ok, w, h = pcall(function()
+    return component.gpu and component.gpu.getResolution()
+  end)
+  state.width, state.height = (ok and w) or 80, (ok and h) or 25
+  state.running = true
+  state.scrollOffset = 0
+  state.history = {}
+  state.inputBuffer = ""
+  state.inputCursor = 0
+  state.cmdHistory = {}
+  state.cmdHistoryIndex = 0
+  state.savedInput = ""
+  state.status = "Ready"
+  state.statusData = nil
+  state.completions = {}
+  state.completionCycle = nil
+  pcall(function()
+    term.clear()
+    tui.drawHeader()
+    tui.drawStatus()
+    tui.drawInput()
+  end)
+end
+
+-- 状态栏右侧动态数据提供者（init.lua 注入: 上下文占用/cache 等）
+function tui.setStatusData(fn)
+  state.statusData = fn
+end
+
+-- Tab 补全候选（命令/工具名列表）
+function tui.setCompletions(list)
+  state.completions = list or {}
+end
+
+-- 绘制 header（第 1 行）
+function tui.drawHeader()
+  local g = component.gpu
+  g.setBackground(tui.colors.status)
+  g.setForeground(tui.colors.statusText)
+  g.fill(1, 1, state.width, 1, " ")
+  g.setForeground(tui.colors.toolName)
+  g.set(2, 1, "OC Agent")
+  g.setForeground(tui.colors.statusText)
+  local hint = "/help | PgUp/PgDn scroll | /exit"
+  if state.width >= ulen(hint) + 16 then
+    g.set(state.width - ulen(hint) - 1, 1, hint)
+  end
+end
+
+-- 绘制状态栏（h-1 行: status 左 + 动态数据右 + scroll 指示）
+function tui.drawStatus()
+  local g = component.gpu
+  local y = state.height - 1
+  g.setBackground(tui.colors.status)
+  g.setForeground(tui.colors.statusText)
+  g.fill(1, y, state.width, 1, " ")
+  g.set(2, y, state.status)
+  if state.statusData then
+    local data = state.statusData()
+    if data and data ~= "" then
+      local maxw = state.width - 8
+      if ulen(data) > maxw then data = usub(data, 1, maxw - 1) .. "~" end
+      g.set(state.width - ulen(data) - 1, y, data)
+    end
+  end
+  if state.scrollOffset > 0 then
+    local st = "[Scroll " .. tostring(state.scrollOffset) .. "]"
+    g.setForeground(tui.colors.tool)
+    g.set(state.width - ulen(st) - 1, y, st)
+    g.setForeground(tui.colors.statusText)
+  end
+  g.setBackground(tui.colors.background)
+  g.setForeground(tui.colors.foreground)
+end
+
+function tui.setStatus(msg)
+  state.status = msg or "Ready"
+  pcall(tui.drawStatus)
+end
+
+-- 内容区边界（含滚动窗口高度）
+local function getContentBounds()
+  return 2, 2, state.width - 2, state.height - 3
+end
+
+-- 逐词换行 + 长词硬断（中文按 unicode 字符）
+local function wrapText(str, width)
+  local lines = {}
+  for line in tostring(str):gmatch("([^\n]*)\n?") do
+    if ulen(line) <= width then
+      lines[#lines + 1] = line
+    else
+      local current = ""
+      for word in line:gmatch("%S+") do
+        if ulen(current) + ulen(word) + 1 <= width then
+          current = current == "" and word or (current .. " " .. word)
+        else
+          if current ~= "" then lines[#lines + 1] = current end
+          if ulen(word) > width then
+            while ulen(word) > width do
+              lines[#lines + 1] = usub(word, 1, width)
+              word = usub(word, width + 1)
+            end
+            current = word
+          else
+            current = word
+          end
+        end
+      end
+      if current ~= "" then lines[#lines + 1] = current end
+    end
+  end
+  return lines
+end
+
+-- 输出到内容区（自动滚动到底）
+function tui.print(msg, color)
+  local _, _, w = getContentBounds()
+  color = color or tui.colors.foreground
+  for _, line in ipairs(wrapText(msg, w)) do
+    state.history[#state.history + 1] = {text = line, color = color}
+  end
+  state.scrollOffset = 0
+  pcall(tui.redrawContent)
+end
+
+-- 角色前缀输出
+function tui.printRole(role, msg)
+  local color, prefix
+  if role == "user" then color, prefix = tui.colors.user, "> "
+  elseif role == "assistant" then color, prefix = tui.colors.assistant, ""
+  elseif role == "tool" then color, prefix = tui.colors.tool, "  "
+  elseif role == "error" then color, prefix = tui.colors.error, "Error: "
+  else color, prefix = tui.colors.foreground, "" end
+  tui.print(prefix .. msg, color)
+end
+
+function tui.printToolCall(name, args)
+  tui.print(">> " .. tostring(name), tui.colors.toolName)
+  if args then
+    local s = type(args) == "string" and args or json_encode(args)
+    if ulen(s) > 100 then s = usub(s, 1, 97) .. "..." end
+    tui.print("   " .. s, tui.colors.dim)
+  end
+end
+
+function tui.printToolResult(name, result)
+  local s = type(result) == "string" and result or json_encode(result)
+  if ulen(s) > 200 then s = usub(s, 1, 197) .. "..." end
+  tui.print("<< " .. s, tui.colors.dim)
+end
+
+local function json_encode(v)
+  local ok, out = pcall(function() return require("agent.json").encode(v) end)
+  return ok and out or tostring(v)
+end
+
+-- 重绘内容区（可见窗口 = 底部 h 行 - scrollOffset）
+function tui.redrawContent()
+  local g = component.gpu
+  local x, y, w, h = getContentBounds()
+  g.setBackground(tui.colors.background)
+  g.fill(x - 1, y, w + 2, h, " ")
+  local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
+  local endIdx = math.min(#state.history, startIdx + h - 1)
+  local row = y
+  for i = startIdx, endIdx do
+    local entry = state.history[i]
+    g.setForeground(entry.color or tui.colors.foreground)
+    g.set(x, row, usub(entry.text, 1, w))
+    row = row + 1
+  end
+  g.setForeground(tui.colors.foreground)
+  tui.drawStatus()
+  tui.drawInput()
+end
+
+function tui.scrollUp(lines)
+  lines = lines or 1
+  local _, _, _, h = getContentBounds()
+  local maxScroll = math.max(0, #state.history - h)
+  state.scrollOffset = math.min(maxScroll, state.scrollOffset + lines)
+  pcall(tui.redrawContent)
+end
+
+function tui.scrollDown(lines)
+  lines = lines or 1
+  state.scrollOffset = math.max(0, state.scrollOffset - lines)
+  pcall(tui.redrawContent)
+end
+
+function tui.scrollToBottom()
+  state.scrollOffset = 0
+  pcall(tui.redrawContent)
+end
+
+function tui.scrollToTop()
+  local _, _, _, h = getContentBounds()
+  state.scrollOffset = math.max(0, #state.history - h)
+  pcall(tui.redrawContent)
+end
+
+-- 绘制输入行（底部: 提示符 + 文本 + 反色块光标 + Tab 候选提示）
+function tui.drawInput()
+  local g = component.gpu
+  local y = state.height
+  g.setBackground(tui.colors.background)
+  g.fill(1, y, state.width, 1, " ")
+  g.setForeground(tui.colors.prompt)
+  g.set(2, y, "> ")
+  g.setForeground(tui.colors.foreground)
+  local inputStart = 4
+  local maxWidth = state.width - inputStart - 1
+  local displayText = state.inputBuffer
+  local visibleCursorPos = state.inputCursor
+  if ulen(displayText) > maxWidth then
+    local start = math.max(1, state.inputCursor - maxWidth + 10)
+    displayText = usub(state.inputBuffer, start, start + maxWidth - 1)
+    visibleCursorPos = state.inputCursor - (start - 1)
+  end
+  g.set(inputStart, y, displayText)
+  -- 反色块光标
+  local cursorX = inputStart + visibleCursorPos
+  if cursorX <= state.width - 1 then
+    local ch = usub(state.inputBuffer, state.inputCursor + 1, state.inputCursor + 1)
+    if ch == "" then ch = " " end
+    g.setBackground(tui.colors.foreground)
+    g.setForeground(tui.colors.background)
+    g.set(cursorX, y, ch)
+    g.setBackground(tui.colors.background)
+    g.setForeground(tui.colors.foreground)
+  end
+  -- Tab 补全候选提示（输入行末尾）
+  if state.completionCycle and state.completionCycle[2] then
+    local hint = "Tab: " .. tostring(state.completionCycle[2].cmd)
+    if ulen(displayText) + ulen(hint) + inputStart < state.width then
+      g.setForeground(tui.colors.tool)
+      g.set(state.width - ulen(hint) - 1, y, hint)
+      g.setForeground(tui.colors.foreground)
+    end
+  end
+  pcall(term.setCursor, cursorX, y)
+  pcall(term.setCursorBlink, false)
+end
+
+-- 补全候选: 命令 + 工具名 + 注册前缀处理器
+local function completionCandidates(buffer)
+  local results = {}
+  local lower = buffer:lower()
+  -- 前缀处理器（completionHandlers，如 /model 的模型候选）
+  for prefix, h in pairs(completionHandlers) do
+    if buffer:sub(1, #prefix) == prefix then
+      local extra = h.handler(buffer)
+      if extra then
+        for _, cand in ipairs(extra) do results[#results + 1] = cand end
+      end
+    end
+  end
+  -- 静态候选（命令 + 工具名）
+  for _, cand in ipairs(state.completions) do
+    local c = type(cand) == "string" and cand or cand.cmd
+    if lower == "" or c:lower():find(lower, 1, true) == 1 then
+      results[#results + 1] = type(cand) == "string" and {cmd = cand, desc = ""} or cand
+    end
+  end
+  -- 去重保序
+  local seen, dedup = {}, {}
+  for _, r in ipairs(results) do
+    if not seen[r.cmd] then seen[r.cmd] = true dedup[#dedup + 1] = r end
+  end
+  return dedup
+end
+
+function tui.registerCompletion(prefix, handler, label)
+  completionHandlers[prefix] = {handler = handler, label = label}
+end
+
+-- 事件驱动输入: 键盘编辑 + 历史浏览 + Tab 补全 + 滚动 + Ctrl+C。
+-- 无 keyboard 组件时回退 io.read（机器人）。
+function tui.readInput()
+  local ok_kb, kb_avail = pcall(function()
+    return keyboard.isAvailable and keyboard.isAvailable()
+  end)
+  if not ok_kb or not kb_avail then
+    io.write("> ")
+    io.flush()
+    local ok, line = pcall(io.read, "*l")
+    if not ok then return nil end
+    return (line or ""):gsub("\r?\n", "")
+  end
+
+  state.inputBuffer = ""
+  state.inputCursor = 0
+  state.completionCycle = nil
+  local cursorVisible = true
+  local lastBlink = computer.uptime()
+
+  pcall(tui.drawInput)
+
+  while true do
+    local ev, _, char, code = event.pull(0.25)
+
+    -- 光标闪烁
+    local now = computer.uptime()
+    if now - lastBlink >= 0.5 then
+      cursorVisible = not cursorVisible
+      lastBlink = now
+      -- 简化: 闪烁只做定时重绘提示（块光标常亮，不闪烁——机器人帧率友好）
+    end
+
+    if ev == "interrupted" then
+      return nil
+    elseif ev == "key_down" then
+      local ch = char or 0
+      if ch == 13 then -- Enter
+        local line = state.inputBuffer
+        if line ~= "" then
+          state.cmdHistory[#state.cmdHistory + 1] = line
+          if #state.cmdHistory > 50 then table.remove(state.cmdHistory, 1) end
+        end
+        state.cmdHistoryIndex = 0
+        state.savedInput = ""
+        state.completionCycle = nil
+        tui.print("> " .. line, tui.colors.user)
+        return line
+      elseif ch == 8 or code == 14 then -- Backspace
+        if state.inputCursor > 0 then
+          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
+            .. usub(state.inputBuffer, state.inputCursor + 1)
+          state.inputCursor = state.inputCursor - 1
+          state.completionCycle = nil
+        end
+      elseif code == 203 then -- Left
+        if state.inputCursor > 0 then state.inputCursor = state.inputCursor - 1 end
+        state.completionCycle = nil
+      elseif code == 205 then -- Right
+        if state.inputCursor < ulen(state.inputBuffer) then
+          state.inputCursor = state.inputCursor + 1
+        end
+        state.completionCycle = nil
+      elseif code == 199 then -- Home
+        state.inputCursor = 0
+      elseif code == 207 then -- End
+        state.inputCursor = ulen(state.inputBuffer)
+      elseif code == 211 then -- Delete
+        local len = ulen(state.inputBuffer)
+        if state.inputCursor < len then
+          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+            .. usub(state.inputBuffer, state.inputCursor + 2)
+        end
+        state.completionCycle = nil
+      elseif code == 200 then -- Up: 历史上翻
+        if #state.cmdHistory > 0 then
+          if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
+          if state.cmdHistoryIndex < #state.cmdHistory then
+            state.cmdHistoryIndex = state.cmdHistoryIndex + 1
+            state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
+            state.inputCursor = ulen(state.inputBuffer)
+          end
+        end
+      elseif code == 208 then -- Down: 历史下翻
+        if state.cmdHistoryIndex > 0 then
+          state.cmdHistoryIndex = state.cmdHistoryIndex - 1
+          if state.cmdHistoryIndex == 0 then
+            state.inputBuffer = state.savedInput
+          else
+            state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
+          end
+          state.inputCursor = ulen(state.inputBuffer)
+        end
+      elseif code == 201 then -- PgUp: 上滚
+        tui.scrollUp(state.height - 4)
+      elseif code == 209 then -- PgDn: 下滚
+        tui.scrollDown(state.height - 4)
+      elseif code == 15 then -- Tab: 补全循环
+        local cands = completionCandidates(state.inputBuffer)
+        if #cands > 0 then
+          if not state.completionCycle then state.completionCycle = {cands, cands[1]} end
+          state.inputBuffer = state.completionCycle[2].cmd
+          state.inputCursor = ulen(state.inputBuffer)
+        end
+      elseif ch >= 32 and ch < 127 then -- 可打印 ASCII
+        state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+          .. string.char(ch)
+          .. usub(state.inputBuffer, state.inputCursor + 1)
+        state.inputCursor = state.inputCursor + 1
+        state.completionCycle = nil
+      end
+      pcall(tui.drawInput)
+    elseif ev == "clipboard" then
+      if char then
+        state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+          .. char
+          .. usub(state.inputBuffer, state.inputCursor + 1)
+        state.inputCursor = state.inputCursor + ulen(char)
+        state.completionCycle = nil
+        pcall(tui.drawInput)
+      end
+    end
+  end
+end
+
+function tui.isRunning()
+  return state.running
+end
+
+function tui.stop()
+  state.running = false
+end
+
+-- 清空会话显示
+function tui.clear()
+  state.history = {}
+  state.scrollOffset = 0
+  pcall(function()
+    term.clear()
+    tui.drawHeader()
+    tui.drawStatus()
+    tui.drawInput()
+  end)
+end
+
+-- 退出恢复终端
+function tui.cleanup()
+  pcall(function()
+    term.clear()
+    local g = component.gpu
+    g.setBackground(0x000000)
+    g.setForeground(0xffffff)
+  end)
+end
+
+-- 测试/调试只读: 内容区消息列表 {text, color}
+function tui.history()
+  return state.history
+end
+
+return tui
 end
 
 -- agent.agent.tools.file (embedded module)
@@ -2100,8 +2663,46 @@ local tools = {
   }},
 }
 
+-- ═══════════════════════════════════════════════════════════════
+-- Unix-ism 护栏（工具层，替代 system prompt 大段指令——确定性拦截，
+-- 不依赖模型遵守; 拒绝信息内含 OpenOS 等价做法，模型从错误中学习）。
+-- 逐 | 管道分段检查（管道内的 head/grep 同样拦截）。
+-- ═══════════════════════════════════════════════════════════════
+local GUARDS = {
+  {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use read_file('/etc/os-release') for system info, or component_list/component_doc."},
+  {pat = "^%s*head", hint = "head: not available in OpenOS. Use read_file with offset=1 and limit=N to read the first N lines."},
+  {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
+  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use list_directory to find files, read_file to read, text_ops to search."},
+  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Use read_file then text_ops op=length to count."},
+  {pat = "^%s*curl", hint = "curl: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
+  {pat = "^%s*wget", hint = "wget: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
+}
+
+-- 护栏: 返回 nil + 错误信息 = 拒绝; 返回 true = 放行。
+-- 裸 lua/luac（无参数或仅行尾注释）= 交互式 REPL，永久阻塞等 stdin。
+-- 注: `(组)?` 可选捕获组合在此环境不可靠，先剥离行尾注释再匹配。
+local function guard_command(cmd)
+  if type(cmd) ~= "string" then return nil, "command must be a string" end
+  local stripped = cmd:gsub("%s*#.*$", "")
+  if stripped:match("^%s*luac?%s*$") then
+    return nil, "rejected by guard: bare 'lua' starts an interactive REPL that blocks forever waiting for stdin. Always pass a script or -e: e.g. 'lua script.lua' or 'lua -e \"print(1)\"'."
+  end
+  for seg in (cmd .. "|"):gmatch("(.-)|") do
+    for _, g in ipairs(GUARDS) do
+      if seg:match(g.pat) then
+        return nil, "rejected by guard: " .. g.hint .. " (command: " .. cmd:sub(1, 120) .. ")"
+      end
+    end
+  end
+  return true
+end
+
 local function exec(name, args, deps)
   if name == "shell_execute" then
+    local ok_guard, guard_err = guard_command(args.command)
+    if not ok_guard then
+      return guard_err
+    end
     local timeout = tonumber(args.timeout) or 60
     local ok, result = pcall(function()
       local thread_ok, thread = pcall(require, "thread")
@@ -2281,6 +2882,62 @@ end
 return {tools = tools, exec = exec}
 end
 
+-- agent.agent.tools.compact (embedded module)
+package.preload["agent.tools.compact"] = function()
+-- ═══════════════════════════════════════════════════════════════
+-- agent.tools.compact — 模型驱动压缩工具（opencode-acp 策略）。
+--
+-- opencode-acp 的核心: 压缩没有进程内自动触发，由模型看到上下文占用后
+-- 主动调用 compress 工具。对应移植: compact_history 工具暴露给模型，
+-- 上下文占用百分比注入运行时尾部块（chat.lua build_runtime_block），
+-- 模型据此决定何时压缩。进程内仅保留 80% 窗口硬保护（防 400/超限）
+-- 与 trim 内存保护。
+--
+-- deps 注入（agent.execute → init.lua DEPS）:
+--   json, load_config, compact_history, get_context, rebuild_current
+-- get_context/rebuild_current 由 process_exchange 每次调用注入。
+-- ═══════════════════════════════════════════════════════════════
+
+local tools = {
+  {type = "function", ["function"] = {
+    name = "compact_history",
+    description = "Compress conversation history: replace old messages with an LLM summary, keeping recent messages verbatim. Call this when your context usage (shown in runtime status) is >=60% of the model window, or the history contains many stale tool results. Critical tool results and errors are preserved inline in the summary via KEEP markers.",
+    parameters = {type = "object", properties = {topic = {type = "string", description = "Optional topic hint to focus the summary on"}}},
+  }},
+}
+
+local function exec(name, args, deps)
+  if name ~= "compact_history" then return nil end
+  local get_context = deps.get_context
+  if type(get_context) ~= "function" then
+    return "compact_history unavailable: no session context"
+  end
+  local messages = get_context()
+  if not messages or #messages <= 6 then
+    return "history too short to compact (" .. tostring(messages and #messages or 0) .. " messages)"
+  end
+  local config = deps.load_config and deps.load_config() or {}
+  local compacted = deps.compact_history(messages, config)
+  if not compacted then
+    return "compaction failed (summarizer unavailable or error)"
+  end
+  local old_count = #messages
+  -- 就地替换消息列表: process_exchange 的工具循环继续基于压缩后历史工作
+  for i = old_count, 1, -1 do messages[i] = nil end
+  for i = 1, #compacted do messages[i] = compacted[i] end
+  local rebuild = deps.rebuild_current
+  if type(rebuild) == "function" then
+    local ok, err = pcall(rebuild, messages)
+    if not ok then print("[compact] rebuild failed: " .. tostring(err)) end
+  end
+  return string.format(
+    "history compacted: %d old messages replaced by an LLM summary; %d recent messages kept verbatim; first message (cache anchor) preserved.",
+    old_count - #compacted + 1, #compacted - 1)
+end
+
+return {tools = tools, exec = exec}
+end
+
 -- ═══════════════════════════════════════════════════════════════
 -- Entry: src/agent/init.lua (inlined verbatim)
 -- ═══════════════════════════════════════════════════════════════
@@ -2403,7 +3060,19 @@ local DEPS = {
   subagent_listen_port = SUBAGENT_LISTEN_PORT,
   subagent_reply_port = SUBAGENT_REPLY_PORT,
   subagent_timeout = SUBAGENT_TIMEOUT,
+  -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具依赖注入。
+  -- get_context/rebuild_current 由 process_exchange 每次调用时更新。
+  compact_history = session_mod.compact_history,
+  get_context = nil,
+  rebuild_current = nil,
 }
+
+-- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
+--   UI_INPUT:   输入函数（TUI readInput 或 nil → io.read）——ask_user /
+--               多行收集共用，避免工具循环内 io.read 破坏 TUI 界面。
+--   UI_HOOKS:   工具活动钩子（onToolCall → 状态栏 "Running X..."）。
+local UI_INPUT = nil
+local UI_HOOKS = {onToolCall = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -2418,8 +3087,14 @@ local function ask_user_repl(args)
     end
     print("输入编号（多个用逗号分隔），或直接输入自定义回答，回车结束:")
   end
-  io.write("> ")
-  local answer = io.read()
+  local answer
+  if UI_INPUT then
+    -- TUI 模式: 走 TUI 输入行（不破坏界面）
+    answer = UI_INPUT()
+  else
+    io.write("> ")
+    answer = io.read()
+  end
   if not answer then return "(用户未回答)" end
   answer = answer:gsub("\n", ""):gsub("\r", ""):gsub("^%s+", ""):gsub("%s+$", "")
   if answer == "" then return "(用户未回答)" end
@@ -2581,8 +3256,13 @@ local function collect_multiline()
   print("--- 多行输入模式: 逐行收集，单独一行 EOF 结束，Ctrl+D 取消 ---")
   local lines = {}
   while true do
-    io.write("...> ")
-    local line = io.read()
+    local line
+    if UI_INPUT then
+      line = UI_INPUT()
+    else
+      io.write("...> ")
+      line = io.read()
+    end
     if not line then
       print("(已取消)")
       return nil
@@ -2836,12 +3516,14 @@ local function ensure_context_budget(messages, config, persist, session)
   end
 
   local est = est_msgs(messages)
-  -- 触发: 估算超窗口 80%，或消息条数超阈值
-  if est <= window * 0.8 and not should_compact(messages, window) then
+  -- 模型驱动压缩（opencode-acp 策略）: 常规压缩由模型调用 compact_history
+  -- 工具主动执行（占用反馈注入运行时尾部块）；此处仅保留 80% 窗口硬保护
+  -- 防 400/超限。should_compact 仅用于 /ctx 建议显示。
+  if est <= window * 0.8 then
     return messages, est
   end
 
-  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens，自动压缩...")
+  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens 超 80% 窗口，硬保护压缩...")
   local compacted = compact_history(messages, config)
   if compacted then
     messages = compacted
@@ -2858,6 +3540,28 @@ end
 
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
+
+  -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具通过 DEPS
+  -- 访问当前消息列表与当前会话的持久化函数（每次 exchange 更新）。
+  DEPS.get_context = function() return messages end
+  DEPS.rebuild_current = persist and function(msgs)
+    if session then rebuild_session_history(session, msgs)
+    else rebuild_history(msgs) end
+  end or nil
+  -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
+  -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
+  local window_now = tonumber(config.context_window) or 128000
+  local est_now = 0
+  for _, m in ipairs(messages) do
+    est_now = est_now + estimate_tokens(m.content or "")
+        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+  end
+  chat_mod.set_runtime_extra(function()
+    local pct = window_now > 0 and (est_now / window_now * 100) or 0
+    return "Context usage: " .. string.format("%.0f%%", pct)
+      .. " of model window (est. " .. fmt_num(est_now) .. "/" .. fmt_num(window_now)
+      .. " tokens). If >=60% or the history is long, call compact_history."
+  end)
 
   -- 请求前上下文预算（压缩/裁剪，防 400 死循环）
   messages, _ = ensure_context_budget(messages, config, persist, session)
@@ -2944,6 +3648,8 @@ local function process_exchange(messages, config, user_input, persist, session)
       if fn then
         local tool_name = fn.name or "?"
         local tool_args = fn.arguments
+        -- TUI: 状态栏显示正在运行的工具
+        if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
         local ok_call, result = pcall(execute_tool, tool_name, tool_args)
         if not ok_call then
           result = "Error: " .. tostring(result)
@@ -3108,7 +3814,82 @@ end
   print("OC Agent ready. Model: " .. config.model)
   print("Type /help for commands.")
 
+  -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
+  -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。
+  local ui = nil
+  local real_print = print
+  if component.isAvailable("gpu") and component.isAvailable("screen") and component.isAvailable("keyboard") then
+    local ok_tui, tui_mod = pcall(require, "agent.tui")
+    if ok_tui then
+      ui = tui_mod
+      local mono = config.monochrome
+      if not mono then
+        local ok_d, depth = pcall(component.gpu.getDepth)
+        mono = ok_d and depth == 1  -- 机器人 T1 GPU: 单色方案
+      end
+      ui.init(mono and {monochrome = true} or nil)
+      ui.print("OC Agent TUI ready. Model: " .. config.model)
+      ui.print("Type /help for commands.", ui.colors.dim)
+      -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
+      print = function(s) ui.print(s, ui.colors.dim) end
+      -- 状态栏右侧: 上下文占用 + 缓存命中 + 模型（opencode TUI 同款数据）
+      ui.setStatusData(function()
+        local parts = {}
+        if LAST_USAGE and LAST_USAGE.prompt_tokens then
+          local win = tonumber(config.context_window) or 128000
+          local pct = win > 0 and (LAST_USAGE.prompt_tokens / win * 100) or 0
+          parts[#parts + 1] = string.format("ctx %.0f%%", pct)
+          local hit, miss = cache_stats(LAST_USAGE)
+          if hit then parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100) end
+        end
+        parts[#parts + 1] = config.model
+        return table.concat(parts, "  ")
+      end)
+      -- Tab 补全: 命令 + 工具名
+      local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
+        "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
+        "/gist-token", "/exit"}
+      for _, t in ipairs(TOOLS) do
+        comps[#comps + 1] = t["function"].name
+      end
+      ui.setCompletions(comps)
+      UI_INPUT = function() return ui.readInput() end
+      UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+    end
+  end
+
   while true do
+    if ui then
+      -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
+      ui.setStatus("Ready")
+      local input = ui.readInput()
+      if input == nil then
+        ui.print("^C", ui.colors.dim)
+        goto continue
+      end
+      if input == "" then goto continue end
+
+      if input:sub(1, 1) == "/" then
+        local exit, c, m = handle_command(input, config, messages)
+        config, messages = c, m
+        if exit then ui.stop() break end
+        goto continue
+      end
+
+      term_history[#term_history + 1] = input
+      if #term_history > 50 then
+        table.remove(term_history, 1)  -- keep terminal history bounded
+      end
+
+      ui.setStatus("Thinking...")
+      local result = process_exchange(messages, config, input, true)
+      if result and result.error then
+        ui.printRole("error", result.error)
+      end
+      ui.print("", ui.colors.foreground)
+      goto continue
+    end
+
     io.write("> ")
     local input = io.read()
     if not input then break end
@@ -3133,6 +3914,12 @@ end
     end
 
     ::continue::
+  end
+
+  -- TUI 清理: 恢复全局 print 与终端状态
+  if ui then
+    print = real_print
+    ui.cleanup()
   end
 
   print("Goodbye!")
@@ -3168,6 +3955,7 @@ if _TEST_MODE then
     build_runtime_block = chat_mod.build_runtime_block,
     trim_history = trim_history,
     compact_history = compact_history,
+    set_chat = session_mod.set_chat,
     should_compact = should_compact,
     summarize_history = summarize_history,
     load_history = load_history,
@@ -3181,6 +3969,11 @@ if _TEST_MODE then
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
     cache_stats = cache_stats,
+    -- 测试钩子: 模型驱动压缩的上下文注入（对应 DEPS.get_context/rebuild_current
+    -- 与 chat_mod.set_runtime_extra，由 process_exchange 每次调用更新）
+    set_context_getter = function(fn) DEPS.get_context = fn end,
+    set_rebuild_current = function(fn) DEPS.rebuild_current = fn end,
+    set_runtime_extra = chat_mod.set_runtime_extra,
     collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,

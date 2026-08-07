@@ -488,6 +488,7 @@ local EXPECTED_TOOLS = {
   "json_query", "calc", "text_ops",
   "component_list", "component_doc", "component_invoke",
   "web_search", "shell_execute", "subagent_call", "ask_user",
+  "compact_history",
 }
 local tools_have = {}
 for _, t in ipairs(agent_test.TOOLS) do
@@ -912,6 +913,214 @@ local line2_ok, line2_text = capture_print(function()
 end)
 test("show_ctx_line openai format cache %", line2_ok and line2_text:find("cache 90%%") ~= nil,
   line2_text)
+
+-- ═══════════════════════════════════════════
+-- KEEP 标记机制（opencode-acp keep-markers 移植）
+-- ═══════════════════════════════════════════
+
+-- summarize prompt 含 KEEP 指令
+local keep_captured_prompt = nil
+local function keep_mock_chat(msgs, cfg)
+  if msgs and msgs[1] then keep_captured_prompt = msgs[1].content end
+  return {content = keep_mock_summary}
+end
+agent_test.set_chat(keep_mock_chat)
+local keep_msgs = {}
+for i = 1, 12 do
+  keep_msgs[#keep_msgs + 1] = {role = "user", content = "msg " .. i}
+end
+keep_msgs[2].content = "critical secret value: abc123"
+agent_test.summarize_history(keep_msgs, {model = "m", api_key = ""})
+test("summarize prompt instructs KEEP markers",
+  keep_captured_prompt and keep_captured_prompt:find("[[KEEP", 1, true) ~= nil,
+  tostring(keep_captured_prompt):sub(1, 200))
+
+-- KEEP 展开: mock 摘要含 [[KEEP:2]] → 原文 abc123 内联
+keep_mock_summary = "summary text with [[KEEP:2]] marker"
+local keep_compacted = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("KEEP expands to original message", keep_compacted
+  and keep_compacted[1].content:find("abc123") ~= nil,
+  tostring(keep_compacted and keep_compacted[1].content or nil):sub(1, 300))
+test("KEEP keeps summary text", keep_compacted
+  and keep_compacted[1].content:find("summary text with") ~= nil)
+
+-- KEEP 越界引用: 不崩溃、保留原标记
+agent_test.set_chat(keep_mock_chat)
+keep_mock_summary = "s [[KEEP:99]]"
+local keep_oob = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("KEEP out-of-range marker survives", keep_oob
+  and keep_oob[1].content:find("[[KEEP:99]]", 1, true) ~= nil,
+  tostring(keep_oob and keep_oob[1].content or nil):sub(1, 200))
+
+-- KEEP 截断: 长消息嵌入截断到 1000 字符
+local keep_long_msgs = {
+  {role = "user", content = string.rep("x", 3000) .. " tail-marker"},
+  {role = "user", content = "short"},
+  {role = "user", content = "s3"}, {role = "user", content = "s4"},
+  {role = "user", content = "s5"}, {role = "user", content = "s6"},
+  {role = "user", content = "s7"}, {role = "user", content = "s8"},
+  {role = "user", content = "s9"}, {role = "user", content = "s10"},
+  {role = "user", content = "s11"}, {role = "user", content = "s12"},
+}
+agent_test.set_chat(keep_mock_chat)
+keep_mock_summary = "s [[KEEP:1]]"
+local keep_long = agent_test.compact_history(keep_long_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("KEEP truncates long embed", keep_long
+  and keep_long[1].content:find("truncated") ~= nil
+  and keep_long[1].content:find("tail-marker") == nil,
+  tostring(keep_long and keep_long[1].content or nil):sub(1, 300))
+
+print("")
+print("═══════════════════════════════════════")
+print("Model-Driven Compaction Tests")
+print("═══════════════════════════════════════")
+
+-- 策略（opencode-acp）: 无进程内自动压缩——60-80% 窗口估算不自动压缩
+local e_msgs = {}
+for i = 1, 10 do
+  e_msgs[#e_msgs + 1] = {role = "user", content = string.rep("e", 10000)}
+end
+local e_after, e_est = agent_test.ensure_context_budget(e_msgs,
+  {context_window = 40000, model = "m", api_key = ""})
+test("ensure no auto-compact at 60-80% (model-driven)",
+  #e_after == 10, "#=" .. tostring(#e_after) .. " est=" .. tostring(e_est))
+
+-- compact_history 工具: 模型驱动压缩（KEEP 标记 + 就地替换 + 持久化）
+local tool_ctx = {}
+for i = 1, 15 do
+  tool_ctx[#tool_ctx + 1] = {role = "user", content = "tool ctx " .. i}
+end
+local rebuilt = nil
+agent_test.set_chat(keep_mock_chat)
+keep_mock_summary = "tool summary [[KEEP:1]]"
+agent_test.set_context_getter(function() return tool_ctx end)
+agent_test.set_rebuild_current(function(msgs) rebuilt = msgs end)
+local compact_result = execute_tool("compact_history", json.encode({}))
+agent_test.set_chat(agent_test.chat)
+agent_test.set_context_getter(nil)
+agent_test.set_rebuild_current(nil)
+test("compact tool compresses history in place",
+  #tool_ctx <= 9 and tool_ctx[1].content:find("tool summary", 1, true) ~= nil,
+  "n=" .. tostring(#tool_ctx) .. " result=" .. tostring(compact_result):sub(1, 120))
+test("compact tool rebuilds history file", rebuilt ~= nil and #rebuilt == #tool_ctx)
+test("compact tool returns report", type(compact_result) == "string"
+  and compact_result:find("compacted", 1, true) ~= nil,
+  tostring(compact_result):sub(1, 160))
+-- 短历史: 拒绝压缩
+local short_ctx = {{role = "user", content = "only one"}}
+agent_test.set_context_getter(function() return short_ctx end)
+local short_result = execute_tool("compact_history", json.encode({}))
+agent_test.set_context_getter(nil)
+test("compact tool rejects short history",
+  type(short_result) == "string" and short_result:find("too short", 1, true) ~= nil,
+  tostring(short_result):sub(1, 160))
+
+-- 上下文占用注入尾部块（模型决策依据: 看见占用 → 决定压缩）
+agent_test.set_runtime_extra(function()
+  return "Context usage: 70% of model window (est. 1000/128000 tokens). If >=60% or the history is long, call compact_history."
+end)
+local rt_extra = agent_test.build_runtime_block()
+agent_test.set_runtime_extra(nil)
+test("runtime block carries context usage",
+  rt_extra:find("Context usage: 70%", 1, true) ~= nil
+  and rt_extra:find("compact_history", 1, true) ~= nil,
+  rt_extra:sub(1, 300))
+
+-- system prompt 含 compact 指令
+test("system prompt instructs compact_history",
+  sys_a:find("compact_history", 1, true) ~= nil)
+
+print("")
+print("═══════════════════════════════════════")
+print("Shell Guard Tests (Unix-ism 护栏)")
+print("═══════════════════════════════════════")
+
+-- 护栏在 exec 入口拦截（先于 shell 调用），mock 环境可测拒绝路径
+local function try_shell(cmd)
+  return execute_tool("shell_execute", json.encode({command = cmd}))
+end
+local g_res = try_shell("uname -a")
+test("guard rejects uname", type(g_res) == "string"
+  and g_res:find("rejected by guard", 1, true) ~= nil
+  and g_res:find("read_file", 1, true) ~= nil, tostring(g_res):sub(1, 160))
+test("guard rejects head", try_shell("head -3 file"):find("rejected by guard", 1, true) ~= nil)
+test("guard rejects tail", try_shell("tail -5 log.txt"):find("rejected by guard", 1, true) ~= nil)
+test("guard rejects grep", try_shell("grep -rn foo /mnt"):find("rejected by guard", 1, true) ~= nil)
+test("guard rejects wc", try_shell("wc -l file.lua"):find("rejected by guard", 1, true) ~= nil)
+test("guard rejects curl", try_shell("curl https://example.com"):find("rejected by guard", 1, true) ~= nil)
+test("guard rejects wget", try_shell("wget http://x"):find("rejected by guard", 1, true) ~= nil)
+-- 管道内的 head 同样拦截
+test("guard rejects head in pipe",
+  try_shell("cat file | head -2"):find("rejected by guard", 1, true) ~= nil)
+-- 裸 lua REPL 拒绝（含提示）
+local g_lua = try_shell("lua")
+test("guard rejects bare lua REPL", type(g_lua) == "string"
+  and g_lua:find("interactive REPL", 1, true) ~= nil, tostring(g_lua):sub(1, 200))
+test("guard rejects bare luac REPL",
+  try_shell("luac # comment"):find("rejected by guard", 1, true) ~= nil)
+-- 带参数的 lua 放行（不触发护栏; mock 环境无真 shell，结果非拒绝即可）
+local g_lua_e = try_shell('lua -e "print(1)"')
+test("guard allows lua -e", type(g_lua_e) == "string"
+  and g_lua_e:find("rejected by guard", 1, true) == nil
+  and g_lua_e:find("interactive REPL", 1, true) == nil, tostring(g_lua_e):sub(1, 120))
+-- 非 Unix 命令放行（echo 在 mock/真实环境都安全）
+local g_echo = try_shell("echo hi")
+test("guard allows normal commands", type(g_echo) == "string"
+  and g_echo:find("rejected by guard", 1, true) == nil, tostring(g_echo):sub(1, 120))
+
+print("")
+print("═══════════════════════════════════════")
+print("TUI Tests (agent.tui, oc-ai 参考)")
+print("═══════════════════════════════════════")
+
+local ok_tui, tui_mod = pcall(require, "agent.tui")
+test("tui module loads", ok_tui and type(tui_mod) == "table", tostring(ok_tui))
+if ok_tui and type(tui_mod) == "table" then
+  test("tui init without gpu (degraded)", (function()
+    local ok_i, err = pcall(tui_mod.init)
+    return ok_i, err
+  end)())
+  -- print → history 追加（绘制静默失败，逻辑仍工作）
+  tui_mod.init()
+  local h0 = #tui_mod.history()
+  tui_mod.print("hello tui")
+  test("tui.print appends history", #tui_mod.history() == h0 + 1,
+    "#=" .. tostring(#tui_mod.history()))
+  -- 长文本换行（宽度 80）
+  tui_mod.print(string.rep("word ", 30))
+  test("tui.print wraps long text", #tui_mod.history() > h0 + 2,
+    "#=" .. tostring(#tui_mod.history()))
+  -- 中文（无 unicode mock 时按字节降级）
+  tui_mod.print("中文测试消息中文测试消息中文测试消息中文测试消息中文测试消息中文测试消息中文测试消息")
+  test("tui.print handles chinese", #tui_mod.history() > h0 + 3)
+  -- 角色前缀
+  tui_mod.printRole("user", "question?")
+  tui_mod.printRole("error", "boom")
+  local hist = tui_mod.history()
+  test("tui.printRole prefixes",
+    hist[#hist - 1].text:sub(1, 2) == "> "
+    and hist[#hist].text:sub(1, 6) == "Error:",
+    hist[#hist - 1].text:sub(1, 10) .. " | " .. hist[#hist].text:sub(1, 10))
+  -- 工具调用显示截断
+  tui_mod.printToolCall("shell_execute", '{"command":"' .. string.rep("x", 150) .. '"}')
+  local hist2 = tui_mod.history()
+  test("tui.printToolCall truncates args",
+    hist2[#hist2].text:find("...", 1, true) ~= nil
+    and #hist2[#hist2].text <= 105, "#=" .. tostring(#hist2[#hist2].text))
+  -- 滚动不崩 + 状态设置
+  local ok_scroll = pcall(tui_mod.scrollUp, 5)
+  test("tui.scrollUp safe", ok_scroll)
+  local ok_sd = pcall(tui_mod.setStatus, "Testing...")
+  test("tui.setStatus safe", ok_sd)
+  -- 补全候选注册（静态列表，不经 UI）
+  local ok_comp = pcall(tui_mod.setCompletions, {"/help", "/ctx", "read_file"})
+  test("tui.setCompletions safe", ok_comp)
+  -- 清理
+  pcall(tui_mod.cleanup)
+end
 
 print("")
 print("═══════════════════════════════════════")

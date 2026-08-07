@@ -36,6 +36,7 @@ local BUILTIN = {
   "agent.tools.shell",
   "agent.tools.subagent",
   "agent.tools.question",
+  "agent.tools.compact",
 }
 
 -- Names already loaded by the BUILTIN loop (below). scan_dir skips these
