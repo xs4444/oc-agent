@@ -1637,7 +1637,12 @@ function tui.init(config)
   local ok, w, h = pcall(function()
     return component.gpu and component.gpu.getResolution()
   end)
-  state.width, state.height = (ok and w) or 80, (ok and h) or 25
+  -- 异常分辨率兜底（某些模拟器/远控返回怪异值 → 标准 80x25）
+  if not ok or type(w) ~= "number" or type(h) ~= "number"
+      or w < 20 or h < 8 or w > 320 or h > 160 then
+    w, h = 80, 25
+  end
+  state.width, state.height = w, h
   state.running = true
   state.scrollOffset = 0
   state.history = {}
@@ -1671,6 +1676,7 @@ end
 -- 绘制 header（第 1 行）
 function tui.drawHeader()
   local g = component.gpu
+  if not g then return end  -- 无 gpu（测试/降级环境）静默
   g.setBackground(tui.colors.status)
   g.setForeground(tui.colors.statusText)
   g.fill(1, 1, state.width, 1, " ")
@@ -1686,6 +1692,7 @@ end
 -- 绘制状态栏（h-1 行: status 左 + 动态数据右 + scroll 指示）
 function tui.drawStatus()
   local g = component.gpu
+  if not g then return end  -- 无 gpu（测试/降级环境）静默
   local y = state.height - 1
   g.setBackground(tui.colors.status)
   g.setForeground(tui.colors.statusText)
@@ -1866,6 +1873,7 @@ end
 -- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示）
 function tui.drawInput()
   local g = component.gpu
+  if not g then return end  -- 无 gpu（测试/降级环境）静默
   local y = state.height
   g.setBackground(tui.colors.background)
   g.fill(1, y, state.width, 1, " ")
@@ -1982,15 +1990,20 @@ function tui.readInput()
       local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
       if ch == 13 then -- Enter
         local line = state.inputBuffer
-        if line ~= "" then
+        if line == "" then
+          -- 空回车: 留在输入循环（重绘输入行）——不返回主循环，
+          -- 避免终端换行/状态栏闪烁等副作用
+          state.completionCycle = nil
+          pcall(tui.drawInput)
+        else
           state.cmdHistory[#state.cmdHistory + 1] = line
           if #state.cmdHistory > 50 then table.remove(state.cmdHistory, 1) end
           tui.print("> " .. line, tui.colors.user)
+          state.cmdHistoryIndex = 0
+          state.savedInput = ""
+          state.completionCycle = nil
+          return line
         end
-        state.cmdHistoryIndex = 0
-        state.savedInput = ""
-        state.completionCycle = nil
-        return line
       elseif ch == 8 or code == 14 then -- Backspace（限最后一行，不删 \n）
         if state.inputCursor > line_start then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
@@ -2101,6 +2114,47 @@ end
 -- 测试/调试只读: 内容区消息列表 {text, color}
 function tui.history()
   return state.history
+end
+
+-- 进入 TUI 时显示会话历史（填充内容区，避免空屏/下半空白）:
+-- 最近优先，最多 30 条，每条截断 200 字符；跳过 folded 折叠段与空内容；
+-- 摘要消息（[对话摘要] system）以 dim 色显示。按旧→新顺序打印。
+function tui.printHistory(messages)
+  if type(messages) ~= "table" then return end
+  local collected = {}
+  for i = #messages, 1, -1 do
+    if #collected >= 30 then break end
+    local m = messages[i]
+    if m and not m.folded then
+      if m.role == "user" then
+        local c = tostring(m.content or ""):sub(1, 200)
+        if c ~= "" then collected[#collected + 1] = {role = "user", text = c} end
+      elseif m.role == "assistant" and m.content then
+        local c = tostring(m.content):sub(1, 200)
+        if c ~= "" then collected[#collected + 1] = {role = "assistant", text = c} end
+      elseif m.role == "system" and type(m.content) == "string"
+          and m.content:match("^%[对话摘要%]") then
+        collected[#collected + 1] = {role = "system", text = tostring(m.content):sub(1, 200)}
+      end
+    end
+  end
+  for i = #collected, 1, -1 do
+    local e = collected[i]
+    if e.role == "user" then
+      tui.printRole("user", e.text)
+    elseif e.role == "assistant" then
+      tui.printRole("assistant", e.text)
+    else
+      tui.print(e.text, tui.colors.dim)
+    end
+  end
+end
+
+-- 测试钩子: 直接设置输入 buffer（模拟粘贴结果）——ocvm 上事件循环模拟
+-- 不可靠（协程 event.pull 卡死），真机验证渲染路径用此钩子。
+function tui.debug_set_buffer(s)
+  state.inputBuffer = tostring(s or "")
+  state.inputCursor = ulen(state.inputBuffer)
 end
 
 return tui
@@ -3997,6 +4051,8 @@ end
       ui.init(mono and {monochrome = true} or nil)
       ui.print("OC Agent TUI ready. Model: " .. config.model)
       ui.print("Type /help for commands.", ui.colors.dim)
+      -- 进入 TUI 显示当前会话历史（填充内容区——避免空屏/输入区占半屏感知）
+      ui.printHistory(messages)
       -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
       print = function(s) ui.print(s, ui.colors.dim) end
       -- 状态栏右侧: 上下文占用 + 缓存命中 + 模型（opencode TUI 同款数据）

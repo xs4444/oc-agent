@@ -1180,6 +1180,37 @@ if ok_tui and type(tui_mod) == "table" then
   -- 补全候选注册（静态列表，不经 UI）
   local ok_comp = pcall(tui_mod.setCompletions, {"/help", "/ctx", "read_file"})
   test("tui.setCompletions safe", ok_comp)
+  -- 多行粘贴钩子（ocvm 事件循环模拟不可靠，用 debug_set_buffer 验证渲染路径）
+  local ok_set = pcall(tui_mod.debug_set_buffer, "line1\nline2\nline3")
+  test("tui.debug_set_buffer safe", ok_set)
+  local ok_multi = pcall(tui_mod.drawInput)
+  test("tui.drawInput multiline safe", ok_multi)
+  pcall(tui_mod.debug_set_buffer, "single")
+  local ok_single2 = pcall(tui_mod.drawInput)
+  test("tui.drawInput singleline safe", ok_single2)
+  -- printHistory: 会话历史填充内容区（截断/跳过 folded/角色色/顺序）
+  tui_mod.init()
+  local ph_msgs = {
+    {role = "system", content = "[对话摘要] 摘要内容"},
+    {role = "user", content = "历史问题1"},
+    {role = "user", content = "折叠消息", folded = true},
+    {role = "assistant", content = string.rep("很长的回答", 50)},
+    {role = "user", content = "最近问题"},
+  }
+  local ph0 = #tui_mod.history()
+  pcall(tui_mod.printHistory, ph_msgs)
+  local ph_hist = tui_mod.history()
+  local ph_joined = ""
+  for i = ph0 + 1, #ph_hist do ph_joined = ph_joined .. ph_hist[i].text end
+  test("printHistory renders history",
+    ph_joined:find("历史问题1", 1, true) ~= nil
+    and ph_joined:find("最近问题", 1, true) ~= nil
+    and ph_joined:find("对话摘要", 1, true) ~= nil,
+    ph_joined:sub(1, 150))
+  test("printHistory skips folded", ph_joined:find("折叠消息", 1, true) == nil,
+    ph_joined:sub(1, 150))
+  test("printHistory truncates long entries",
+    #ph_hist[#ph_hist].text <= 205, "#=" .. tostring(#ph_hist[#ph_hist].text))
   -- 清理
   pcall(tui_mod.cleanup)
 end

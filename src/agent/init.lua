@@ -949,6 +949,8 @@ end
       ui.init(mono and {monochrome = true} or nil)
       ui.print("OC Agent TUI ready. Model: " .. config.model)
       ui.print("Type /help for commands.", ui.colors.dim)
+      -- 进入 TUI 显示当前会话历史（填充内容区——避免空屏/输入区占半屏感知）
+      ui.printHistory(messages)
       -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
       print = function(s) ui.print(s, ui.colors.dim) end
       -- 状态栏右侧: 上下文占用 + 缓存命中 + 模型（opencode TUI 同款数据）
