@@ -470,13 +470,32 @@ local injected_chat
 -- overridable via set_paths (used by tests).
 local history_path = config_mod.history_path
 
-local MAX_HISTORY = 20
-local MAX_HISTORY_BYTES = 50000  -- ~50KB budget; large tool results trimmed away
+-- 历史/trim 预算（OC 内存约束）与压缩触发（模型窗口约束）:
+--   - trim: 200KB / 60 条 —— 2MB 内存下历史+编码峰值 ~600KB，安全
+--   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
+-- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
+-- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
+local MAX_HISTORY = 60
+local MAX_HISTORY_BYTES = 200000  -- ~200KB budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 
-local COMPACT_KEEP = 4          -- recent messages kept verbatim after compaction
-local COMPACT_TRIGGER_COUNT = 16  -- auto-compact when history exceeds this many messages
-local COMPACT_TRIGGER_BYTES = 40000 -- ... or this many bytes (of the 50KB budget)
+local COMPACT_KEEP = 4          -- 保留条数下限
+local COMPACT_KEEP_MIN_TOKENS = 1500  -- 保留 token 保底（不足时向前补充，
+                                      -- opencode-acp 的条数+token 双轨思路）
+local COMPACT_KEEP_MAX = 8      -- 保留条数封顶（防小消息全保留、压缩无效）
+local COMPACT_TRIGGER_COUNT = 48  -- 条数兜底（trim 60 条的 80%，防海量小消息退化）
+local COMPACT_WINDOW_RATIO = 0.6  -- 主触发: 估算 tokens ≥ 窗口 × 0.6（tokens 上限阈值驱动）
+
+-- 估算 token（与 init.lua 同款）: 英文 ~4 字符/token，中文按 0.45 token/字节
+local function estimate_tokens(s)
+  if not s then return 0 end
+  s = tostring(s)
+  local ascii, non_ascii = 0, 0
+  for i = 1, #s do
+    if s:byte(i) < 128 then ascii = ascii + 1 else non_ascii = non_ascii + 1 end
+  end
+  return math.floor(ascii / 4 + non_ascii * 0.45)
+end
 
 local function msg_bytes(msg)
   local total = 0
@@ -572,12 +591,24 @@ end
 -- Compact: replace older messages with an LLM summary, keep recent verbatim.
 -- Anchored: if the history already starts with a summary (system message),
 -- the new summary is an UPDATE of it (opencode-style), preserving old facts.
+-- 保留策略（opencode-acp 双轨）: 至少 COMPACT_KEEP 条，估算 token 不足
+-- COMPACT_KEEP_MIN_TOKENS 时向前补充，封顶 COMPACT_KEEP_MAX 条。
 -- Returns new message list on success, nil on failure (caller falls back to trim).
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
+  local keep = COMPACT_KEEP
+  local est = 0
+  for i = #messages, #messages - keep + 1, -1 do
+    est = est + estimate_tokens(messages[i].content or "")
+  end
+  while keep < COMPACT_KEEP_MAX and est < COMPACT_KEEP_MIN_TOKENS
+      and #messages - keep >= 1 do
+    keep = keep + 1
+    est = est + estimate_tokens(messages[#messages - keep + 1].content or "")
+  end
   local previous_summary
   local old = {}
-  for i = 1, #messages - COMPACT_KEEP do
+  for i = 1, #messages - keep do
     local m = messages[i]
     if m.role == "system" and type(m.content) == "string" then
       local s = m.content:match("^%[对话摘要%] (.*)$")
@@ -595,20 +626,27 @@ local function compact_history(messages, config)
   if not summary then return nil end
 
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
-  for i = #messages - COMPACT_KEEP + 1, #messages do
+  for i = #messages - keep + 1, #messages do
     result[#result + 1] = messages[i]
   end
   return result
 end
 
--- Decide whether compaction is worthwhile before trimming
-local function should_compact(messages)
+-- 压缩触发判定（tokens 上限阈值驱动，用户要求按 context_window 比例）:
+--   估算 tokens ≥ 窗口 × COMPACT_WINDOW_RATIO → 压缩；条数 ≥
+--   COMPACT_TRIGGER_COUNT 兜底（防海量小消息退化）。
+-- window 缺省/为 0 时仅按条数。超限场景由 ensure_context_budget 的
+-- 80% 窗口估算先行（压缩失败再 force_trim）。
+local function should_compact(messages, window)
   if #messages <= COMPACT_KEEP + 1 then return false end
   if #messages >= COMPACT_TRIGGER_COUNT then return true end
-  local total = 0
+  local w = tonumber(window) or 0
+  if w <= 0 then return false end
+  local est = 0
   for _, m in ipairs(messages) do
-    total = total + msg_bytes(m)
-    if total >= COMPACT_TRIGGER_BYTES then return true end
+    est = est + estimate_tokens(m.content or "")
+        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+    if est >= w * COMPACT_WINDOW_RATIO then return true end
   end
   return false
 end
@@ -2531,7 +2569,7 @@ local function cmd_ctx(config, messages, usage_override)
   print("└──────────────────────────────")
   print("合计(估算): " .. fmt_num(est_total) .. " tok | 模型: " .. tostring(config.model or "?"))
   -- 压缩状态
-  local ok_sc, sc = pcall(should_compact, messages)
+  local ok_sc, sc = pcall(should_compact, messages, window)
   print("压缩: " .. (ok_sc and sc and "即将触发（超过阈值，可 /compact）" or "未触发") .. " | /ctx 参考 opencode TUI 的 usage 显示")
 end
 
@@ -2799,7 +2837,7 @@ local function ensure_context_budget(messages, config, persist, session)
 
   local est = est_msgs(messages)
   -- 触发: 估算超窗口 80%，或消息条数超阈值
-  if est <= window * 0.8 and not should_compact(messages) then
+  if est <= window * 0.8 and not should_compact(messages, window) then
     return messages, est
   end
 

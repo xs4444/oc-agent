@@ -435,21 +435,41 @@ if compacted then
     and tostring(compacted[1].content):find("对话摘要") ~= nil)
   test("compact keeps last messages", compacted[#compacted].content == "message number 30"
     and compacted[#compacted - 1].content == "message number 29")
-  test("compact shrinks count", #compacted <= 6)
+  -- 保留策略双轨: 小消息时向前补充到 token 保底（封顶 8 条）
+test("compact shrinks count", #compacted <= 9, "#=" .. tostring(#compacted))
+test("compact token floor keeps more small messages", #compacted >= 5, "#=" .. tostring(#compacted))
 end
 
--- should_compact trigger thresholds
-test("should_compact true when many messages",
-  should_compact({{role="u",content="x"},{role="u",content="y"},{role="u",content="z"},
-    {role="u",content="w"},{role="u",content="v"},{role="u",content="q"},
-    {role="u",content="a"},{role="u",content="b"},{role="u",content="c"},
-    {role="u",content="d"},{role="u",content="e"},{role="u",content="f"},
-    {role="u",content="g"},{role="u",content="h"},{role="u",content="i"},{role="u",content="j"},
-    {role="u",content="k"},{role="u",content="l"}}))
+-- should_compact trigger thresholds（窗口比例 0.6 驱动 + 条数 48 兜底）
+local sc_msgs = {}
+for i = 1, 49 do
+  sc_msgs[#sc_msgs + 1] = {role = "u", content = "x"}
+end
+test("should_compact true at count floor (49)", should_compact(sc_msgs, 128000))
 test("should_compact false when short",
   not should_compact({{role="u", content="x"}}))
 test("should_compact false when big bytes but few messages",
   not should_compact({{role="u", content=string.rep("a", 45000)}}))
+-- 窗口比例: est(6×20000B ≈ 30000 tok) ≥ 40000×0.6=24000 → true
+test("should_compact true at 60% window ratio",
+  should_compact({
+    {role="u", content=string.rep("a", 20000)},
+    {role="u", content=string.rep("b", 20000)},
+    {role="u", content=string.rep("c", 20000)},
+    {role="u", content=string.rep("d", 20000)},
+    {role="u", content=string.rep("e", 20000)},
+    {role="u", content=string.rep("f", 20000)},
+  }, 40000))
+-- 窗口比例: est(10×1000B ≈ 2500 tok) < 128000×0.6=76800 → false
+local sc_small = {}
+for i = 1, 10 do
+  sc_small[#sc_small + 1] = {role = "u", content = string.rep("z", 1000)}
+end
+test("should_compact false below 60% window ratio",
+  not should_compact(sc_small, 128000))
+-- 无 window 时仅条数兜底（20 条 < 48 → false）
+test("should_compact no window falls back to count",
+  not should_compact(sc_small, nil))
 
 -- compact_history returns nil when nothing to compact
 test("compact_history nil on tiny history", compact_history({{role="u", content="x"}}, {}) == nil)
@@ -836,20 +856,20 @@ end
 -- trim_history: 保留 messages[1] 头部锚点（缓存前缀跨裁剪存活）
 local trim_history = agent_test.trim_history
 local anchor_msgs = {}
-for i = 1, 30 do
+for i = 1, 70 do
   anchor_msgs[#anchor_msgs + 1] = {role = "user", content = "msg " .. i}
 end
 local trimmed = trim_history(anchor_msgs)
 test("trim_history keeps first message", trimmed[1].content == "msg 1",
   "first=" .. tostring(trimmed[1] and trimmed[1].content))
-test("trim_history caps count", #trimmed <= 20, "#=" .. tostring(#trimmed))
+test("trim_history caps count", #trimmed <= 60, "#=" .. tostring(#trimmed))
 local anchor2 = {}
 for i = 1, 6 do
-  anchor2[#anchor2 + 1] = {role = "user", content = string.rep("x", 15000) .. " m" .. i}
+  anchor2[#anchor2 + 1] = {role = "user", content = string.rep("x", 40000) .. " m" .. i}
 end
 local trimmed2 = trim_history(anchor2)
-test("trim_history byte cap keeps head + last 2",
-  trimmed2[1].content:find("m1") ~= nil and #trimmed2 == 3,
+test("trim_history byte cap keeps head + recent",
+  trimmed2[1].content:find("m1") ~= nil and #trimmed2 == 4,
   "#=" .. tostring(#trimmed2))
 
 -- /ctx + 运行时行: cache hit/miss 显示（usage 字段透传）

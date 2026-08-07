@@ -12,7 +12,7 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 python scripts/build_all.py
 ```
 
-预期输出：`FINAL: 163 pass, 0 fail out of 163 tests`
+预期输出：`FINAL: 167 pass, 0 fail out of 163 tests`
 
 ## 脚本分类
 
@@ -21,7 +21,7 @@ python scripts/build_all.py
 | 脚本 | 用途 |
 |------|------|
 | `oc_mock.lua` | OC API 模拟层（component/computer/filesystem/shell/internet/serialization/**event/modem/thread**），`package.loaded` 注入 `require`；含 chat/completions 端点 mock 与 modem 环路事件队列 |
-| `run_tests.lua` | 主回归（**163 项**）：JSON 编解码（含**控制字符 \u00XX 转义**）+ 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（15 项）+ **/ctx 仪表盘**（tokens/进度条三色/构成/缓存命中率）+ **400 防护**（预算压缩/强制裁剪）+ **多行输入收集** + **前缀缓存静态性**（system prompt 字节稳定/尾部 runtime 块/首消息锚定） |
+| `run_tests.lua` | 主回归（**167 项**）：JSON 编解码（含**控制字符 \u00XX 转义**）+ 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（15 项）+ **/ctx 仪表盘**（tokens/进度条三色/构成/缓存命中率）+ **400 防护**（预算压缩/强制裁剪）+ **多行输入收集** + **前缀缓存静态性**（system prompt 字节稳定/尾部 runtime 块/首消息锚定） |
 | `wire_check.lua` | 本地 mock 捕获 chat() 请求体：核对 tools 数组声明（15 工具在列）+ 系统提示内容（ask_user/离线文档段存在性） |
 | `ustar_check.lua` | 离线文档包 ustar 解析器本地验证（269 条目 / 无 CRLF / 关键文件存在） |
 | `plugin_test.lua` | 插件注册：临时目录写假模块 → scan_dir 注册 → 调用 → 坏模块跳过（12 项） |
