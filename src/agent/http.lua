@@ -11,8 +11,45 @@
 
 local json = require("agent.json")
 
-local MAX_RETRIES = 3            -- retries for transient HTTP failures
-local RETRY_BASE_DELAY = 2       -- seconds, doubled per attempt
+-- ═══════════════════════════════════════════════════════════════
+-- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
+-- 2000ms 基数 ×2，瞬态失败无限重试直到成功或不可重试错误）:
+--   - 瞬态 = 网络错误 / HTTP 429 / 5xx；4xx 永久失败不重试
+--   - 总重试预算 MAX_RETRY_BUDGET 秒（默认 1 小时）——预算耗尽返回
+--     最后一次结果。opencode 无总预算（单请求可挂 24 天），但 OC
+--     单线程场景必须有界（用户指定上限 1 小时）
+--   - 单次等待封顶 RETRY_DELAY_CAP（300s），避免极端退避
+-- 讯飞星辰等免费端点频繁 429/慢响应，需要更长的重试窗口。
+-- ═══════════════════════════════════════════════════════════════
+local RETRY_BASE_DELAY = 2         -- 指数退避基数（秒）
+local RETRY_DELAY_CAP = 300        -- 单次等待封顶（秒）
+-- 总重试预算: 生产 1 小时；测试环境（_TEST_MODE）缩短为 60s，
+-- 避免 e2e/回归在端点持续故障时长时间挂起
+local MAX_RETRY_BUDGET = _TEST_MODE and 60 or 3600
+
+-- POST with automatic retry（指数退避 + 总预算上限）
+local function http_post(url, headers, body)
+  local attempt = 0
+  local deadline = os.clock() + MAX_RETRY_BUDGET
+  while true do
+    attempt = attempt + 1
+    local code, resp, err = http_post_once(url, headers, body)
+    local transient = err ~= nil or code == 429 or (code and code >= 500)
+    if not transient then
+      return code, resp, err
+    end
+    local now = os.clock()
+    if now >= deadline then
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      return code, resp, err
+    end
+    local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
+    if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
+    local remaining = deadline - now
+    if wait > remaining then wait = remaining end
+    os.sleep(wait)
+  end
+end
 
 -- Single request attempt. Returns code, body, err.
 local function http_post_once(url, headers, body)
@@ -60,20 +97,27 @@ local function http_post_once(url, headers, body)
   return code or 0, response_body, nil
 end
 
--- POST with automatic retry: transient failures (network errors, 429, 5xx)
--- are retried with exponential backoff. 4xx errors are permanent, never retried.
+-- POST with automatic retry（指数退避 + 总预算上限，见上方常量说明）
 local function http_post(url, headers, body)
-  for attempt = 1, MAX_RETRIES + 1 do
+  local attempt = 0
+  local deadline = os.clock() + MAX_RETRY_BUDGET
+  while true do
+    attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
-    if err then
-      if attempt > MAX_RETRIES then return code, resp, err end
-    else
-      local transient = (code == 429 or code >= 500)
-      if not transient or attempt > MAX_RETRIES then
-        return code, resp, err
-      end
+    local transient = err ~= nil or code == 429 or (code and code >= 500)
+    if not transient then
+      return code, resp, err
     end
-    os.sleep(RETRY_BASE_DELAY * 2 ^ (attempt - 1))
+    local now = os.clock()
+    if now >= deadline then
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      return code, resp, err
+    end
+    local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
+    if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
+    local remaining = deadline - now
+    if wait > remaining then wait = remaining end
+    os.sleep(wait)
   end
 end
 

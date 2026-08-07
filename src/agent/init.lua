@@ -199,15 +199,40 @@ local function ctx_bar(pct, width)
   return color .. string.rep("█", filled) .. string.rep("░", width - filled) .. "\27[0m"
 end
 
+-- 缓存命中统计: 兼容两种 provider 上报格式
+--   DeepSeek/zen:        usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+--   讯飞星辰(kimi)/OpenAI 新格式: usage.prompt_tokens_details.cached_tokens
+-- 返回 hit, miss（无缓存字段或 hit=0 时返回 nil）
+local function cache_stats(usage)
+  if not usage or not usage.prompt_tokens then return nil end
+  local hit = usage.prompt_cache_hit_tokens
+  if hit == nil and usage.prompt_tokens_details then
+    hit = usage.prompt_tokens_details.cached_tokens
+  end
+  hit = hit or 0
+  if hit <= 0 then return nil end
+  local miss = usage.prompt_cache_miss_tokens
+  if miss == nil then
+    miss = math.max(0, (usage.prompt_tokens or 0) - hit)
+  end
+  return hit, miss
+end
+
 -- 运行时上下文自动显示: 每次 LLM 响应后一行（opencode TUI 底栏同款数据）
 local function show_ctx_line(usage, config)
   if not (usage and usage.prompt_tokens) then return end
   local window = tonumber(config.context_window) or 128000
   local total = usage.prompt_tokens
   local pct = window > 0 and (total / window) or 0
+  local line = "[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
+    .. string.format("%.1f", pct * 100) .. "%) " .. ctx_bar(pct, 20)
+  -- 缓存命中率（provider 上报；无字段/全 miss 则不显示）
+  local hit, miss = cache_stats(usage)
+  if hit and hit + miss > 0 then
+    line = line .. "  cache " .. string.format("%.0f%%", hit / (hit + miss) * 100)
+  end
   print("")
-  print("[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
-    .. string.format("%.1f", pct * 100) .. "%) " .. ctx_bar(pct, 20))
+  print(line)
 end
 
 local function cmd_ctx(config, messages, usage_override)
@@ -222,6 +247,12 @@ local function cmd_ctx(config, messages, usage_override)
     print(ctx_bar(pct, 40) .. "  " .. string.format("%.1f%%", pct * 100))
     if usage.completion_tokens then
       print("输出: " .. fmt_num(usage.completion_tokens) .. " tokens")
+    end
+    -- 缓存计费: provider 上报的缓存命中/未命中（DeepSeek 或 OpenAI 新格式）
+    local hit, miss = cache_stats(usage)
+    if hit then
+      print("缓存: 命中 " .. fmt_num(hit) .. " / 未命中 " .. fmt_num(miss) .. " tokens ("
+        .. string.format("%.0f", hit / (hit + miss) * 100) .. "% hit)")
     end
   else
     print("尚无请求记录（发一条消息后刷新）")
@@ -477,7 +508,8 @@ end
 -- user input, runs the LLM tool-calling loop, returns the final text
 -- (concatenated assistant content) and updates `messages`.
 
--- 强制裁剪: 丢弃最早消息直到估算 tokens < 窗口 60% 或只剩 4 条。
+-- 强制裁剪: 丢弃最早消息直到估算 tokens < 窗口 60% 或只剩 5 条。
+-- 保留 messages[1]（首个 user 消息 = 前缀缓存锚点），从第 2 条开始丢。
 -- 用于压缩失败（LLM 已超限，summarize 同样 400）与 400 重试路径。
 -- 返回裁剪后的估算值。
 local function force_trim(messages, config)
@@ -488,9 +520,11 @@ local function force_trim(messages, config)
     est = est + estimate_tokens(m.content or "")
         + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
   end
-  while #messages > 4 and est > target do
-    est = est - estimate_tokens(messages[1].content or "")
-    table.remove(messages, 1)
+  -- 保留头部锚点（缓存前缀），最低 1 + 4 条
+  while #messages > 5 and est > target do
+    est = est - estimate_tokens(messages[2].content or "")
+        - estimate_tokens(messages[2].tool_calls and tostring(messages[2].tool_calls) or "")
+    table.remove(messages, 2)
   end
   return est
 end
@@ -845,6 +879,7 @@ if _TEST_MODE then
     chat = chat,
     http_post = http_post,
     build_system_prompt = chat_mod.build_system_prompt,
+    build_runtime_block = chat_mod.build_runtime_block,
     trim_history = trim_history,
     compact_history = compact_history,
     should_compact = should_compact,
@@ -859,6 +894,7 @@ if _TEST_MODE then
     estimate_tokens = estimate_tokens,
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
+    cache_stats = cache_stats,
     collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,

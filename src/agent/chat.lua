@@ -25,18 +25,21 @@ local function safe_call(fn, ...)
   return nil
 end
 
-local function build_system_prompt()
-  local computer = require("computer")
-  local component = require("component")
+-- ═══════════════════════════════════════════════════════════════
+-- Prompt caching (DeepSeek 前缀缓存/计费):
+-- build_system_prompt() 惰性 memoize——每进程只算一次，此后字节稳定。
+-- 运行时变化的数据（uptime / freeMemory / 实时组件列表）移入
+-- build_runtime_block()，由 chat() 追加为请求的最后一条消息。
+-- 头部（system + tools + 历史前缀）字节稳定 → 后续请求命中缓存前缀，
+-- 只按 miss 部分计费；变化的尾部不进缓存前缀，成本仅自身 token。
+-- ═══════════════════════════════════════════════════════════════
+local CACHED_SYSTEM_PROMPT = nil
 
-  local comp_list = {}
-  for addr, typ in component.list() do
-    comp_list[#comp_list + 1] = addr:sub(1, 8) .. "... = " .. typ
-  end
+local function build_system_prompt()
+  if CACHED_SYSTEM_PROMPT then return CACHED_SYSTEM_PROMPT end
+  local computer = require("computer")
 
   local address = safe_call(computer.address) or "unknown"
-  local uptime = safe_call(computer.uptime) or 0
-  local free_mem = safe_call(computer.freeMemory) or 0
   -- 离线文档探测: /mnt/<x>/doc/version.txt 存在即视为已安装（挂载短名每次
   -- 重启会变，不能硬编码路径；仅几个 fs 调用，开销可忽略）
   local doc_path
@@ -68,7 +71,7 @@ local function build_system_prompt()
     end
   end
 
-  return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+  CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
     .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
     .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
@@ -106,6 +109,24 @@ local function build_system_prompt()
     .. "2. component_doc(address) to learn what methods a component has\n"
     .. "3. component_doc(address, method) for method details, then component_invoke to call it\n\n"
     .. "Current computer address: " .. tostring(address) .. "\n"
+  return CACHED_SYSTEM_PROMPT
+end
+
+-- 运行时状态块: 每次请求重新生成（uptime/freeMemory/组件列表会变），由
+-- chat() 追加为请求的最后一条消息——不入历史、不进缓存前缀。内容显式标记
+-- 为机器生成上下文，避免模型误当作用户输入。
+local function build_runtime_block()
+  local computer = require("computer")
+  local component = require("component")
+
+  local comp_list = {}
+  for addr, typ in component.list() do
+    comp_list[#comp_list + 1] = addr:sub(1, 8) .. "... = " .. typ
+  end
+
+  local uptime = safe_call(computer.uptime) or 0
+  local free_mem = safe_call(computer.freeMemory) or 0
+  return "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
     .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
     .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
     .. "Connected components:\n" .. table.concat(comp_list, "\n")
@@ -132,6 +153,10 @@ local function chat(messages, config)
   for _, msg in ipairs(messages) do
     api_messages[#api_messages + 1] = msg
   end
+  -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
+  -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容
+  -- 端点都接受，且不影响工具调用循环。
+  api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
 
   local body = json.encode({
     model = config.model or "deepseek-v4-flash-free",
@@ -178,6 +203,7 @@ end
 return {
   safe_call = safe_call,
   build_system_prompt = build_system_prompt,
+  build_runtime_block = build_runtime_block,
   build_headers = build_headers,
   chat = chat,
 }

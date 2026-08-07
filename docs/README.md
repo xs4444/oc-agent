@@ -47,6 +47,7 @@ docs/
 - **JSON 控制字符转义**：全控制字符（\x00-\x1f、\x7f）转义为 \u00XX——裸控制字符产出非法 JSON，服务端 400（实测 0.7% 上下文时的 400 即此因）
 - **多行输入 /ml**：逐行收集到 EOF 合并为一条消息（粘贴多行代码场景；OC 无 bracketed paste，ocvm 精简 OpenOS 无 term.paste 处理，逐行最稳）
 - **离线文档 docs.lua**：GTNH wiki markdown 可选下载（纯 Lua ustar 解包，零依赖）；交互引导安装（候选盘容量/系统盘排除）+ 卸载 + status；docs.json 版本对比跳过重复下载；v0.3.3 起纳入分发清单（update.lua 自动更新）
-- **发版自动化**：build_all.py（构建+清单+142 项回归）→ release_check.py（版本 bump/清单/字节/语法检查）→ watch_release.py（jsDelivr 索引监控）——杜绝 v0.3.2 类"版本未 bump 服务器嗅探不到"事故
+- **发版自动化**：build_all.py（构建+清单+163 项回归）→ release_check.py（版本 bump/清单/字节/语法检查）→ watch_release.py（jsDelivr 索引监控）——杜绝 v0.3.2 类"版本未 bump 服务器嗅探不到"事故
+- **前缀缓存计费优化**：system prompt 静态化（进程内 memoize，字节稳定）+ uptime/freeMemory/组件列表移入请求尾部 runtime 块 → 前缀缓存命中（讯飞 kimi k2.6 实测 2432/2669 = 91%）；`/ctx`/`[ctx]` 显示缓存命中率（兼容 DeepSeek 与 OpenAI 新格式 usage 字段）；trim_history/force_trim 保留首条消息锚定缓存前缀；http 重试改为 opencode 风格指数退避（总预算 1 小时，测试环境 60s）
 
 核心架构（两级循环 + 工具契约 + 动态系统提示）与设计文档一致。

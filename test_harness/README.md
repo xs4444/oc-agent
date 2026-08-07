@@ -12,7 +12,7 @@ agent.lua 的测试套件：本地 mock 回归 + 模拟器（ocvm / OCEmu）内�
 python scripts/build_all.py
 ```
 
-预期输出：`FINAL: 142 pass, 0 fail out of 142 tests`
+预期输出：`FINAL: 163 pass, 0 fail out of 163 tests`
 
 ## 脚本分类
 
@@ -21,7 +21,7 @@ python scripts/build_all.py
 | 脚本 | 用途 |
 |------|------|
 | `oc_mock.lua` | OC API 模拟层（component/computer/filesystem/shell/internet/serialization/**event/modem/thread**），`package.loaded` 注入 `require`；含 chat/completions 端点 mock 与 modem 环路事件队列 |
-| `run_tests.lua` | 主回归（**142 项**）：JSON 编解码（含**控制字符 \u00XX 转义**）+ 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（15 项）+ **/ctx 仪表盘**（tokens/进度条三色/构成）+ **400 防护**（预算压缩/强制裁剪）+ **多行输入收集** |
+| `run_tests.lua` | 主回归（**163 项**）：JSON 编解码（含**控制字符 \u00XX 转义**）+ 工具执行 + compaction + **append-only 会话日志** + **子代理协议/会话持久化** + **TOOLS 显式清单双向校验**（15 项）+ **/ctx 仪表盘**（tokens/进度条三色/构成/缓存命中率）+ **400 防护**（预算压缩/强制裁剪）+ **多行输入收集** + **前缀缓存静态性**（system prompt 字节稳定/尾部 runtime 块/首消息锚定） |
 | `wire_check.lua` | 本地 mock 捕获 chat() 请求体：核对 tools 数组声明（15 工具在列）+ 系统提示内容（ask_user/离线文档段存在性） |
 | `ustar_check.lua` | 离线文档包 ustar 解析器本地验证（269 条目 / 无 CRLF / 关键文件存在） |
 | `plugin_test.lua` | 插件注册：临时目录写假模块 → scan_dir 注册 → 调用 → 坏模块跳过（12 项） |
@@ -64,6 +64,7 @@ python scripts/build_all.py
 | `reasoning_e2e_test.lua` | **reasoning_content 传回 e2e**：完整工具链（thinking 输出 + calc 调用 + 第二轮请求带 reasoning_content）→ 无 400（3/3） |
 | `json_ctrl_e2e_test.lua` | **JSON 控制字符修复 e2e**：tool 结果含 \x00/\x1b 的合法消息序列 → 真实端点 200（修复前 400） |
 | `ctx_display_test.lua` | **/ctx 渲染真机验证**：加载 + ANSI 进度条 + 消息构成输出（无网络依赖） |
+| `cache_e2e_test.lua` | **前缀缓存命中真机 e2e**：两次顺序 chat() 请求 → 断言尾部 runtime 消息被端点接受 + 第 2 次请求缓存命中 >0（兼容 DeepSeek/OpenAI 新格式字段；讯飞 kimi k2.6 实测 91% 命中） |
 | `test_docs_lua.lua` | **docs.lua 端到端**（注入假网络）：版本对比跳过（tar 只下载一次）+ ustar 解压 269 文件 + version.txt |
 | `test_docs_interact.lua` | **docs.lua 交互引导全流程**（10 项）：路径安装/status 检测/交互选盘/交互卸载/卸载后确认 |
 | `thread_diag_test.lua` | **协作式调度诊断**：确认纯 CPU 死循环（`while true do end` 永不 yield）在 OpenOS 中饿死主线程，任何 Lua 层超时无法中断（平台限制，真实 OC 同样如此） |
@@ -110,7 +111,7 @@ lua /mnt/<挂载短名>/search_test.lua /mnt/<挂载短名> <api_key> <model> <a
 
 ## 测试约定
 
-- agent.lua 加载时 `_TEST_MODE = true` 跳过 `main()`，暴露 `agent_test` 钩子表（chat/http_post/build_system_prompt/trim_history/compact_history/should_compact/summarize_history/process_exchange/wait_modem_message/load_history/append_history/rebuild_history/set_history_path/cmd_ctx/estimate_tokens/ctx_bar/show_ctx_line/collect_multiline/ensure_context_budget/force_trim/TOOLS）
+- agent.lua 加载时 `_TEST_MODE = true` 跳过 `main()`，暴露 `agent_test` 钩子表（chat/http_post/build_system_prompt/**build_runtime_block**/trim_history/compact_history/should_compact/summarize_history/process_exchange/wait_modem_message/load_history/append_history/rebuild_history/set_history_path/cmd_ctx/estimate_tokens/ctx_bar/show_ctx_line/**cache_stats**/collect_multiline/ensure_context_budget/force_trim/TOOLS）
 - TOOLS 断言：`run_tests.lua` 定义 `EXPECTED_TOOLS` 显式清单（15 项），双向校验（无缺失 + 无多余）——**新增工具必须在清单登记**，否则测试失败
 - 脚本内不用 `arg` 全局（OpenOS 的 lua 无此变量），参数用 `{...}` vararg
 - 结果实时写入文件（OpenOS 崩溃时保留部分结果）；ocvm 驱动自动保存副本到 `results/`（gitignored）

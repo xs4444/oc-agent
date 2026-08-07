@@ -589,7 +589,8 @@ for i = 1, 20 do
 end
 local cfg_small = {context_window = 40000}
 local est = agent_test.force_trim(msgs_big, cfg_small)
-test("force_trim cuts to min 4 msgs", #msgs_big == 4, "#=" .. tostring(#msgs_big))
+test("force_trim cuts to min 5 msgs (head + 4)", #msgs_big == 5, "#=" .. tostring(#msgs_big))
+test("force_trim keeps head anchor", msgs_big[1].content == big_content)
 test("force_trim keeps system+recent", msgs_big[#msgs_big].role == "assistant")
 test("force_trim returns estimate", type(est) == "number" and est > 0)
 
@@ -772,6 +773,125 @@ test("session id sanitize",
 
 os.remove(session_file)
 os.execute("rmdir test_session_temp 2>nul")
+
+print("")
+print("═══════════════════════════════════════")
+print("Prompt Cache (Prefix Cache) Tests")
+print("═══════════════════════════════════════")
+
+-- build_system_prompt(): memoized + byte-stable（DeepSeek 前缀缓存锚点）
+local sys_a = agent_test.build_system_prompt()
+local sys_b = agent_test.build_system_prompt()
+test("system prompt byte-stable across calls", sys_a == sys_b)
+test("system prompt has no runtime data",
+  type(sys_a) == "string" and not sys_a:find("Uptime:") and not sys_a:find("Free memory:")
+  and not sys_a:find("Connected components:"))
+test("system prompt keeps static content", sys_a:find("Current computer address:") ~= nil)
+
+-- build_runtime_block(): 每次请求重新生成（uptime 变化 → 内容变化）
+local rt_a, rt_b
+do
+  local real_uptime = computer.uptime
+  computer.uptime = function() return 1000 end
+  rt_a = agent_test.build_runtime_block()
+  computer.uptime = function() return 2000 end
+  rt_b = agent_test.build_runtime_block()
+  computer.uptime = real_uptime
+end
+test("runtime block changes between calls", rt_a ~= rt_b)
+test("runtime block carries dynamic fields",
+  rt_a:find("Uptime: 1000") ~= nil and rt_a:find("Free memory:") ~= nil
+  and rt_a:find("Connected components:") ~= nil, rt_a:sub(1, 200))
+
+-- chat(): 尾部追加 runtime 消息 + system 保持静态（包装 internet.request 捕获请求体）
+local rt_live = agent_test.build_runtime_block()
+local captured = nil
+local real_request = internet.request
+internet.request = function(url, data, headers, method)
+  captured = data
+  return real_request(url, data, headers, method)
+end
+local chat_resp = agent_test.chat(
+  {{role = "user", content = "hi"}},
+  {api_key = "test", model = "mock", api_url = "https://example.test/chat/completions"})
+internet.request = real_request
+test("chat() mock round-trip", type(chat_resp) == "table" and chat_resp.content ~= nil,
+  "resp=" .. tostring(chat_resp and chat_resp.content or chat_resp))
+local ok_body, body = pcall(json.decode, captured or "")
+test("chat() body decodes", ok_body and type(body) == "table")
+if ok_body and type(body) == "table" then
+  test("chat() first message = static system prompt",
+    body.messages[1].role == "system" and body.messages[1].content == sys_a)
+  local last = body.messages[#body.messages]
+  test("chat() last message = runtime block",
+    last and last.role == "user" and last.content == rt_live
+    and last.content:find("runtime status") ~= nil,
+    "last role=" .. tostring(last and last.role) .. " content="
+      .. tostring(last and last.content):sub(1, 100))
+  test("chat() conversation preserved before tail",
+    body.messages[#body.messages - 1].role == "user"
+    and body.messages[#body.messages - 1].content == "hi")
+end
+
+-- trim_history: 保留 messages[1] 头部锚点（缓存前缀跨裁剪存活）
+local trim_history = agent_test.trim_history
+local anchor_msgs = {}
+for i = 1, 30 do
+  anchor_msgs[#anchor_msgs + 1] = {role = "user", content = "msg " .. i}
+end
+local trimmed = trim_history(anchor_msgs)
+test("trim_history keeps first message", trimmed[1].content == "msg 1",
+  "first=" .. tostring(trimmed[1] and trimmed[1].content))
+test("trim_history caps count", #trimmed <= 20, "#=" .. tostring(#trimmed))
+local anchor2 = {}
+for i = 1, 6 do
+  anchor2[#anchor2 + 1] = {role = "user", content = string.rep("x", 15000) .. " m" .. i}
+end
+local trimmed2 = trim_history(anchor2)
+test("trim_history byte cap keeps head + last 2",
+  trimmed2[1].content:find("m1") ~= nil and #trimmed2 == 3,
+  "#=" .. tostring(#trimmed2))
+
+-- /ctx + 运行时行: cache hit/miss 显示（usage 字段透传）
+local function capture_print(fn)
+  local out = {}
+  local real_print = print
+  print = function(s) out[#out + 1] = tostring(s) end
+  local ok = pcall(fn)
+  print = real_print
+  return ok, table.concat(out)
+end
+local ctx_ok, ctx_text = capture_print(function()
+  agent_test.cmd_ctx({context_window = 128000, model = "mock"},
+    {{role = "user", content = "hi"}},
+    {prompt_tokens = 1000, completion_tokens = 200,
+     prompt_cache_hit_tokens = 800, prompt_cache_miss_tokens = 200})
+end)
+test("cmd_ctx renders cache hit line", ctx_ok and ctx_text:find("缓存") ~= nil,
+  ctx_text)
+local line_ok, line_text = capture_print(function()
+  agent_test.show_ctx_line({prompt_tokens = 10000,
+    prompt_cache_hit_tokens = 9000, prompt_cache_miss_tokens = 1000},
+    {context_window = 128000})
+end)
+test("show_ctx_line shows cache %", line_ok and line_text:find("cache 90%%") ~= nil,
+  line_text)
+
+-- cache_stats: 兼容 DeepSeek 与 OpenAI 新格式（讯飞星辰 kimi 实测格式）
+local cs = agent_test.cache_stats
+local h, m = cs({prompt_tokens = 1000, prompt_cache_hit_tokens = 800, prompt_cache_miss_tokens = 200})
+test("cache_stats deepseek format", h == 800 and m == 200, tostring(h) .. "/" .. tostring(m))
+local h2, m2 = cs({prompt_tokens = 1000, prompt_tokens_details = {cached_tokens = 800}})
+test("cache_stats openai details format", h2 == 800 and m2 == 200, tostring(h2) .. "/" .. tostring(m2))
+test("cache_stats nil without cache fields", cs({prompt_tokens = 1000}) == nil)
+test("cache_stats nil on zero hit", cs({prompt_tokens = 1000, prompt_tokens_details = {cached_tokens = 0}}) == nil)
+local line2_ok, line2_text = capture_print(function()
+  agent_test.show_ctx_line({prompt_tokens = 10000,
+    prompt_tokens_details = {cached_tokens = 9000}},
+    {context_window = 128000})
+end)
+test("show_ctx_line openai format cache %", line2_ok and line2_text:find("cache 90%%") ~= nil,
+  line2_text)
 
 print("")
 print("═══════════════════════════════════════")

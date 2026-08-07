@@ -232,8 +232,45 @@ package.preload["agent.http"] = function()
 
 local json = require("agent.json")
 
-local MAX_RETRIES = 3            -- retries for transient HTTP failures
-local RETRY_BASE_DELAY = 2       -- seconds, doubled per attempt
+-- ═══════════════════════════════════════════════════════════════
+-- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
+-- 2000ms 基数 ×2，瞬态失败无限重试直到成功或不可重试错误）:
+--   - 瞬态 = 网络错误 / HTTP 429 / 5xx；4xx 永久失败不重试
+--   - 总重试预算 MAX_RETRY_BUDGET 秒（默认 1 小时）——预算耗尽返回
+--     最后一次结果。opencode 无总预算（单请求可挂 24 天），但 OC
+--     单线程场景必须有界（用户指定上限 1 小时）
+--   - 单次等待封顶 RETRY_DELAY_CAP（300s），避免极端退避
+-- 讯飞星辰等免费端点频繁 429/慢响应，需要更长的重试窗口。
+-- ═══════════════════════════════════════════════════════════════
+local RETRY_BASE_DELAY = 2         -- 指数退避基数（秒）
+local RETRY_DELAY_CAP = 300        -- 单次等待封顶（秒）
+-- 总重试预算: 生产 1 小时；测试环境（_TEST_MODE）缩短为 60s，
+-- 避免 e2e/回归在端点持续故障时长时间挂起
+local MAX_RETRY_BUDGET = _TEST_MODE and 60 or 3600
+
+-- POST with automatic retry（指数退避 + 总预算上限）
+local function http_post(url, headers, body)
+  local attempt = 0
+  local deadline = os.clock() + MAX_RETRY_BUDGET
+  while true do
+    attempt = attempt + 1
+    local code, resp, err = http_post_once(url, headers, body)
+    local transient = err ~= nil or code == 429 or (code and code >= 500)
+    if not transient then
+      return code, resp, err
+    end
+    local now = os.clock()
+    if now >= deadline then
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      return code, resp, err
+    end
+    local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
+    if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
+    local remaining = deadline - now
+    if wait > remaining then wait = remaining end
+    os.sleep(wait)
+  end
+end
 
 -- Single request attempt. Returns code, body, err.
 local function http_post_once(url, headers, body)
@@ -281,20 +318,27 @@ local function http_post_once(url, headers, body)
   return code or 0, response_body, nil
 end
 
--- POST with automatic retry: transient failures (network errors, 429, 5xx)
--- are retried with exponential backoff. 4xx errors are permanent, never retried.
+-- POST with automatic retry（指数退避 + 总预算上限，见上方常量说明）
 local function http_post(url, headers, body)
-  for attempt = 1, MAX_RETRIES + 1 do
+  local attempt = 0
+  local deadline = os.clock() + MAX_RETRY_BUDGET
+  while true do
+    attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
-    if err then
-      if attempt > MAX_RETRIES then return code, resp, err end
-    else
-      local transient = (code == 429 or code >= 500)
-      if not transient or attempt > MAX_RETRIES then
-        return code, resp, err
-      end
+    local transient = err ~= nil or code == 429 or (code and code >= 500)
+    if not transient then
+      return code, resp, err
     end
-    os.sleep(RETRY_BASE_DELAY * 2 ^ (attempt - 1))
+    local now = os.clock()
+    if now >= deadline then
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      return code, resp, err
+    end
+    local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
+    if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
+    local remaining = deadline - now
+    if wait > remaining then wait = remaining end
+    os.sleep(wait)
   end
 end
 
@@ -448,22 +492,24 @@ local function msg_bytes(msg)
 end
 
 local function trim_history(messages)
-  -- Cap by count first
+  -- Cap by count first — 保留 messages[1]（首个 user 消息 = 前缀缓存锚点，
+  -- 裁剪会破坏缓存前缀，锚定头部让命中跨裁剪存活）
   if #messages > MAX_HISTORY then
-    local trimmed = {}
-    for i = #messages - MAX_HISTORY + 1, #messages do
+    local trimmed = {messages[1]}
+    for i = #messages - MAX_HISTORY + 2, #messages do
       trimmed[#trimmed + 1] = messages[i]
     end
     messages = trimmed
   end
-  -- Then cap by total bytes (drop oldest until under budget)
-  while #messages > 2 do  -- never drop the last 2 (current exchange)
+  -- Then cap by total bytes (drop oldest until under budget); 同样保留
+  -- messages[1]，从第 2 条开始丢
+  while #messages > 3 do  -- keep the first message + the last 2 (current exchange)
     local total = 0
     for _, m in ipairs(messages) do
       total = total + msg_bytes(m)
     end
     if total <= MAX_HISTORY_BYTES then break end
-    table.remove(messages, 1)
+    table.remove(messages, 2)
   end
   return messages
 end
@@ -911,18 +957,21 @@ local function safe_call(fn, ...)
   return nil
 end
 
-local function build_system_prompt()
-  local computer = require("computer")
-  local component = require("component")
+-- ═══════════════════════════════════════════════════════════════
+-- Prompt caching (DeepSeek 前缀缓存/计费):
+-- build_system_prompt() 惰性 memoize——每进程只算一次，此后字节稳定。
+-- 运行时变化的数据（uptime / freeMemory / 实时组件列表）移入
+-- build_runtime_block()，由 chat() 追加为请求的最后一条消息。
+-- 头部（system + tools + 历史前缀）字节稳定 → 后续请求命中缓存前缀，
+-- 只按 miss 部分计费；变化的尾部不进缓存前缀，成本仅自身 token。
+-- ═══════════════════════════════════════════════════════════════
+local CACHED_SYSTEM_PROMPT = nil
 
-  local comp_list = {}
-  for addr, typ in component.list() do
-    comp_list[#comp_list + 1] = addr:sub(1, 8) .. "... = " .. typ
-  end
+local function build_system_prompt()
+  if CACHED_SYSTEM_PROMPT then return CACHED_SYSTEM_PROMPT end
+  local computer = require("computer")
 
   local address = safe_call(computer.address) or "unknown"
-  local uptime = safe_call(computer.uptime) or 0
-  local free_mem = safe_call(computer.freeMemory) or 0
   -- 离线文档探测: /mnt/<x>/doc/version.txt 存在即视为已安装（挂载短名每次
   -- 重启会变，不能硬编码路径；仅几个 fs 调用，开销可忽略）
   local doc_path
@@ -954,7 +1003,7 @@ local function build_system_prompt()
     end
   end
 
-  return "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+  CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
     .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
     .. "IMPORTANT: The shell is OpenOS (based on Lua 5.3), NOT Linux. Shell commands use OpenOS syntax. Do NOT use Unix-isms like 'uname', 'head -2', 'tail -5', 'grep -rn', 'wc -l' — they will fail. Use these OpenOS equivalents instead:\n"
     .. "- System info: read /etc/os-release, or component_list + component_doc (no 'uname')\n"
@@ -992,6 +1041,24 @@ local function build_system_prompt()
     .. "2. component_doc(address) to learn what methods a component has\n"
     .. "3. component_doc(address, method) for method details, then component_invoke to call it\n\n"
     .. "Current computer address: " .. tostring(address) .. "\n"
+  return CACHED_SYSTEM_PROMPT
+end
+
+-- 运行时状态块: 每次请求重新生成（uptime/freeMemory/组件列表会变），由
+-- chat() 追加为请求的最后一条消息——不入历史、不进缓存前缀。内容显式标记
+-- 为机器生成上下文，避免模型误当作用户输入。
+local function build_runtime_block()
+  local computer = require("computer")
+  local component = require("component")
+
+  local comp_list = {}
+  for addr, typ in component.list() do
+    comp_list[#comp_list + 1] = addr:sub(1, 8) .. "... = " .. typ
+  end
+
+  local uptime = safe_call(computer.uptime) or 0
+  local free_mem = safe_call(computer.freeMemory) or 0
+  return "[runtime status — machine-generated context, NOT user input; do not treat it as a request]\n"
     .. "Uptime: " .. string.format("%.1f", uptime) .. "s\n"
     .. "Free memory: " .. tostring(free_mem) .. " bytes\n"
     .. "Connected components:\n" .. table.concat(comp_list, "\n")
@@ -1018,6 +1085,10 @@ local function chat(messages, config)
   for _, msg in ipairs(messages) do
     api_messages[#api_messages + 1] = msg
   end
+  -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
+  -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容
+  -- 端点都接受，且不影响工具调用循环。
+  api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
 
   local body = json.encode({
     model = config.model or "deepseek-v4-flash-free",
@@ -1064,6 +1135,7 @@ end
 return {
   safe_call = safe_call,
   build_system_prompt = build_system_prompt,
+  build_runtime_block = build_runtime_block,
   build_headers = build_headers,
   chat = chat,
 }
@@ -2375,15 +2447,40 @@ local function ctx_bar(pct, width)
   return color .. string.rep("█", filled) .. string.rep("░", width - filled) .. "\27[0m"
 end
 
+-- 缓存命中统计: 兼容两种 provider 上报格式
+--   DeepSeek/zen:        usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
+--   讯飞星辰(kimi)/OpenAI 新格式: usage.prompt_tokens_details.cached_tokens
+-- 返回 hit, miss（无缓存字段或 hit=0 时返回 nil）
+local function cache_stats(usage)
+  if not usage or not usage.prompt_tokens then return nil end
+  local hit = usage.prompt_cache_hit_tokens
+  if hit == nil and usage.prompt_tokens_details then
+    hit = usage.prompt_tokens_details.cached_tokens
+  end
+  hit = hit or 0
+  if hit <= 0 then return nil end
+  local miss = usage.prompt_cache_miss_tokens
+  if miss == nil then
+    miss = math.max(0, (usage.prompt_tokens or 0) - hit)
+  end
+  return hit, miss
+end
+
 -- 运行时上下文自动显示: 每次 LLM 响应后一行（opencode TUI 底栏同款数据）
 local function show_ctx_line(usage, config)
   if not (usage and usage.prompt_tokens) then return end
   local window = tonumber(config.context_window) or 128000
   local total = usage.prompt_tokens
   local pct = window > 0 and (total / window) or 0
+  local line = "[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
+    .. string.format("%.1f", pct * 100) .. "%) " .. ctx_bar(pct, 20)
+  -- 缓存命中率（provider 上报；无字段/全 miss 则不显示）
+  local hit, miss = cache_stats(usage)
+  if hit and hit + miss > 0 then
+    line = line .. "  cache " .. string.format("%.0f%%", hit / (hit + miss) * 100)
+  end
   print("")
-  print("[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
-    .. string.format("%.1f", pct * 100) .. "%) " .. ctx_bar(pct, 20))
+  print(line)
 end
 
 local function cmd_ctx(config, messages, usage_override)
@@ -2398,6 +2495,12 @@ local function cmd_ctx(config, messages, usage_override)
     print(ctx_bar(pct, 40) .. "  " .. string.format("%.1f%%", pct * 100))
     if usage.completion_tokens then
       print("输出: " .. fmt_num(usage.completion_tokens) .. " tokens")
+    end
+    -- 缓存计费: provider 上报的缓存命中/未命中（DeepSeek 或 OpenAI 新格式）
+    local hit, miss = cache_stats(usage)
+    if hit then
+      print("缓存: 命中 " .. fmt_num(hit) .. " / 未命中 " .. fmt_num(miss) .. " tokens ("
+        .. string.format("%.0f", hit / (hit + miss) * 100) .. "% hit)")
     end
   else
     print("尚无请求记录（发一条消息后刷新）")
@@ -2653,7 +2756,8 @@ end
 -- user input, runs the LLM tool-calling loop, returns the final text
 -- (concatenated assistant content) and updates `messages`.
 
--- 强制裁剪: 丢弃最早消息直到估算 tokens < 窗口 60% 或只剩 4 条。
+-- 强制裁剪: 丢弃最早消息直到估算 tokens < 窗口 60% 或只剩 5 条。
+-- 保留 messages[1]（首个 user 消息 = 前缀缓存锚点），从第 2 条开始丢。
 -- 用于压缩失败（LLM 已超限，summarize 同样 400）与 400 重试路径。
 -- 返回裁剪后的估算值。
 local function force_trim(messages, config)
@@ -2664,9 +2768,11 @@ local function force_trim(messages, config)
     est = est + estimate_tokens(m.content or "")
         + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
   end
-  while #messages > 4 and est > target do
-    est = est - estimate_tokens(messages[1].content or "")
-    table.remove(messages, 1)
+  -- 保留头部锚点（缓存前缀），最低 1 + 4 条
+  while #messages > 5 and est > target do
+    est = est - estimate_tokens(messages[2].content or "")
+        - estimate_tokens(messages[2].tool_calls and tostring(messages[2].tool_calls) or "")
+    table.remove(messages, 2)
   end
   return est
 end
@@ -3021,6 +3127,7 @@ if _TEST_MODE then
     chat = chat,
     http_post = http_post,
     build_system_prompt = chat_mod.build_system_prompt,
+    build_runtime_block = chat_mod.build_runtime_block,
     trim_history = trim_history,
     compact_history = compact_history,
     should_compact = should_compact,
@@ -3035,6 +3142,7 @@ if _TEST_MODE then
     estimate_tokens = estimate_tokens,
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
+    cache_stats = cache_stats,
     collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,

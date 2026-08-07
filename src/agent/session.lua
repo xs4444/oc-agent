@@ -45,22 +45,24 @@ local function msg_bytes(msg)
 end
 
 local function trim_history(messages)
-  -- Cap by count first
+  -- Cap by count first — 保留 messages[1]（首个 user 消息 = 前缀缓存锚点，
+  -- 裁剪会破坏缓存前缀，锚定头部让命中跨裁剪存活）
   if #messages > MAX_HISTORY then
-    local trimmed = {}
-    for i = #messages - MAX_HISTORY + 1, #messages do
+    local trimmed = {messages[1]}
+    for i = #messages - MAX_HISTORY + 2, #messages do
       trimmed[#trimmed + 1] = messages[i]
     end
     messages = trimmed
   end
-  -- Then cap by total bytes (drop oldest until under budget)
-  while #messages > 2 do  -- never drop the last 2 (current exchange)
+  -- Then cap by total bytes (drop oldest until under budget); 同样保留
+  -- messages[1]，从第 2 条开始丢
+  while #messages > 3 do  -- keep the first message + the last 2 (current exchange)
     local total = 0
     for _, m in ipairs(messages) do
       total = total + msg_bytes(m)
     end
     if total <= MAX_HISTORY_BYTES then break end
-    table.remove(messages, 1)
+    table.remove(messages, 2)
   end
   return messages
 end
