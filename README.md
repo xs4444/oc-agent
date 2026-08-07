@@ -21,7 +21,8 @@
 - **联网搜索**：默认 HN Algolia（无 key），`/tavily <key>` 升级为通用搜索（含中文）
 - **shell_execute 增强**：`io.popen` 捕获 stdout+stderr（不再只返回 true/false）+ 线程超时保护（默认 60s，死循环/挂起命令自动 kill）
 - **append-only 会话日志**：每条消息 JSON 单行追加（O(新增) 内存，替代整表重写 O(n²)）；启动重放 + 裁剪；旧格式自动迁移
-- **自动重试**：网络错误 / 429 / 5xx 自动重试（指数退避，最多 3 次），4xx 不重试
+- **自动重试**：网络错误 / 429 / 5xx 自动重试（opencode 风格指数退避 2s×2ⁿ，单次等待封顶 5 分钟，**总预算 1 小时**；测试环境 60s），4xx 不重试——适配讯飞星辰等频繁限流的免费端点
+- **前缀缓存计费优化**：system prompt **静态化**（进程内 memoize，字节稳定）+ 动态运行时数据（uptime/freeMemory/组件列表）移入**请求尾部**独立消息 → DeepSeek/讯飞前缀缓存命中（实测 kimi k2.6 命中率 91%）；`/ctx` 与 `[ctx]` 行显示缓存命中率（兼容 DeepSeek `prompt_cache_hit_tokens` 与 OpenAI 新格式 `prompt_tokens_details.cached_tokens`）；`trim_history`/`force_trim` 保留首条消息（缓存锚点），裁剪不破坏前缀
 - **对话压缩**：历史超限时自动用 LLM 生成摘要替换旧消息（保留最近 4 条），失败回退裁剪；`/compact` 手动触发
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **诊断上报**：`/debug` 收集版本+脱敏配置+最近历史 → 本地文件 + 可选上传 GitHub Gist（`/gist-token <token>` 配置，scope: gist）
@@ -113,7 +114,7 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   └── superpowers/
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
-│   ├── run_tests.lua      # 本地回归测试（142 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入）
+│   ├── run_tests.lua      # 本地回归测试（163 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性）
 │   ├── danger_test.lua    # 高危场景测试（21 项：自改/坏插件/死循环/磁盘/配置/自删/递归）
 │   ├── shell_timeout_test.lua  # ocvm/OCEmu 真机 shell 超时验证
 │   ├── reasoning_e2e_test.lua  # reasoning_content 传回真机 e2e（工具链无 400）
@@ -133,7 +134,7 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── ssh_win.py         # windowsCo 一键执行（密钥认证，--ps 中文路径）
 │   └── gist.py            # /debug 报告拉取（list/latest/fetch）
 ├── scripts/               # 构建与发版脚本 → scripts/README.md
-│   ├── build_all.py       # 构建+清单+142 项回归一键
+│   ├── build_all.py       # 构建+清单+163 项回归一键
 │   ├── release_check.py   # 发版安全检查（版本 bump/清单/字节/语法）
 │   ├── watch_release.py   # jsDelivr 索引监控（索引后提示可更新）
 │   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
@@ -160,7 +161,7 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 ```
 
 测试要点：
-- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**142 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集）+ `danger_test.lua`（21 项高危场景）
+- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**163 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性）+ `danger_test.lua`（21 项高危场景）
 - 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
 - LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
