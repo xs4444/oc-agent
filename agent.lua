@@ -4325,12 +4325,27 @@ local function process_exchange(messages, config, user_input, persist, session)
       local has_reasoning = response.reasoning_content ~= nil and response.reasoning_content ~= ""
       if content_blank and has_reasoning and response.finish_reason == "stop" then
         -- 情形 A（reasoningOnlyFinishHonoured）: content 空 + reasoning 非空 +
-        -- finish=stop → 接受该轮不重试（thinking 模式常见: 模型先想后答）
-        if #final_text == 0 then
-          print("[reasoning-only] 接受 reasoning-only 轮（无可见回答）")
+        -- finish=stop。中间轮可接受（tool_calls 已排除），但最终轮（final_text
+        -- 空）不能直接收尾——thinking 模式模型常只输出思考就 stop，真机会
+        -- 出现"对话静默停止"（gist 实证：agent 探索完代码后无可见回答）。
+        -- 与情形 B 共用 retried_empty 重试网（合计限一次）。
+        if #final_text == 0 and not retried_empty then
+          retried_empty = true
+          print("[reasoning-only] 无可见回答，注入重试消息（限一次）")
+          local retry_msg = {role = "user",
+            content = "你只产出了思考内容，没有给出可见回答。请直接给出最终回答。"}
+          messages[#messages + 1] = retry_msg
+          if persist then
+            if session then append_session_history(session, retry_msg)
+            else append_history(retry_msg) end
+          end
+          -- 继续循环（不 break）
+        elseif #final_text == 0 then
+          print("[reasoning-only] 重试后仍无可见回答，接受收尾")
           return {content = "(模型仅产出思考未给出可见回答)", text = "(模型仅产出思考未给出可见回答)"}
+        else
+          break
         end
-        break
       elseif content_blank and not has_reasoning
           and (response.finish_reason == "stop" or response.finish_reason == "length") then
         -- 情形 B: 纯空回答 → 注入重试消息（限一次）

@@ -1514,21 +1514,42 @@ do
     tostring(ex_res and ex_res.text))
 end
 
--- 任务2 情形 A: reasoning-only 轮（content 空 + reasoning 非空 + finish=stop）→ 接受不重试
+-- 任务2 情形 A: reasoning-only 轮（content 空 + reasoning 非空 + finish=stop）
+-- → 无可见回答时注入重试消息一次（与情形 B 共用 retried_empty 网），
+-- 重试后仍空才返回 placeholder（修复：此前直接接受导致真机对话静默停止）
 do
+  -- A1: 首次 reasoning-only → 重试 → 第二次给出可见回答 → 正常返回
   next_llm = {
     llm_content(nil, "让我想想这个问题的解法", "stop"),
+    llm_content("这是重试后的真正回答", nil, "stop"),
   }
   llm_idx = 0
   local ro_msgs = {}
   local ro_res = agent_test.process_exchange(ro_msgs,
     {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
      context_window = 128000}, "测试", false)
-  test("reasoning-only: accepted without retry", ro_res and ro_res.error == nil,
+  local ro_joined = ""
+  for _, m in ipairs(ro_msgs) do
+    if m.content and type(m.content) == "string" then ro_joined = ro_joined .. m.content end
+  end
+  test("reasoning-only: retry message injected", ro_joined:find("只产出了思考内容", 1, true) ~= nil,
+    ro_joined:sub(1, 200))
+  test("reasoning-only: final answer after retry", ro_res and ro_res.text == "这是重试后的真正回答",
     tostring(ro_res and (ro_res.error or ro_res.text)))
-  test("reasoning-only: placeholder text returned", ro_res and ro_res.content and
-    ro_res.content:find("仅产出思考", 1, true) ~= nil,
-    tostring(ro_res and (ro_res.content or ro_res.text)))
+
+  -- A2: 两次 reasoning-only（重试后仍空）→ 返回 placeholder
+  next_llm = {
+    llm_content(nil, "思考一", "stop"),
+    llm_content(nil, "思考二", "stop"),
+  }
+  llm_idx = 0
+  local ro2_msgs = {}
+  local ro2_res = agent_test.process_exchange(ro2_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  test("reasoning-only: placeholder after retry exhausted", ro2_res and ro2_res.content and
+    ro2_res.content:find("仅产出思考", 1, true) ~= nil,
+    tostring(ro2_res and (ro2_res.content or ro2_res.text)))
   next_llm = nil
 end
 
