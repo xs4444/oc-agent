@@ -2041,8 +2041,16 @@ end
 -- 事件驱动输入: 键盘编辑 + 历史浏览 + Tab 补全 + 滚动 + Ctrl+C。
 -- 无 keyboard 组件时回退 io.read（机器人）。
 function tui.readInput()
+  -- 键盘可用性检测（荒野大师/OCEmu 同款 OpenOS 库缺 keyboard.isAvailable，
+  -- 但组件存在且事件驱动正常——真机探针实证 key_down 全键标准格式到达）：
+  -- isAvailable 缺失时回退到组件检测；组件可用即走事件驱动分支，否则
+  -- io.read 回退（机器人）。此前缺失误判导致每次 readInput 走 io.read
+  -- 回退（io.write 直写终端层 + 阻塞读行）——Tab/方向键/Ctrl 组合全部
+  -- "无反应"、空回车多状态栏，均由此产生。
   local ok_kb, kb_avail = pcall(function()
-    return keyboard.isAvailable and keyboard.isAvailable()
+    if keyboard.isAvailable then return keyboard.isAvailable() end
+    local ok_c, comp = pcall(require, "component")
+    return ok_c and comp.isAvailable and comp.isAvailable("keyboard")
   end)
   if not ok_kb or not kb_avail then
     io.write("> ")
