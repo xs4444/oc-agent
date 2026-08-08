@@ -18,8 +18,8 @@
     "tools/search.lua": 4566,
     "tools/shell.lua": 5335,
     "tools/subagent.lua": 5015,
-    "tui.lua": 24210,
+    "tui.lua": 24386,
     "docs.lua": 14689
   },
-  "version": "2026-08-08T1449"
+  "version": "2026-08-08T1520"
 }
