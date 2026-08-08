@@ -1268,7 +1268,10 @@ local function main(config, ...)
         ui.print("^C", ui.colors.dim)
         goto continue
       end
-      if input == "" then goto continue end
+      -- 空/空白输入: 不提交（readInput 已拦空白回车；此处兜底 io.read
+      -- 回退路径与未来调用方——空白消息会触发 Thinking 状态+完整请求+
+      -- 空回答重试网，造成状态栏反复切换）
+      if input == "" or input:match("^%s+$") then goto continue end
 
       if input:sub(1, 1) == "/" then
         local exit, c, m = handle_command(input, config, messages)

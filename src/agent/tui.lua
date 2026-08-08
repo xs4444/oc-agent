@@ -442,9 +442,12 @@ function tui.readInput()
       local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
       if ch == 13 then -- Enter
         local line = state.inputBuffer
-        if line == "" then
-          -- 空回车: 留在输入循环（重绘输入行）——不返回主循环，
-          -- 避免终端换行/状态栏闪烁等副作用
+        if line == "" or line:match("^%s+$") then
+          -- 空回车/空白回车: 留在输入循环（重绘输入行）——不返回主循环，
+          -- 避免终端换行/状态栏闪烁等副作用。
+          -- 空白字符（空格/全角空格/Tab）必须同样拦截：否则空白消息被
+          -- 当真输入提交 → Thinking 状态 + 完整请求 → 空回答重试网再一轮
+          -- → 状态栏 Ready→Thinking→...反复切换（真机"多个状态栏"根因）
           state.completionCycle = nil
           pcall(tui.drawInput)
         else
