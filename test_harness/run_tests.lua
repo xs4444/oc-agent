@@ -1480,6 +1480,37 @@ os.remove(sdir .. "/beta.jsonl")
 os.remove(sdir .. "/archive.txt")
 os.execute("rmdir " .. sdir .. " 2>nul")
 
+-- ═══════════════════════════════════════════
+-- debug 报告: 无全局/模块 computer 时不崩
+-- （真机 OpenOS 无全局 computer——此前 :59 直接 pcall(computer.uptime)
+--  参数求值崩溃；oc_mock 注入了全局 computer 掩盖了该 bug）
+-- ═══════════════════════════════════════════
+do
+  local dbg_ok, dbg_mod = pcall(require, "agent.debug")
+  if dbg_ok and type(dbg_mod) == "table" then
+    local saved_date = os.date
+    local saved_comp_global = _G.computer
+    local saved_comp_loaded = package.loaded["computer"]
+    -- 伪造 RTC 缺失（os.date 返回 epoch 1970）→ 触发 uptime 回退分支；
+    -- 同时移除全局与模块 computer → 真机场景
+    os.date = function() return "1970-01-01 00:00:00" end
+    _G.computer = nil
+    package.loaded["computer"] = nil
+    local ok_collect, report = pcall(dbg_mod.collect, {model = "m"}, {})
+    os.date = saved_date
+    _G.computer = saved_comp_global
+    package.loaded["computer"] = saved_comp_loaded
+    test("debug.collect survives missing computer", ok_collect,
+      tostring(report))
+    if ok_collect then
+      test("debug.collect uptime fallback placeholder", tostring(report):find("uptime %?") ~= nil,
+        tostring(report):match("Generated: [^\n]*"))
+    end
+  else
+    test("debug.collect survives missing computer", true, "agent.debug unavailable, skipped")
+  end
+end
+
 print("")
 print("═══════════════════════════════════════")
 print(string.format("FINAL: %d pass, %d fail out of %d tests", pass, fail, pass + fail))
