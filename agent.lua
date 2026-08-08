@@ -2109,10 +2109,16 @@ function tui.readInput()
         -- oc-ai 用 char==9；荒野大师等模拟器对 Tab 可能只派发 char 不派发
         -- code 15（实测原生 shell Tab 可用而我们 code 判断接不住））
         local cands = completionCandidates(state.inputBuffer)
+        -- 可见诊断反馈: 无候选/有候选都更新状态栏, 用于区分
+        -- "Tab 事件没到达"(状态栏无变化) vs "候选为空"(显示 Tab: no match)
         if #cands > 0 then
           if not state.completionCycle then state.completionCycle = {cands, cands[1]} end
           state.inputBuffer = state.completionCycle[2].cmd
           state.inputCursor = ulen(state.inputBuffer)
+          tui.setStatus("Tab: " .. state.completionCycle[2].cmd
+            .. (#cands > 1 and (" (" .. #cands .. " candidates)") or ""))
+        else
+          tui.setStatus("Tab: no match")
         end
       elseif ch >= 32 and ch < 127 then -- 可打印 ASCII
         state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
