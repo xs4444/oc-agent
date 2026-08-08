@@ -259,7 +259,7 @@ if ok_tui and type(tui) == "table" then
       parts[#parts + 1] = string.format("ctx %.0f%%", pct)
       local hit, miss = agent_test.cache_stats(status_usage)
       if hit and hit + miss > 0 then
-        parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100)
+        parts[#parts + 1] = string.format("cache %.0f%%", hit / (hit + miss) * 100)
       end
     end
     parts[#parts + 1] = status_cfg.model
