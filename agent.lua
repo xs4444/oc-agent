@@ -1712,8 +1712,11 @@ function tui.drawStatus()
     g.setForeground(tui.colors.statusText)
   end
   if state.statusData then
-    local data = state.statusData()
-    if data and data ~= "" then
+    -- pcall 防御: 回调内任何异常（如 provider usage 结构怪异）都不应
+    -- 中断状态栏绘制——否则状态栏只剩 status 文本（真机曾现"完成后
+    -- 只剩 Ready，model/ctx/cache 全丢"）
+    local ok_data, data = pcall(state.statusData)
+    if ok_data and data and data ~= "" then
       local maxw = state.width - 8
       if ulen(data) > maxw then data = usub(data, 1, maxw - 1) .. "~" end
       g.set(state.width - ulen(data) - 1, y, data)
@@ -3510,9 +3513,11 @@ local DEPS = {
 -- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
 --   UI_INPUT:   输入函数（TUI readInput 或 nil → io.read）——ask_user /
 --               多行收集共用，避免工具循环内 io.read 破坏 TUI 界面。
---   UI_HOOKS:   工具活动钩子（onToolCall → 状态栏 "Running X..."）。
+--   UI_HOOKS:   工具活动钩子（onToolCall → 状态栏 "Running X..."；
+--               onAssistantText → assistant 输出走角色色，避免与日志
+--               一样渲染成灰色——历史记录与实时输出视觉一致）。
 local UI_INPUT = nil
-local UI_HOOKS = {onToolCall = nil}
+local UI_HOOKS = {onToolCall = nil, onAssistantText = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -3591,19 +3596,23 @@ end
 -- 缓存命中统计: 兼容两种 provider 上报格式
 --   DeepSeek/zen:        usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
 --   讯飞星辰(kimi)/OpenAI 新格式: usage.prompt_tokens_details.cached_tokens
--- 返回 hit, miss（无缓存字段或 hit=0 时返回 nil）
+-- 返回 hit, miss（无缓存字段或 hit=0 时返回 nil）。
+-- 全防御: provider usage 结构怪异（字段类型不对/嵌套非表）时返回 nil 而非抛错
+-- ——statusData 回调依赖它，异常曾导致 TUI 状态栏绘制中断（只剩 status）。
 local function cache_stats(usage)
   if not usage or not usage.prompt_tokens then return nil end
   local hit = usage.prompt_cache_hit_tokens
-  if hit == nil and usage.prompt_tokens_details then
+  if hit == nil and type(usage.prompt_tokens_details) == "table" then
     hit = usage.prompt_tokens_details.cached_tokens
   end
-  hit = hit or 0
+  hit = tonumber(hit) or 0
   if hit <= 0 then return nil end
   local miss = usage.prompt_cache_miss_tokens
   if miss == nil then
-    miss = math.max(0, (usage.prompt_tokens or 0) - hit)
+    local pt = tonumber(usage.prompt_tokens) or 0
+    miss = math.max(0, pt - hit)
   end
+  miss = tonumber(miss) or 0
   return hit, miss
 end
 
@@ -4120,7 +4129,13 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
 
     if response.content then
-      print(response.content)
+      -- TUI 模式（onAssistantText 已注册）走角色色渲染，与历史记录一致；
+      -- REPL 模式保持原生 print
+      if UI_HOOKS.onAssistantText then
+        UI_HOOKS.onAssistantText(response.content)
+      else
+        print(response.content)
+      end
       final_text[#final_text + 1] = response.content
     end
 
@@ -4407,14 +4422,19 @@ local function main(config, ...)
       -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
       print = function(s) ui.print(s, ui.colors.dim) end
       -- 状态栏右侧: 上下文占用 + 缓存命中 + 模型（opencode TUI 同款数据）
+      -- 全防御: provider usage 字段可能为字符串（"446"）——数值运算前
+      -- tonumber，避免回调抛错导致状态栏只剩 status（真机已现）。
       ui.setStatusData(function()
         local parts = {}
         if LAST_USAGE and LAST_USAGE.prompt_tokens then
           local win = tonumber(config.context_window) or 128000
-          local pct = win > 0 and (LAST_USAGE.prompt_tokens / win * 100) or 0
+          local pt = tonumber(LAST_USAGE.prompt_tokens) or 0
+          local pct = win > 0 and (pt / win * 100) or 0
           parts[#parts + 1] = string.format("ctx %.0f%%", pct)
           local hit, miss = cache_stats(LAST_USAGE)
-          if hit then parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100) end
+          if hit and hit + miss > 0 then
+            parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100)
+          end
         end
         parts[#parts + 1] = config.model
         return table.concat(parts, "  ")
@@ -4430,6 +4450,9 @@ local function main(config, ...)
       ui.setCompletions(comps)
       UI_INPUT = function() return ui.readInput() end
       UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+      -- assistant 正文输出走角色色（白色），与历史 printHistory 一致；
+      -- 日志/工具行仍由 print 代理渲染为 dim 灰色。
+      UI_HOOKS.onAssistantText = function(s) ui.printRole("assistant", s) end
       -- 翻页命令钩子（PgUp/PgDn 在部分键盘/远程环境不产生键码 → /up /down 兜底）
       UI_HOOKS.scrollUp = function(n)
         ui.scrollUp(n or ui.pageStep() or 1)
@@ -4465,6 +4488,9 @@ local function main(config, ...)
         table.remove(term_history, 1)  -- keep terminal history bounded
       end
 
+      -- 回显 user 输入到内容区（readInput 提交后无终端回显，不打印则
+      -- 内容区只有 assistant 回复，用户看不到自己发了什么——真机已现）
+      ui.printRole("user", input)
       ui.setStatus("Thinking...")
       local result = process_exchange(messages, config, input, true)
       if result and result.error then

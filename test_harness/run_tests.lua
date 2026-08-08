@@ -922,6 +922,12 @@ local h2, m2 = cs({prompt_tokens = 1000, prompt_tokens_details = {cached_tokens 
 test("cache_stats openai details format", h2 == 800 and m2 == 200, tostring(h2) .. "/" .. tostring(m2))
 test("cache_stats nil without cache fields", cs({prompt_tokens = 1000}) == nil)
 test("cache_stats nil on zero hit", cs({prompt_tokens = 1000, prompt_tokens_details = {cached_tokens = 0}}) == nil)
+-- 防御: provider usage 字段可能为字符串/嵌套非表（真机曾致 statusData 回调
+-- 抛错 → TUI 状态栏绘制中断，只剩 status 文本）
+local h3, m3 = cs({prompt_tokens = "1000", prompt_cache_hit_tokens = "800", prompt_cache_miss_tokens = "200"})
+test("cache_stats string fields safe", h3 == 800 and m3 == 200, tostring(h3) .. "/" .. tostring(m3))
+test("cache_stats non-table details safe", cs({prompt_tokens = 1000, prompt_tokens_details = true}) == nil)
+test("cache_stats weird details safe", cs({prompt_tokens = 1000, prompt_tokens_details = "x"}) == nil)
 local line2_ok, line2_text = capture_print(function()
   agent_test.show_ctx_line({prompt_tokens = 10000,
     prompt_tokens_details = {cached_tokens = 9000}},
