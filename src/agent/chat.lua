@@ -168,17 +168,25 @@ local function chat(messages, config)
   -- 端点都接受，且不影响工具调用循环。
   api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
 
-  local body = json.encode({
+  -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
+  -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
+  -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
+  local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
     tools = tools_mod.list(),
     -- 输出预算: dsv4 等 thinking 模型思考强度高（reasoning 可占大量输出
     -- token），2048 曾导致"长思考挤掉可见回答 → content 空"（真机 gist
-    -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 16384，config.max_tokens
-    -- 可覆盖（zen free 端点通常上限 32768）。
-    max_tokens = tonumber(config.max_tokens) or 16384,
+    -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 8192——16384 曾致
+    -- 长 reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM 崩溃
+    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖。
+    max_tokens = tonumber(config.max_tokens) or 8192,
     temperature = 0.7
   })
+  if not ok_enc then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "请求编码失败（内存不足）: " .. tostring(body)}
+  end
 
   local headers = build_headers(config)
 

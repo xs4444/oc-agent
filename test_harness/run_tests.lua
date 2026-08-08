@@ -639,11 +639,33 @@ local m3_before = 0
 for _, m in ipairs(m3) do
   m3_before = m3_before + agent_test.estimate_tokens(m.content or "")
 end
-local m3r, e3 = agent_test.ensure_context_budget(m3, cfg_small, false)
+local m3r, e3 = agent_test.ensure_context_budget(m3,
+  {context_window = cfg_small.context_window, byte_budget = 99999999}, false)
 test("ensure projects fold on big session",
   m3r[1].role == "system" and tostring(m3r[1].content):find("对话摘要") ~= nil
   and e3 < m3_before and #m3r == m3_n + 1,
   "#=" .. tostring(#m3r) .. " est " .. tostring(e3) .. " from " .. tostring(m3_before))
+
+-- ensure 字节硬预算: token 未超但字节超 150KB → 裁剪早期消息（P0 修复:
+-- 真机 55K tokens≈190KB 文本 encode 峰值超 OC 1.4MB 内存 → json.lua:70
+-- table.concat OOM 崩溃；字节预算是独立于 token 估算的硬约束）
+local m4 = {}
+for i = 1, 10 do
+  m4[#m4 + 1] = {role = "user", content = string.rep("x", 30000)}
+end
+local m4_n = #m4  -- 快照：ensure_context_budget 就地裁剪
+local m4_bytes = 0
+for _, m in ipairs(m4) do m4_bytes = m4_bytes + #(m.content or "") end
+local m4r = agent_test.ensure_context_budget(m4,
+  {context_window = 128000, byte_budget = 150000}, false)
+local m4r_bytes = 0
+for _, m in ipairs(m4r) do m4r_bytes = m4r_bytes + #(m.content or "") end
+test("ensure byte budget trims oversized",
+  m4r_bytes <= 150000 and #m4r < m4_n,
+  "bytes " .. tostring(m4r_bytes) .. " from " .. tostring(m4_bytes)
+    .. " msgs " .. tostring(#m4r) .. "/" .. tostring(m4_n))
+test("ensure byte budget keeps head anchor", m4r[1] == m4[1],
+  "head changed")
 
 print("")
 print("═══════════════════════════════════════")

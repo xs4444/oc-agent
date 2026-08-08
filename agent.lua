@@ -1256,17 +1256,25 @@ local function chat(messages, config)
   -- 端点都接受，且不影响工具调用循环。
   api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
 
-  local body = json.encode({
+  -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
+  -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
+  -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
+  local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
     tools = tools_mod.list(),
     -- 输出预算: dsv4 等 thinking 模型思考强度高（reasoning 可占大量输出
     -- token），2048 曾导致"长思考挤掉可见回答 → content 空"（真机 gist
-    -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 16384，config.max_tokens
-    -- 可覆盖（zen free 端点通常上限 32768）。
-    max_tokens = tonumber(config.max_tokens) or 16384,
+    -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 8192——16384 曾致
+    -- 长 reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM 崩溃
+    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖。
+    max_tokens = tonumber(config.max_tokens) or 8192,
     temperature = 0.7
   })
+  if not ok_enc then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "请求编码失败（内存不足）: " .. tostring(body)}
+  end
 
   local headers = build_headers(config)
 
@@ -4136,22 +4144,49 @@ local function ensure_context_budget(messages, config, persist, session)
   -- 模型驱动压缩（opencode-acp 策略）: 常规压缩由模型调用 compact_history
   -- 工具主动执行（占用反馈注入运行时尾部块）；此处仅保留 80% 窗口硬保护
   -- 防 400/超限。should_compact 仅用于 /ctx 建议显示。
-  if est <= window * 0.8 then
-    return messages, est
+  if est > window * 0.8 then
+    print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens 超 80% 窗口，硬保护压缩...")
+    local compacted = compact_history(messages, config)
+    if compacted then
+      messages = compacted
+      persist_msgs(messages)
+    else
+      -- 压缩失败（LLM 超限）：强制裁剪最早对话消息
+      print("压缩失败（LLM 可能已超限），强制裁剪早期消息...")
+      force_trim(messages, config)
+      persist_msgs(messages)
+    end
   end
 
-  print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens 超 80% 窗口，硬保护压缩...")
-  local compacted = compact_history(messages, config)
-  if compacted then
-    messages = compacted
+  -- ═══ 字节硬预算（OC 内存 1.4MB 限制）═══
+  -- token 估算通过不代表 encode 不 OOM：json.encode 峰值 ≈ 2-3x 文本字节
+  -- （结果 + parts 数组 + 输入）。真机实证：ctx 43%（55K tokens≈190KB 文本）
+  -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
+  -- 独立字节预算（config.byte_budget 可调，默认 150KB），作为 compact 之后
+  -- 的最终兜底：超限直接裁剪早期消息（保留 head 锚点 + 最近 5 条）。
+  local byte_est = 0
+  for _, m in ipairs(messages) do
+    if not m.folded then
+      byte_est = byte_est + #(m.content or "")
+          + #(m.tool_calls and tostring(m.tool_calls) or "")
+    end
+  end
+  local BYTE_BUDGET = tonumber(config.byte_budget) or 150000
+  if byte_est > BYTE_BUDGET then
+    print("上下文 " .. fmt_num(byte_est) .. " 字节超内存预算 " .. fmt_num(BYTE_BUDGET) .. "，裁剪早期消息...")
+    local guard = 0
+    while #messages > 5 and byte_est > BYTE_BUDGET and guard < 500 do
+      guard = guard + 1
+      local m2 = messages[2]
+      if m2 and not m2.folded then
+        byte_est = byte_est - #(m2.content or "")
+            - #(m2.tool_calls and tostring(m2.tool_calls) or "")
+      end
+      table.remove(messages, 2)
+    end
     persist_msgs(messages)
-    return messages, est_msgs(messages)
   end
 
-  -- 压缩失败（LLM 超限）：强制裁剪最早对话消息
-  print("压缩失败（LLM 可能已超限），强制裁剪早期消息...")
-  force_trim(messages, config)
-  persist_msgs(messages)
   return messages, est_msgs(messages)
 end
 
