@@ -542,7 +542,9 @@ function tui.readInput()
         tui.scrollDown(state.height - 4)
       elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
         state.completionCycle = nil
-      elseif code == 15 then -- Tab: 补全循环
+      elseif ch == 9 or code == 15 then -- Tab: 补全循环（char 或 code 双判断——
+        -- oc-ai 用 char==9；荒野大师等模拟器对 Tab 可能只派发 char 不派发
+        -- code 15（实测原生 shell Tab 可用而我们 code 判断接不住））
         local cands = completionCandidates(state.inputBuffer)
         if #cands > 0 then
           if not state.completionCycle then state.completionCycle = {cands, cands[1]} end
