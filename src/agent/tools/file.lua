@@ -76,6 +76,20 @@ local function escape_literal(str)
   return (str:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
 end
 
+-- UTF-8 安全截断: 取前 n 字节，回退到字符边界（不劈裂多字节字符）。
+-- 续字节 = 0x80-0xBF；单字节 < 0x80；起始字节 0xC0+。
+local function utf8_cut(s, n)
+  if not s or #s <= n then return s end
+  local cut = n
+  while cut < #s and cut >= 1 do
+    local b = s:byte(cut + 1)
+    if not b or b < 0x80 or b >= 0xC0 then break end
+    cut = cut - 1
+  end
+  if cut < 0 then cut = 0 end
+  return s:sub(1, cut)
+end
+
 -- Convert a glob pattern to a Lua pattern. Supports '*' (within a
 -- path segment) and '**' (across segments): e.g. '*.lua', 'lib/**/*.lua'.
 local function glob_to_lua_pattern(glob_pat)
@@ -157,8 +171,13 @@ local function search_files_code(args)
       line_num = line_num + 1
       local ok_find, found = pcall(line.find, line, pat)
       if ok_find and found then
-        results[#results + 1] = rel_path .. ":" .. line_num .. ": "
-          .. line:sub(1, max_line_length)
+        local shown = line
+        -- 超长行: UTF-8 安全截断 + 显式标记（pi 风格，不静默丢内容）
+        if #shown > max_line_length then
+          shown = utf8_cut(shown, max_line_length)
+            .. " ... [line truncated at " .. max_line_length .. "]"
+        end
+        results[#results + 1] = rel_path .. ":" .. line_num .. ": " .. shown
         if #results >= max_results then
           truncated = true
           f:close()
@@ -264,11 +283,30 @@ local function exec(name, args, deps)
       if not f then error("file not found: " .. args.path) end
       local offset = args.offset
       local limit = args.limit
+      -- 无 offset/limit 的默认读: 有行/字节上限，避免大文件全量回传。
+      -- 上限与 edit_file 的 20KB 预算一致; 超限时尾注给出续读指引。
+      local READ_MAX_LINES = 400
+      local READ_MAX_BYTES = 20000
       if offset == nil and limit == nil then
-        -- Whole file (original behavior)
-        local c = f:read("*a")
+        local parts = {}
+        local n = 0
+        local total_bytes = 0
+        for line in f:lines() do
+          n = n + 1
+          total_bytes = total_bytes + #line + 1
+          if n > READ_MAX_LINES or total_bytes > READ_MAX_BYTES then
+            f:close()
+            -- 截断: 返回已收集的行 + 尾注（提示用 offset 续读）
+            local out = table.concat(parts, "\n")
+            local shown = #parts
+            return out .. "\n...(truncated: showing first " .. shown
+              .. " lines; use read_file with offset=" .. (shown + 1)
+              .. " to continue)"
+          end
+          parts[#parts + 1] = line
+        end
         f:close()
-        return c
+        return table.concat(parts, "\n")
       end
       -- Line-slice mode: count lines first (needed for negative offset / tail)
       local total = 0
@@ -295,7 +333,14 @@ local function exec(name, args, deps)
       if #parts == 0 then
         return "no lines (file has " .. total .. " lines; offset " .. tostring(offset or 1) .. ")"
       end
-      return table.concat(parts, "\n")
+      local out = table.concat(parts, "\n")
+      -- 切片结果仍超上限（limit 参数过大）: 同样尾注
+      if #out > READ_MAX_BYTES then
+        out = out:sub(1, READ_MAX_BYTES)
+          .. "\n...(truncated: slice output exceeds " .. READ_MAX_BYTES
+          .. " bytes; use read_file with a smaller limit to continue)"
+      end
+      return out
     end)
     return ok and result or ("Error: " .. tostring(result))
 

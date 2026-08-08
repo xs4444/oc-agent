@@ -928,6 +928,17 @@ local h3, m3 = cs({prompt_tokens = "1000", prompt_cache_hit_tokens = "800", prom
 test("cache_stats string fields safe", h3 == 800 and m3 == 200, tostring(h3) .. "/" .. tostring(m3))
 test("cache_stats non-table details safe", cs({prompt_tokens = 1000, prompt_tokens_details = true}) == nil)
 test("cache_stats weird details safe", cs({prompt_tokens = 1000, prompt_tokens_details = "x"}) == nil)
+-- 非整除命中率: 400/446×100=89.686 → cache_stats 返回 400, 46（不四舍五入丢失）
+-- （真机 bug 根因: statusData 回调曾用 %d 格式化非整数 → 抛错 → pcall 吞掉
+--  → 状态栏只剩 "Ready"；show_ctx_line 用 %.0f 无此问题）
+local h5, m5 = cs({prompt_tokens = 446, prompt_tokens_details = {cached_tokens = 400}})
+test("cache_stats non-integer ratio", h5 == 400 and m5 == 46, tostring(h5) .. "/" .. tostring(m5))
+local line3_ok, line3_text = capture_print(function()
+  agent_test.show_ctx_line({prompt_tokens = 446, prompt_tokens_details = {cached_tokens = 400}},
+    {context_window = 128000})
+end)
+test("show_ctx_line non-integer cache %", line3_ok and line3_text:find("cache 90%%") ~= nil,
+  line3_text)
 local line2_ok, line2_text = capture_print(function()
   agent_test.show_ctx_line({prompt_tokens = 10000,
     prompt_tokens_details = {cached_tokens = 9000}},
@@ -1449,6 +1460,119 @@ do
   test("length-truncated: model corrects and answers", tl_res and tl_res.text == "修正后的最终回答",
     tostring(tl_res and tl_res.text))
   next_llm = nil
+end
+
+-- ── 截断机制（exp-1 审计修复）: head+tail 双保 + UTF-8 安全 ──
+-- 任务1: 超长工具结果 >3000 字节（含中文）→ head(1500)+tail(1500) 都保留、
+-- UTF-8 边界不被劈裂（head 之后/原串的下一字节不是续字节，tail 首字节不是
+-- 续字节）、标记含 truncated/bytes + 续读提示
+do
+  -- 大文件: 前半 ASCII + 中间大量中文 + 结尾哨兵，总长 >3000 <20000
+  local big_path = "test_trunc_big.txt"
+  local head_sentinel = "HEAD_START_MARKER_"
+  local tail_sentinel = "_TAIL_END_MARKER"
+  local body = string.rep("ab", 200) .. string.rep("中", 900) .. string.rep("cd", 200)
+  local big_content = head_sentinel .. body .. tail_sentinel
+  local fw = io.open(big_path, "w")
+  fw:write(big_content)
+  fw:close()
+  local is_cont = function(b) return b and b >= 0x80 and b <= 0xBF end
+
+  -- 用 mock LLM 驱动 read_file（走 process_exchange 的 3000 字节截断路径）
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "read_file", arguments = json.encode({path = big_path})}}}),
+    llm_content("读完了", nil, "stop"),
+  }
+  llm_idx = 0
+  local trunc_msgs = {}
+  local trunc_res = agent_test.process_exchange(trunc_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  next_llm = nil
+
+  local tool_content = nil
+  for _, m in ipairs(trunc_msgs) do
+    if m.role == "tool" and tostring(m.content):find("truncated", 1, true) ~= nil then
+      tool_content = m.content
+    end
+  end
+  local got_marker = tool_content ~= nil
+  local head_ok = got_marker and tool_content:find(head_sentinel, 1, true) ~= nil
+  local tail_ok = got_marker and tool_content:find(tail_sentinel, 1, true) ~= nil
+  -- UTF-8 安全: head 是原串前缀，其"后一字节"在原串中不是续字节（即切点恰好
+  -- 落在字符边界上——head 可以以完整多字节字符的末字节结尾，那正是续字节，
+  -- 所以判据看的是切点之后而不是 head 末字节）；tail 首字节不能是续字节。
+  local utf8_ok = false
+  if got_marker then
+    local marker_idx = tool_content:find("\n...\n[truncated ", 1, true)
+    local head_part = marker_idx and tool_content:sub(1, marker_idx - 1) or ""
+    local after = marker_idx and tool_content:find("\n...\n", marker_idx + 1, true) or nil
+    local tail_part = after and tool_content:sub(after + 4) or ""
+    -- head 后一字节在原串中:
+    local next_byte = big_content:byte(#head_part + 1)
+    -- tail 首字节（若 tail_part 非空）
+    local tb = tail_part:byte(1)
+    utf8_ok = not is_cont(next_byte) and (tb == nil or not is_cont(tb))
+  end
+  os.remove(big_path)
+  test("truncate: head+tail both kept", head_ok and tail_ok,
+    tostring(tool_content and tool_content:sub(1, 120) or "nil"))
+  test("truncate: marker has bytes + truncated", got_marker
+    and tool_content:find("truncated", 1, true) ~= nil
+    and tool_content:find("bytes", 1, true) ~= nil,
+    tostring(tool_content and tool_content:sub(1, 200) or "nil"))
+  test("truncate: UTF-8 boundaries not split", utf8_ok,
+    tostring(got_marker and tool_content:sub(1, 60) or "no marker"))
+  test("truncate: file tools get continuation hint with path",
+    got_marker and tool_content:find("use read_file with offset/limit", 1, true) ~= nil
+    and tool_content:find(big_path, 1, true) ~= nil,
+    tostring(tool_content and tool_content:sub(1, 300) or "nil"))
+  test("truncate: exchange still returns final answer", trunc_res
+    and trunc_res.text == "读完了", tostring(trunc_res and trunc_res.text))
+end
+
+-- 任务2: read_file 默认读超限（>400 行）→ 尾注续读指引；offset 续读可拿后续
+do
+  local rl_path = "test_readcap.txt"
+  local rl = {}
+  for i = 1, 450 do rl[i] = "caprow " .. i end
+  local fw = io.open(rl_path, "w")
+  fw:write(table.concat(rl, "\n"))
+  fw:close()
+  local rl_res = execute_tool("read_file", json.encode({path = rl_path}))
+  local rl_cont = execute_tool("read_file",
+    json.encode({path = rl_path, offset = 401, limit = 10}))
+  os.remove(rl_path)
+  test("read_file cap: note tells offset continuation",
+    type(rl_res) == "string" and rl_res:find("truncated: showing first 400 lines", 1, true) ~= nil
+    and rl_res:find("use read_file with offset=401", 1, true) ~= nil,
+    tostring(rl_res and rl_res:sub(-120)))
+  test("read_file cap: offset=401 continues reading",
+    type(rl_cont) == "string" and rl_cont:find("401. caprow 401", 1, true) ~= nil
+    and rl_cont:find("410. caprow 410", 1, true) ~= nil,
+    tostring(rl_cont and rl_cont:sub(1, 120)))
+end
+
+-- 任务3: search_files 超长行（>200 字节含中文）→ [line truncated 标记 + 无乱码
+do
+  local sf_path = "test_search_long.txt"
+  local long_line = string.rep("x", 80) .. string.rep("中", 60) .. string.rep("y", 100)
+  local fw = io.open(sf_path, "w")
+  fw:write("needle " .. long_line .. "\n")
+  fw:write("other line\n")
+  fw:close()
+  local sf_res = execute_tool("search_files",
+    json.encode({pattern = "needle", path = sf_path, max_line_length = 200}))
+  os.remove(sf_path)
+  test("search_files: long line gets truncation marker",
+    type(sf_res) == "string" and sf_res:find("[line truncated at 200]", 1, true) ~= nil,
+    tostring(sf_res and sf_res:sub(1, 300)))
+  test("search_files: marker line keeps head content, no torn UTF-8",
+    type(sf_res) == "string" and sf_res:find("needle ", 1, true) ~= nil
+    and sf_res:find(string.rep("x", 60), 1, true) ~= nil
+    and not sf_res:find("\239\191\189"),
+    tostring(sf_res and sf_res:sub(1, 300)))
 end
 
 internet.request = orig_request

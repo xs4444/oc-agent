@@ -231,6 +231,71 @@ if ok_tui and type(tui) == "table" then
   pcall(tui.setStatusData, nil)
 end
 
+-- ══════════════════════════════════════════════════════════════
+-- v0.3.24 状态栏读屏实证: ctx%/cache%/model 真实渲染
+-- （复制 init.lua:4427-4441 真实回调逻辑 + agent_test.cache_stats 真实现）
+-- ══════════════════════════════════════════════════════════════
+if ok_tui and type(tui) == "table" then
+  local gpu = require("component").gpu
+  -- 状态栏行 = height-1（同 resolution_test 锚点）
+  local function status_row_text()
+    local sw, sh = gpu.getResolution()
+    local parts = {}
+    for x = 1, sw do
+      local okg, c = pcall(gpu.get, x, sh - 1)
+      if okg and c then parts[#parts + 1] = c end
+    end
+    return table.concat(parts)
+  end
+  -- 复制 init.lua 回调逻辑（usage 用测试注入，模拟 LAST_USAGE）
+  local status_usage = nil
+  local status_cfg = {context_window = 128000, model = "mock-model"}
+  local function real_status_cb()
+    local parts = {}
+    if status_usage and status_usage.prompt_tokens then
+      local win = tonumber(status_cfg.context_window) or 128000
+      local pt = tonumber(status_usage.prompt_tokens) or 0
+      local pct = win > 0 and (pt / win * 100) or 0
+      parts[#parts + 1] = string.format("ctx %.0f%%", pct)
+      local hit, miss = agent_test.cache_stats(status_usage)
+      if hit and hit + miss > 0 then
+        parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100)
+      end
+    end
+    parts[#parts + 1] = status_cfg.model
+    return table.concat(parts, "  ")
+  end
+
+  -- 断言 9: 典型 usage（字符串字段 + cached_tokens）→ 状态栏含 ctx/cache/model
+  status_usage = {prompt_tokens = "446", prompt_tokens_details = {cached_tokens = 400}}
+  pcall(tui.setStatusData, real_status_cb)
+  local set9 = pcall(tui.setStatus, "Ready")
+  local row9 = status_row_text()
+  check("statusData shows ctx and cache",
+    set9 and row9:find("ctx", 1, true) ~= nil and row9:find("cache", 1, true) ~= nil
+    and row9:find("mock-model", 1, true) ~= nil and row9:find("Ready", 1, true) ~= nil,
+    "row='" .. row9 .. "'")
+
+  -- 断言 10: 无缓存字段 → 状态栏仍含 model（且含 ctx）
+  status_usage = {prompt_tokens = 1000}
+  local set10 = pcall(tui.setStatus, "Ready")
+  local row10 = status_row_text()
+  check("statusData shows model name",
+    set10 and row10:find("mock-model", 1, true) ~= nil and row10:find("ctx", 1, true) ~= nil,
+    "row='" .. row10 .. "'")
+
+  -- 断言 11: 怪异 usage（字符串 token + 非表 details）→ 不崩，状态栏仍含 model
+  status_usage = {prompt_tokens = "x", prompt_tokens_details = true}
+  local set11 = pcall(tui.setStatus, "Ready")
+  local row11 = status_row_text()
+  check("statusData survives weird usage",
+    set11 and row11:find("mock-model", 1, true) ~= nil,
+    "row='" .. row11 .. "'")
+
+  pcall(tui.setStatusData, nil)
+  status_usage = nil
+end
+
 -- 恢复
 internet.request = orig_request
 _G.__TEST_SET_UI(nil)
