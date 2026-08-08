@@ -1229,13 +1229,22 @@ if ok_tui and type(tui_mod) == "table" then
   pcall(tui_mod.debug_set_buffer, "single")
   local ok_single2 = pcall(tui_mod.drawInput)
   test("tui.drawInput singleline safe", ok_single2)
-  -- printHistory: 会话历史填充内容区（截断/跳过 folded/角色色/顺序）
+  -- printHistory: 会话历史填充内容区（完整显示/跳过 folded/角色色/顺序）
   tui_mod.init()
+  -- 真实语料: 仓库 README.md 全文（真实存在，避免假长字符串）
+  local real_text = ""
+  do
+    local rf = io.open("../README.md", "r")
+    if rf then
+      real_text = rf:read("*a") or ""
+      rf:close()
+    end
+  end
   local ph_msgs = {
     {role = "system", content = "[对话摘要] 摘要内容"},
     {role = "user", content = "历史问题1"},
     {role = "user", content = "折叠消息", folded = true},
-    {role = "assistant", content = string.rep("很长的回答", 50)},
+    {role = "assistant", content = real_text},
     {role = "user", content = "最近问题"},
   }
   local ph0 = #tui_mod.history()
@@ -1250,8 +1259,23 @@ if ok_tui and type(tui_mod) == "table" then
     ph_joined:sub(1, 150))
   test("printHistory skips folded", ph_joined:find("折叠消息", 1, true) == nil,
     ph_joined:sub(1, 150))
-  test("printHistory truncates long entries",
-    #ph_hist[#ph_hist].text <= 205, "#=" .. tostring(#ph_hist[#ph_hist].text))
+  -- 完整显示: assistant 长文本（真实 README 语料）不被截断
+  -- wrapText 折行会归一化连续空白（缩进/多空格→单空格），但绝不丢
+  -- 非空白字符 → 去空白规范化后应与原文一致（字节数会因空白归一化变小，
+  -- 不能直接比长度）
+  local ph0b = #tui_mod.history()
+  pcall(tui_mod.printHistory, {{role = "assistant", content = real_text}})
+  local phb_joined = ""
+  for i = ph0b + 1, #tui_mod.history() do
+    phb_joined = phb_joined .. tui_mod.history()[i].text
+  end
+  local norm = function(s) return tostring(s):gsub("%s+", "") end
+  local full_kept = norm(phb_joined) == norm(real_text)
+  test("printHistory keeps full content", full_kept,
+    "real=" .. tostring(#real_text) .. " shown=" .. tostring(#phb_joined))
+  -- 中文完整显示: README 含中文，无乱码/无截断残留
+  local ok_cjk_clean = ph_joined:find("%z") == nil and ph_joined:find("�") == nil
+  test("printHistory cjk full display clean", ok_cjk_clean, ph_joined:sub(-20))
   -- 清理
   pcall(tui_mod.cleanup)
 end
