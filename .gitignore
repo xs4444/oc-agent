@@ -18,6 +18,8 @@ nul
 
 # opencode 运行时（会话历史、临时状态）
 .opencode/
+.codegraph/
+watch_release_*.log
 
 # wiki 镜像（如需纳入版本控制，删除下面两行）
 wiki/raw/

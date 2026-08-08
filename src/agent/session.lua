@@ -39,7 +39,8 @@ local COMPACT_KEEP_MAX = 8      -- 保留条数封顶（防小消息全保留、
 local COMPACT_TRIGGER_COUNT = 48  -- 条数兜底（trim 60 条的 80%，防海量小消息退化）
 local COMPACT_WINDOW_RATIO = 0.6  -- 主触发: 估算 tokens ≥ 窗口 × 0.6（tokens 上限阈值驱动）
 
--- 估算 token（与 init.lua 同款）: 英文 ~4 字符/token，中文按 0.45 token/字节
+-- 估算 token（唯一实现，init.lua 引用本模块导出）: 英文 ~4 字符/token，
+-- 中文按 0.45 token/字节
 local function estimate_tokens(s)
   if not s then return 0 end
   s = tostring(s)
@@ -130,12 +131,13 @@ local function summarize_history(messages, config, previous_summary)
 
   -- Anchored summary (opencode-style): when a previous summary exists, ask the
   -- model to UPDATE it instead of summarizing from scratch. Keeps older facts
-  -- stable and saves tokens. KEEP 指令（opencode-acp 移植）: 行号标记
-  -- 关键消息原文，压缩后由 expand_keep_markers 展开。
-  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
+  -- stable and saves tokens. KEEP/REF 指令（opencode-acp 移植）: KEEP 行号标记
+  -- 嵌入关键原文，REF 行号标记做省 token 的引用指针；压缩后由
+  -- expand_keep_markers 展开。七节骨架（reasonix compact 借鉴）。
+  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nOrganize the summary with these sections: Standing facts（持续成立的事实）、Goal（当前目标）、Decisions（已做的决定及理由）、Files（涉及的文件与改动）、Commands（重要命令）、Errors（关键错误与教训）、Pending（未完成事项）。Omit sections that have nothing to report.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. For less critical messages, reference them cheaply with [[REF:N|简短描述]] instead of embedding the full text. Use at most 3 KEEP markers and at most 5 REF markers."
   local user_prompt
   if previous_summary and previous_summary ~= "" then
-    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
+    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nOrganize the summary with these sections: Standing facts（持续成立的事实）、Goal（当前目标）、Decisions（已做的决定及理由）、Files（涉及的文件与改动）、Commands（重要命令）、Errors（关键错误与教训）、Pending（未完成事项）。Omit sections that have nothing to report.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. For less critical messages, reference them cheaply with [[REF:N|简短描述]] instead of embedding the full text. Use at most 3 KEEP markers and at most 5 REF markers."
     user_prompt = "<previous-summary>\n" .. previous_summary .. "\n</previous-summary>\n\n<new-history>\n" .. transcript .. "\n</new-history>\n\nUpdate the summary."
   else
     user_prompt = "Summarize this conversation:\n\n" .. transcript
@@ -155,14 +157,17 @@ local function summarize_history(messages, config, previous_summary)
   return summary
 end
 
--- KEEP 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
--- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；越界引用保留原样并
--- 警告（非阻塞质量门——引用解析率是压缩质量指标，失败不阻断压缩）。
+-- KEEP/REF 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
+-- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；[[REF:N|desc]] 只展开为
+-- 引用指针 "[消息 N] desc"（描述来自摘要本身，不嵌入原文——省 token）。
+-- 越界引用保留原样并警告（非阻塞质量门——引用解析率是压缩质量指标，
+-- 失败不阻断压缩）。
 local KEEP_PATTERN = "%[%[KEEP:(%d+)%]%]"
+local REF_PATTERN = "%[%[REF:(%d+)%|([^%]]-)%]%]"
 local KEEP_EMBED_MAX_CHARS = 1000
 
 local function expand_keep_markers(summary, transcript_parts)
-  return (summary:gsub(KEEP_PATTERN, function(idx_s)
+  summary = (summary:gsub(KEEP_PATTERN, function(idx_s)
     local idx = tonumber(idx_s)
     local m = transcript_parts and transcript_parts[idx]
     if not m then
@@ -186,6 +191,16 @@ local function expand_keep_markers(summary, transcript_parts)
     local label = m.role or "?"
     return "\n--- [KEEP:" .. idx_s .. ": " .. label .. "] ---\n"
       .. content .. "\n--- end ---\n"
+  end))
+  -- REF 引用指针: 展开为 "[消息 N] desc"（不嵌原文）
+  return (summary:gsub(REF_PATTERN, function(idx_s, desc)
+    local idx = tonumber(idx_s)
+    local m = transcript_parts and transcript_parts[idx]
+    if not m then
+      print("[compact] REF 引用越界: " .. idx_s)
+      return "[[REF:" .. idx_s .. "|" .. desc .. "]]"
+    end
+    return "[消息 " .. idx .. "] " .. desc
   end))
 end
 
@@ -388,4 +403,6 @@ return {
   list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
+  -- 单一 token 估算实现（init.lua 引用，避免重复定义）
+  estimate_tokens = estimate_tokens,
 }

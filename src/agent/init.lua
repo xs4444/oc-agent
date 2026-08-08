@@ -84,6 +84,7 @@ local trim_history, compact_history, should_compact, summarize_history =
   session_mod.trim_history, session_mod.compact_history, session_mod.should_compact, session_mod.summarize_history
 local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
+local estimate_tokens = session_mod.estimate_tokens
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
 
 -- Tool registry + execution dispatcher (Phase 1 split). The deps
@@ -187,18 +188,6 @@ end
 
 -- 最近一次 LLM 响应的 usage（provider 上报；opencode TUI 同款数据源）
 local LAST_USAGE = nil
-
--- 粗略 token 估算（无 tokenizer，仅显示用途）: 英文 ~4 字符/token，
--- 中文按字节 3B/字 ≈ 0.45 token/字节
-local function estimate_tokens(s)
-  if not s then return 0 end
-  s = tostring(s)
-  local ascii, non_ascii = 0, 0
-  for i = 1, #s do
-    if s:byte(i) < 128 then ascii = ascii + 1 else non_ascii = non_ascii + 1 end
-  end
-  return math.floor(ascii / 4 + non_ascii * 0.45)
-end
 
 local function fmt_num(n)
   local s = tostring(math.floor(n or 0))
@@ -692,8 +681,15 @@ local function process_exchange(messages, config, user_input, persist, session)
 
   local final_text = {}
   local retried_400 = false
+  -- 工具循环轮次上限（oc-ai maxSteps / reasonix tool-round cap 借鉴）:
+  -- 每轮请求 +1；超过后注入提示消息，再做一次收尾请求。
+  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps) or 12
+  local tool_steps = 0
+  local tool_cap_reached = false
+  local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
   while true do
     io.write("Thinking...\n")
+    tool_steps = tool_steps + 1
     local response = chat(messages, config)
 
     if response.error then
@@ -742,6 +738,11 @@ local function process_exchange(messages, config, user_input, persist, session)
       final_text[#final_text + 1] = response.content
     end
 
+    local has_tool_calls = response.tool_calls and #response.tool_calls > 0
+    -- 任务1: 本轮触顶（超过轮次上限且模型还想调用工具）——不执行本轮工具，
+    -- 注入提示后做最后一次收尾请求
+    local cap_trigger = has_tool_calls and not tool_cap_reached and tool_steps > MAX_TOOL_STEPS
+
     local assistant_msg = {role = "assistant", content = response.content or ""}
     -- reasoning_content 必须完整传回（DeepSeek/Kimi thinking mode 要求：
     -- 网关校验后续请求中的 reasoning_content，缺失返回 400
@@ -749,7 +750,9 @@ local function process_exchange(messages, config, user_input, persist, session)
     if response.reasoning_content and response.reasoning_content ~= "" then
       assistant_msg.reasoning_content = response.reasoning_content
     end
-    if response.tool_calls then
+    -- 触顶轮（提示轮/收尾轮）丢弃 tool_calls：不执行、不入历史，
+    -- 防悬空 tool_calls（assistant 带 tool_calls 却无 tool 响应 → 网关 400）
+    if has_tool_calls and not tool_cap_reached and not cap_trigger then
       assistant_msg.tool_calls = response.tool_calls
     end
     messages[#messages + 1] = assistant_msg
@@ -758,66 +761,127 @@ local function process_exchange(messages, config, user_input, persist, session)
       else append_history(assistant_msg) end
     end
 
-    if not response.tool_calls or #response.tool_calls == 0 then
-      break
-    end
-
-    for _, tc in ipairs(response.tool_calls) do
-      local fn = tc["function"]
-      if fn then
-        local tool_name = fn.name or "?"
-        local tool_args = fn.arguments
-        -- TUI: 状态栏显示正在运行的工具
-        if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
-        local ok_call, result = pcall(execute_tool, tool_name, tool_args)
-        if not ok_call then
-          result = "Error: " .. tostring(result)
+    -- ── 任务2: reasoning-only 轮接受 + 空回答重试网（reasonix 借鉴）──
+    if not has_tool_calls then
+      local content_blank = not response.content or response.content:gsub("%s", "") == ""
+      local has_reasoning = response.reasoning_content ~= nil and response.reasoning_content ~= ""
+      if content_blank and has_reasoning and response.finish_reason == "stop" then
+        -- 情形 A（reasoningOnlyFinishHonoured）: content 空 + reasoning 非空 +
+        -- finish=stop → 接受该轮不重试（thinking 模式常见: 模型先想后答）
+        if #final_text == 0 then
+          print("[reasoning-only] 接受 reasoning-only 轮（无可见回答）")
+          return {content = "(模型仅产出思考未给出可见回答)", text = "(模型仅产出思考未给出可见回答)"}
         end
-        if type(result) == "string" and #result > MAX_TOOL_RESULT then
-          result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
-        end
-
-        -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
-        local KEY_FIELD = {
-          read_file="path", write_file="path", edit_file="path", append_file="path",
-          list_directory="path", shell_execute="command", component_doc="address",
-          component_invoke="method", web_search="query", subagent_call="task",
-          calc="expression", json_query="path", text_ops="op", component_list="filter",
-        }
-        local param_str = ""
-        local kf = KEY_FIELD[tool_name]
-        if kf and tool_args then
-          param_str = tool_args:match('"' .. kf .. '"%s*:%s*"([^"]*)"')
-                   or tool_args:match('"' .. kf .. '"%s*:%s*(%d+)') or ""
-          if #param_str > 30 then param_str = param_str:sub(1, 28) .. ".." end
-        end
-        local result_brief = ""
-        if type(result) == "string" then
-          result_brief = result:gsub("\n", " | "):sub(1, 60)
-          if #result > 60 then result_brief = result_brief .. "..." end
-        end
-        print("[" .. tool_name .. (param_str ~= "" and (" " .. param_str) or "") .. "] " .. result_brief)
-        local tool_msg = {
-          role = "tool",
-          tool_call_id = tc.id,
-          content = result
-        }
-        messages[#messages + 1] = tool_msg
-        if persist then
-          if session then append_session_history(session, tool_msg)
-          else append_history(tool_msg) end
+        break
+      elseif content_blank and not has_reasoning
+          and (response.finish_reason == "stop" or response.finish_reason == "length") then
+        -- 情形 B: 纯空回答 → 注入重试消息（限一次）
+        if not retried_empty then
+          retried_empty = true
+          print("[empty-reply] 空回答，注入重试消息（限一次）")
+          local retry_msg = {role = "user", content = "你的回复内容为空，请直接回答用户的问题。"}
+          messages[#messages + 1] = retry_msg
+          if persist then
+            if session then append_session_history(session, retry_msg)
+            else append_history(retry_msg) end
+          end
+          -- 继续循环（不 break）
+        else
+          break
         end
       else
-        local err_msg = "malformed tool_call (missing 'function')"
-        print("[error] " .. err_msg)
-        local tool_msg = {role = "tool", tool_call_id = tc.id or "?", content = "Error: " .. err_msg}
+        break
+      end
+    elseif tool_cap_reached then
+      -- 任务1 触顶收尾: 丢弃 tool_calls 只取 content（content 空 → 错误）
+      if #final_text == 0 then
+        print("[tool-cap] 触顶后仍返回工具调用且无 content，终止")
+        return {error = "工具循环超出轮次上限"}
+      end
+      break
+    elseif cap_trigger then
+      -- 任务1 触顶: 注入提示消息，再做一次收尾请求（本轮工具不执行）
+      tool_cap_reached = true
+      local notice = "已达到工具调用轮次上限（" .. MAX_TOOL_STEPS .. " 轮）。请基于已获得的工具结果立即给出最终回答，不要再调用工具。"
+      print("[tool-cap] " .. notice)
+      local notice_msg = {role = "user", content = notice}
+      messages[#messages + 1] = notice_msg
+      if persist then
+        if session then append_session_history(session, notice_msg)
+        else append_history(notice_msg) end
+      end
+    elseif response.finish_reason == "length" then
+      -- 任务3（pi agent-loop 借鉴）: finish_reason=length 时工具参数可能被
+      -- 截断，不执行任何工具——为每个调用生成错误结果，让模型修正/收尾
+      print("[truncated] finish_reason=length，截断工具调用不执行")
+      for i, tc in ipairs(response.tool_calls) do
+        local trunc_err = "Error: tool call truncated (finish_reason=length), parameters incomplete — do NOT retry the same call. Summarize progress and answer directly."
+        local tool_msg = {role = "tool", tool_call_id = tc.id or ("call_" .. (i - 1)), content = trunc_err}
         messages[#messages + 1] = tool_msg
         if persist then
           if session then append_session_history(session, tool_msg)
           else append_history(tool_msg) end
         end
       end
-    end
+      -- 继续循环让模型修正
+    else
+      for _, tc in ipairs(response.tool_calls) do
+          local fn = tc["function"]
+          if fn then
+            local tool_name = fn.name or "?"
+            local tool_args = fn.arguments
+            -- TUI: 状态栏显示正在运行的工具
+            if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
+            local ok_call, result = pcall(execute_tool, tool_name, tool_args)
+            if not ok_call then
+              result = "Error: " .. tostring(result)
+            end
+            if type(result) == "string" and #result > MAX_TOOL_RESULT then
+              result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
+            end
+
+            -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
+            local KEY_FIELD = {
+              read_file="path", write_file="path", edit_file="path", append_file="path",
+              list_directory="path", shell_execute="command", component_doc="address",
+              component_invoke="method", web_search="query", subagent_call="task",
+              calc="expression", json_query="path", text_ops="op", component_list="filter",
+            }
+            local param_str = ""
+            local kf = KEY_FIELD[tool_name]
+            if kf and tool_args then
+              param_str = tool_args:match('"' .. kf .. '"%s*:%s*"([^"]*)"')
+                       or tool_args:match('"' .. kf .. '"%s*:%s*(%d+)') or ""
+              if #param_str > 30 then param_str = param_str:sub(1, 28) .. ".." end
+            end
+            local result_brief = ""
+            if type(result) == "string" then
+              result_brief = result:gsub("\n", " | "):sub(1, 60)
+              if #result > 60 then result_brief = result_brief .. "..." end
+            end
+            print("[" .. tool_name .. (param_str ~= "" and (" " .. param_str) or "") .. "] " .. result_brief)
+            local tool_msg = {
+              role = "tool",
+              tool_call_id = tc.id,
+              content = result
+            }
+            messages[#messages + 1] = tool_msg
+            if persist then
+              if session then append_session_history(session, tool_msg)
+              else append_history(tool_msg) end
+            end
+          else
+            local err_msg = "malformed tool_call (missing 'function')"
+            print("[error] " .. err_msg)
+            local tool_msg = {role = "tool", tool_call_id = tc.id or "?", content = "Error: " .. err_msg}
+            messages[#messages + 1] = tool_msg
+            if persist then
+              if session then append_session_history(session, tool_msg)
+              else append_history(tool_msg) end
+            end
+          end
+        end
+      end
     end
   end
 
@@ -917,10 +981,9 @@ local function main(config, ...)
                 print("[subagent] reply sent for " .. tostring(req.id))
               else
                 print("[subagent] FAILED to send reply for " .. tostring(req.id))
-end
-      end
-      ::continue_tc::
-    end
+              end
+            end
+          end
         end
       end
     end

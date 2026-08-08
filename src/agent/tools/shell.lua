@@ -26,7 +26,7 @@ local GUARDS = {
   {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use read_file('/etc/os-release') for system info, or component_list/component_doc."},
   {pat = "^%s*head", hint = "head: not available in OpenOS. Use read_file with offset=1 and limit=N to read the first N lines."},
   {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
-  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use list_directory to find files, read_file to read, text_ops to search."},
+  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use search_files to search file contents, glob to find files."},
   {pat = "^%s*wc", hint = "wc: not available in OpenOS. Use read_file then text_ops op=length to count."},
   {pat = "^%s*curl", hint = "curl: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
   {pat = "^%s*wget", hint = "wget: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},

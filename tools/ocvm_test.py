@@ -148,11 +148,10 @@ class OcvmDriver:
             self.send(f"touch /mnt/{t}/.wtest 2>/dev/null && echo WRITE{t}")
             time.sleep(2)
             s2 = self.screen()
-            # 段定位用该候选自己的 touch 前缀（不能 rfind 通用前缀——
-            # 会取到最后一个候选的段，误判前一个候选）
-            idx = s2.rfind(f"touch /mnt/{t}/")
-            seg = s2[idx:] if idx >= 0 else s2
-            if f"WRITE{t}" in seg:
+            # 必须匹配 echo 输出的独立行（^WRITE{t}$），不能只查子串——
+            # 命令回显行本身含 "&& echo WRITE{t}"，子串检查恒真，会误选
+            # 只读根盘（touch 失败但命令文本仍在屏幕上）
+            if re.search(rf"(?m)^WRITE{t}\s*$", s2):
                 return t
         return None
 
