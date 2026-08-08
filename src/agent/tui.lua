@@ -130,7 +130,9 @@ function tui.drawHeader()
   g.setForeground(tui.colors.toolName)
   g.set(2, 1, "OC Agent")
   g.setForeground(tui.colors.statusText)
-  local hint = "/help | PgUp/PgDn scroll | /exit"
+  -- hint 只宣传实际可用的滚动方式：PgUp/PgDn 在部分游戏/远程环境
+  -- 不产生键码（荒野大师实测不可用），/up /down 命令是通用兜底
+  local hint = "/help | /up /down scroll | /exit"
   if state.width >= ulen(hint) + 16 then
     g.set(state.width - ulen(hint) - 1, 1, hint)
   end
