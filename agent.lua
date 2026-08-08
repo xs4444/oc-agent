@@ -1446,6 +1446,11 @@ end
 -- 返回报告字符串。
 local function collect(config, history)
   local lines = {}
+  -- 统一获取 computer 模块（pcall 保护：某些环境无此模块/require 返回 nil）。
+  -- 注意不能依赖全局 computer——pcall(computer.uptime) 的参数在 pcall 进入
+  -- 前求值，全局缺失（真机 OpenOS）会直接崩溃而非被捕获。
+  local ok_comp, computer = pcall(require, "computer")
+  if not ok_comp or type(computer) ~= "table" then computer = nil end
 
   lines[#lines + 1] = "=== OC Agent Debug Report ==="
   -- 时间: os.date 在无 RTC 时返回 epoch (1970)，此时回退用 uptime
@@ -1455,9 +1460,8 @@ local function collect(config, history)
     if ok_d and d and d:match("^20%d%d%-") then
       ts = d
     else
-      -- 用全局 computer（与下方 Uptime 行一致；require 的表调用在某些
-      -- 环境返回 nil，导致显示 "uptime ?"）
-      local ok_u, u = pcall(computer.uptime)
+      local ok_u, u = false
+      if computer then ok_u, u = pcall(computer.uptime) end
       ts = "uptime " .. ((ok_u and u and string.format("%.0f", u) .. "s") or "?")
     end
     lines[#lines + 1] = "Generated: " .. ts
@@ -1477,11 +1481,14 @@ local function collect(config, history)
   end
   lines[#lines + 1] = "Version: " .. ver
 
-  -- 运行状态
-  local computer = require("computer")
-  local ok_uptime, uptime = pcall(computer.uptime)
-  local ok_mem, free_mem = pcall(computer.freeMemory)
-  local ok_addr, addr = pcall(computer.address)
+  -- 运行状态（computer 已在函数顶部统一获取，可能为 nil；
+  -- pcall 参数求值陷阱同上：computer 为 nil 时须先判空再调用）
+  local ok_uptime, uptime = false
+  if computer then ok_uptime, uptime = pcall(computer.uptime) end
+  local ok_mem, free_mem = false
+  if computer then ok_mem, free_mem = pcall(computer.freeMemory) end
+  local ok_addr, addr = false
+  if computer then ok_addr, addr = pcall(computer.address) end
   lines[#lines + 1] = "Uptime: " .. (ok_uptime and string.format("%.1f", uptime) or "?") .. "s"
   lines[#lines + 1] = "Free memory: " .. (ok_mem and tostring(free_mem) or "?") .. " bytes"
   lines[#lines + 1] = "Computer address: " .. (ok_addr and tostring(addr) or "?")
