@@ -563,6 +563,11 @@ function tui.readInput()
           .. usub(state.inputBuffer, state.inputCursor + 1)
         state.inputCursor = state.inputCursor + 1
         state.completionCycle = nil
+      else
+        -- 诊断（v0.3.29 临时）: 未匹配任何分支的 key_down——用于定位荒野大师
+        -- 真机 Tab 无反应：若 Tab 事件到达但 char/code 值不同，会落入此分支
+        -- 并显示实际值；若状态栏仍无变化则事件根本未到达 agent。
+        tui.setStatus("kd?" .. tostring(char) .. "/" .. tostring(code))
       end
       pcall(tui.drawInput)
     elseif ev == "clipboard" then
