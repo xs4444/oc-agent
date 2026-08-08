@@ -86,6 +86,7 @@ local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
 local estimate_tokens = session_mod.estimate_tokens
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
+local TOOL_RESULT_KEEP = session_mod.TOOL_RESULT_KEEP
 
 -- Tool registry + execution dispatcher (Phase 1 split). The deps
 -- table is built once at module scope (not on every call) to avoid
@@ -190,6 +191,35 @@ end
 
 -- 最近一次 LLM 响应的 usage（provider 上报；opencode TUI 同款数据源）
 local LAST_USAGE = nil
+
+-- UTF-8 安全截断: 取前 n 字节，回退到字符边界（不劈裂多字节字符）。
+-- 规则: 续字节 = 0x80-0xBF；单字节 < 0x80；起始字节 0xC0+。
+-- 切点 p 合法当且仅当 p == #s 或 s:byte(p+1) 不是续字节（下一字符从头开始）。
+-- 从 n 往回找：若 byte(p+1) 是续字节，说明字符被劈裂，前移一位。
+local function utf8_safe_cut(s, n)
+  if not s or #s <= n then return s end
+  local cut = n
+  while cut < #s and cut >= 1 do
+    local b = s:byte(cut + 1)
+    if not b or b < 0x80 or b >= 0xC0 then break end
+    cut = cut - 1  -- 下一字节是续字节 → 当前切点劈裂字符，回退
+  end
+  if cut < 0 then cut = 0 end  -- 0 = 空（首个字符都放不下时不劈裂）
+  return s:sub(1, cut)
+end
+
+-- UTF-8 安全尾部截断: 从末尾保留约 n 字节，向前扫描对齐到字符边界
+-- （跳过头部可能是续字节的部分——它属于前一个被切掉的字符）。
+local function utf8_safe_tail(s, n)
+  if not s or #s <= n then return s end
+  local start = #s - n + 1
+  while start <= #s do
+    local b = s:byte(start)
+    if not b or b < 0x80 or b >= 0xC0 then break end
+    start = start + 1  -- 续字节属于前一个字符，跳过
+  end
+  return s:sub(start)
+end
 
 local function fmt_num(n)
   local s = tostring(math.floor(n or 0))
@@ -853,7 +883,25 @@ local function process_exchange(messages, config, user_input, persist, session)
               result = "Error: " .. tostring(result)
             end
             if type(result) == "string" and #result > MAX_TOOL_RESULT then
-              result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
+              -- head+tail 双保（reasonix 借鉴）: 前/后各 TOOL_RESULT_KEEP 字节，
+              -- UTF-8 安全切分（不劈裂多字节字符），中间加截断标记 + 续读提示。
+              local head = utf8_safe_cut(result, TOOL_RESULT_KEEP)
+              local tail = utf8_safe_tail(result, TOOL_RESULT_KEEP)
+              local cut_bytes = #result - (#head + #tail)
+              local marker = "\n...\n[truncated " .. cut_bytes .. " bytes] (head+tail kept)\n...\n"
+              -- 续读提示（按工具类型）: 文件类工具给出路径续读指引
+              local path = tool_args and tool_args:match('"path"%s*:%s*"([^"]*)"')
+              if tool_name == "read_file" or tool_name == "edit_file"
+                  or tool_name == "append_file" or tool_name == "list_directory" then
+                if path and path ~= "" then
+                  marker = marker .. "\n[full output exceeds cap; use read_file with offset/limit to read the rest of " .. path .. "]"
+                else
+                  marker = marker .. "\n[full output exceeds cap; use read_file with offset/limit to read the rest]"
+                end
+              else
+                marker = marker .. "\n[output truncated at " .. MAX_TOOL_RESULT .. " bytes (head+tail); rerun with narrower arguments to see the middle]"
+              end
+              result = head .. marker .. tail
             end
 
             -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
@@ -1048,7 +1096,7 @@ local function main(config, ...)
           parts[#parts + 1] = string.format("ctx %.0f%%", pct)
           local hit, miss = cache_stats(LAST_USAGE)
           if hit and hit + miss > 0 then
-            parts[#parts + 1] = string.format("cache %d%%", hit / (hit + miss) * 100)
+            parts[#parts + 1] = string.format("cache %.0f%%", hit / (hit + miss) * 100)
           end
         end
         parts[#parts + 1] = config.model

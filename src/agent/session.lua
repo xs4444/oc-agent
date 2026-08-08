@@ -31,6 +31,9 @@ local history_path = config_mod.history_path
 local MAX_HISTORY = 60
 local MAX_HISTORY_BYTES = 200000  -- ~200KB budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
+-- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
+-- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。
+local TOOL_RESULT_KEEP = 1500
 
 local COMPACT_KEEP = 4          -- 保留条数下限
 local COMPACT_KEEP_MIN_TOKENS = 1500  -- 保留 token 保底（不足时向前补充，
@@ -403,6 +406,8 @@ return {
   list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
+  -- head+tail 每半预算（init.lua 截断用）
+  TOOL_RESULT_KEEP = TOOL_RESULT_KEEP,
   -- 单一 token 估算实现（init.lua 引用，避免重复定义）
   estimate_tokens = estimate_tokens,
 }
