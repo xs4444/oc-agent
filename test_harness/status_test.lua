@@ -49,7 +49,7 @@ if not agent_path then
 end
 log("agent at " .. tostring(agent_path))
 
--- 读取产物 agent.lua 源码，注入测试接缝（仅暴露 UI_INPUT setter，不改逻辑）
+-- 读取产物 agent.lua 源码，注入测试接缝（仅暴露 setter，不改逻辑）
 local f_src = io.open(agent_path, "r")
 local src = f_src and f_src:read("*a") or ""
 if f_src then f_src:close() end
@@ -59,6 +59,13 @@ check("UI_INPUT seam pattern found", seam_ok, "pattern=" .. SEAM_PATTERN)
 if not seam_ok then log("RESULT: " .. PASS .. " pass, " .. FAIL .. " fail") return end
 local seam_src = src:gsub(SEAM_PATTERN,
   "local UI_INPUT = nil\n_G.__TEST_SET_UI = function(f) UI_INPUT = f end", 1)
+-- v0.3.24: UI_HOOKS 也是模块级 local（onAssistantText 钩子）→ 同样注入 setter
+local SEAM_HOOKS_PATTERN = "local UI_HOOKS = {onToolCall = nil, onAssistantText = nil}"
+if seam_src:find(SEAM_HOOKS_PATTERN, 1, true) then
+  seam_src = seam_src:gsub(SEAM_HOOKS_PATTERN,
+    "local UI_HOOKS = {onToolCall = nil, onAssistantText = nil}\n"
+    .. "_G.__TEST_SET_HOOKS = function(h) UI_HOOKS.onAssistantText = h end", 1)
+end
 
 _TEST_MODE = true
 local chunk, lerr = load(seam_src, "=" .. agent_path)
@@ -70,6 +77,8 @@ if not ok then log("RESULT: " .. PASS .. " pass, " .. FAIL .. " fail") return en
 -- 验证接缝生效: __TEST_SET_UI 可用
 check("UI_INPUT setter injected", type(_G.__TEST_SET_UI) == "function",
   tostring(type(_G.__TEST_SET_UI)))
+check("UI_HOOKS setter injected", type(_G.__TEST_SET_HOOKS) == "function",
+  tostring(type(_G.__TEST_SET_HOOKS)))
 
 -- agent_test 钩子: process_exchange 入口（_TEST_MODE 下由 agent.lua 暴露）
 local pe = agent_test and agent_test.process_exchange
@@ -167,8 +176,64 @@ check("process_exchange succeeds",
 check("state status clean", tui_call_ok and repl_call_ok,
   "tui_ok=" .. tostring(tui_call_ok) .. " repl_ok=" .. tostring(repl_call_ok))
 
+-- ══════════════════════════════════════════════════════════════
+-- v0.3.24 新增断言
+-- ══════════════════════════════════════════════════════════════
+
+-- 断言 6+7: onAssistantText 钩子（TUI 下 assistant 输出走钩子而非 print）
+local ok_tui, tui = pcall(require, "agent.tui")
+check("tui module available", ok_tui and type(tui) == "table", tostring(ok_tui))
+if ok_tui and type(tui) == "table" then
+  local tui_init_ok = pcall(function() tui.init({}) end)
+  check("tui init ok", tui_init_ok, tostring(tui_init_ok))
+
+  -- 注入 onAssistantText 捕获钩子（模拟 TUI 注册行为）
+  local captured_ast = {}
+  _G.__TEST_SET_HOOKS(function(s) captured_ast[#captured_ast + 1] = tostring(s) end)
+  _G.__TEST_SET_UI(function() return "" end)  -- TUI 模式
+  next_llm = { llm_content("hello world") }
+  llm_idx = 0
+  local ast_ok, ast_res = pcall(function()
+    return agent_test.process_exchange({}, MIN_CFG, "hi", false)
+  end)
+  local ast_joined = table.concat(captured_ast, "")
+  check("onAssistantText hook called",
+    ast_ok and ast_joined:find("hello world", 1, true) ~= nil,
+    "captured='" .. ast_joined:sub(1, 120) .. "'")
+
+  -- 断言: assistant 渲染走角色色（printRole 存在于 tui 模块 + history 含文本）
+  local ph_ok, ph = pcall(tui.printRole, "assistant", "hello world")
+  local hist_after = tui.history()
+  local hist_joined = ""
+  for _, e in ipairs(hist_after) do hist_joined = hist_joined .. tostring(e.text or "") end
+  check("onAssistantText prints role color",
+    ph_ok and hist_joined:find("hello world", 1, true) ~= nil,
+    "hist='" .. hist_joined:sub(1, 120) .. "'")
+
+  -- 断言: user input 回显路径（printRole user 前缀 "> " 渲染）
+  local h0 = #tui.history()
+  local pu_ok, pu = pcall(tui.printRole, "user", "test input")
+  local hist2 = tui.history()
+  local hist2_joined = ""
+  for i = h0 + 1, #hist2 do hist2_joined = hist2_joined .. tostring(hist2[i].text or "") end
+  check("user input echoed",
+    pu_ok and hist2_joined:find("test input", 1, true) ~= nil,
+    "hist='" .. hist2_joined:sub(1, 120) .. "'")
+end
+
+-- 断言 8: statusData 回调防御（pcall 兜底，回调抛错不崩）
+if ok_tui and type(tui) == "table" then
+  local sd_ok = pcall(tui.setStatusData, function() error("boom") end)
+  local set_ok = pcall(tui.setStatus, "Ready")
+  check("statusData callback defensive", sd_ok and set_ok,
+    "sd_ok=" .. tostring(sd_ok) .. " set_ok=" .. tostring(set_ok))
+  -- 清理: 恢复默认
+  pcall(tui.setStatusData, nil)
+end
+
 -- 恢复
 internet.request = orig_request
 _G.__TEST_SET_UI(nil)
+_G.__TEST_SET_HOOKS(nil)
 log("")
 log("RESULT: " .. PASS .. " pass, " .. FAIL .. " fail")
