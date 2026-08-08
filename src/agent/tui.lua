@@ -92,6 +92,21 @@ function tui.init(config)
   state.width, state.height = w, h
   state.running = true
   state.scrollOffset = 0
+  -- 滚动型渲染探测（荒野大师等终端滚动型模拟器）：写入最底行 y=h 会触发
+  -- 整屏上滚（帧缓冲模拟器如 ocvm/OCEmu 无此行为）。探测：写 y=h 标记后
+  -- 读 y=1 是否被波及（滚动会把原第 2 行顶到第 1 行）。scrollSafe = true
+  -- 时布局整体上移一行（最底行 h 永不写入），杜绝滚动触发。
+  state.scrollSafe = false
+  local ok_g, gpu0 = pcall(function() return component.gpu end)
+  if ok_g and gpu0 and gpu0.set and gpu0.get then
+    local ok1, c1 = pcall(gpu0.get, 1, 1)
+    local ok2 = pcall(gpu0.set, 1, h, "Z")
+    local ok3, c2 = pcall(gpu0.get, 1, 1)
+    pcall(gpu0.set, 1, h, " ")  -- 清理标记
+    if ok1 and ok2 and ok3 and c1 ~= c2 then
+      state.scrollSafe = true
+    end
+  end
   state.history = {}
   state.inputBuffer = ""
   state.inputCursor = 0
@@ -138,11 +153,11 @@ function tui.drawHeader()
   end
 end
 
--- 绘制状态栏（h-1 行: status 左 + 动态数据右 + scroll 指示）
+-- 绘制状态栏（h-1 行: status 左 + 动态数据右 + scroll 指示; scrollSafe 时上移一行）
 function tui.drawStatus()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
-  local y = state.height - 1
+  local y = state.height - 1 - (state.scrollSafe and 1 or 0)
   g.setBackground(tui.colors.status)
   g.setForeground(tui.colors.statusText)
   g.fill(1, y, state.width, 1, " ")
@@ -181,9 +196,9 @@ function tui.setStatus(msg)
   pcall(tui.drawStatus)
 end
 
--- 内容区边界（含滚动窗口高度）
+-- 内容区边界（含滚动窗口高度）; scrollSafe 时整体上移一行（内容区少 1 行）
 local function getContentBounds()
-  return 2, 2, state.width - 2, state.height - 3
+  return 2, 2, state.width - 2, state.height - 3 - (state.scrollSafe and 1 or 0)
 end
 
 -- 逐词换行 + 长词硬断（中文按 unicode 字符）
@@ -304,8 +319,9 @@ function tui.scrollToTop()
 end
 
 -- 翻页步长（半屏）——/up /down 命令与 PgUp/PgDn 失效时的兜底
+-- scrollSafe 时内容区矮 1 行 → 步长同步 -1，与内容区一致
 function tui.pageStep()
-  return math.max(1, state.height - 4)
+  return math.max(1, state.height - 4 - (state.scrollSafe and 1 or 0))
 end
 
 -- 多行 buffer 支持: 粘贴内容（含 \n）完整保留，输入行只显示最后一行，
@@ -322,11 +338,12 @@ local function lastLineStart(buffer)
   return idx
 end
 
--- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示）
+-- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示;
+-- scrollSafe 时上移一行, 最底行 h 永不写入——杜绝终端滚动型模拟器触发整屏上滚）
 function tui.drawInput()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
-  local y = state.height
+  local y = state.height - (state.scrollSafe and 1 or 0)
   g.setBackground(tui.colors.background)
   g.fill(1, y, state.width, 1, " ")
   local line_start = lastLineStart(state.inputBuffer)
@@ -540,9 +557,9 @@ function tui.readInput()
           state.inputCursor = ulen(state.inputBuffer)
         end
       elseif code == 201 then -- PgUp: 上滚
-        tui.scrollUp(state.height - 4)
+        tui.scrollUp(tui.pageStep())
       elseif code == 209 then -- PgDn: 下滚
-        tui.scrollDown(state.height - 4)
+        tui.scrollDown(tui.pageStep())
       elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
         state.completionCycle = nil
       elseif ch == 9 or code == 15
