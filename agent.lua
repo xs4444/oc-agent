@@ -1634,12 +1634,27 @@ local ok_c, component = pcall(require, "component")
 local ok_t, term = pcall(require, "term")
 local ok_e, event = pcall(require, "event")
 local ok_k, keyboard = pcall(require, "keyboard")
+-- computer 模块（pcall 保护）：readInput 光标闪烁计时用。**不能依赖全局
+-- computer**——荒野大师/OCEmu 无全局（debug.lua:59 同款坑：oc_mock 注入
+-- 全局 computer 掩盖，真机崩溃）。
+local ok_cp, computer = pcall(require, "computer")
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
 if not ok_t then term = {} end
 if not ok_e then event = {} end
 if not ok_k then keyboard = {} end
+if not ok_cp or type(computer) ~= "table" then computer = nil end
+
+-- 计时源：优先 computer.uptime()（真实 OC 开机秒），缺失时 os.clock()
+-- 兜底（闪烁计时仅装饰，精度无关紧要）
+local function now_seconds()
+  if computer and computer.uptime then
+    local ok_u, u = pcall(computer.uptime)
+    if ok_u and type(u) == "number" then return u end
+  end
+  return os.clock()
+end
 
 -- UTF-8 显示宽度（OC 等宽屏: ASCII 1 列, CJK/多字节 2 列——中文按 1 字符
 -- 计算会导致换行/光标/截断全部错位，长中文行溢出炸布局）
@@ -2064,7 +2079,7 @@ function tui.readInput()
   state.inputCursor = 0
   state.completionCycle = nil
   local cursorVisible = true
-  local lastBlink = computer.uptime()
+  local lastBlink = now_seconds()
 
   pcall(tui.drawInput)
 
@@ -2072,7 +2087,7 @@ function tui.readInput()
     local ev, _, char, code = event.pull(0.25)
 
     -- 光标闪烁
-    local now = computer.uptime()
+    local now = now_seconds()
     if now - lastBlink >= 0.5 then
       cursorVisible = not cursorVisible
       lastBlink = now
