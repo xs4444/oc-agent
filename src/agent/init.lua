@@ -688,7 +688,9 @@ local function process_exchange(messages, config, user_input, persist, session)
   local tool_cap_reached = false
   local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
   while true do
-    io.write("Thinking...\n")
+    -- TUI 模式（UI_INPUT ~= nil）不输出 "Thinking..."：状态栏 setStatus
+    -- 已实时显示；io.write 直写终端会与 TUI 屏幕叠加产生多状态行残留。
+    if not UI_INPUT then io.write("Thinking...\n") end
     tool_steps = tool_steps + 1
     local response = chat(messages, config)
 
