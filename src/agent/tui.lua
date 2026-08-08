@@ -154,8 +154,11 @@ function tui.drawStatus()
     g.setForeground(tui.colors.statusText)
   end
   if state.statusData then
-    local data = state.statusData()
-    if data and data ~= "" then
+    -- pcall 防御: 回调内任何异常（如 provider usage 结构怪异）都不应
+    -- 中断状态栏绘制——否则状态栏只剩 status 文本（真机曾现"完成后
+    -- 只剩 Ready，model/ctx/cache 全丢"）
+    local ok_data, data = pcall(state.statusData)
+    if ok_data and data and data ~= "" then
       local maxw = state.width - 8
       if ulen(data) > maxw then data = usub(data, 1, maxw - 1) .. "~" end
       g.set(state.width - ulen(data) - 1, y, data)
