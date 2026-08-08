@@ -2166,8 +2166,9 @@ function tui.history()
 end
 
 -- 进入 TUI 时显示会话历史（填充内容区，避免空屏/下半空白）:
--- 最近优先，最多 30 条，每条截断 200 字符；跳过 folded 折叠段与空内容；
+-- 最近优先，最多 30 条；跳过 folded 折叠段与空内容；
 -- 摘要消息（[对话摘要] system）以 dim 色显示。按旧→新顺序打印。
+-- 当前不截断：完整显示（内容区可滚动查看全文）。
 function tui.printHistory(messages)
   if type(messages) ~= "table" then return end
   local collected = {}
@@ -2176,14 +2177,14 @@ function tui.printHistory(messages)
     local m = messages[i]
     if m and not m.folded then
       if m.role == "user" then
-        local c = tostring(m.content or ""):sub(1, 200)
+        local c = tostring(m.content or "")
         if c ~= "" then collected[#collected + 1] = {role = "user", text = c} end
       elseif m.role == "assistant" and m.content then
-        local c = tostring(m.content):sub(1, 200)
+        local c = tostring(m.content)
         if c ~= "" then collected[#collected + 1] = {role = "assistant", text = c} end
       elseif m.role == "system" and type(m.content) == "string"
           and m.content:match("^%[对话摘要%]") then
-        collected[#collected + 1] = {role = "system", text = tostring(m.content):sub(1, 200)}
+        collected[#collected + 1] = {role = "system", text = m.content}
       end
     end
   end
@@ -4105,9 +4106,11 @@ local function process_exchange(messages, config, user_input, persist, session)
       retried_400 = false
 
     -- 保存 provider 上报的 usage（/ctx 显示用）+ 运行时自动显示
+    -- TUI 模式（UI_INPUT ~= nil）跳过 [ctx] 行：状态栏 setStatusData 已实时
+    -- 显示 ctx%/cache%，内容区再打 [ctx] 行是命令行时期残留。
     if response.usage then
       LAST_USAGE = response.usage
-      if config.ctx_auto ~= false then show_ctx_line(response.usage, config) end
+      if config.ctx_auto ~= false and not UI_INPUT then show_ctx_line(response.usage, config) end
     end
 
     if response.reasoning_content then
@@ -4310,7 +4313,14 @@ local function main(config, ...)
     local event = require("event")
     local busy_session = nil  -- currently-processing session (opencode Active state)
 
-    while true do
+  -- REPL（无 TUI）模式欢迎语：TUI 模式不打印命令行时期的欢迎文本，
+  -- 由 "OC Agent TUI ready" 取代（避免残留）。
+  if not ui then
+    print("OC Agent ready. Model: " .. config.model)
+    print("Type /help for commands.")
+  end
+
+  while true do
       local sig = {event.pull("modem_message")}
       if sig[1] == "modem_message" then
         local sender = sig[3]
@@ -4373,9 +4383,6 @@ local function main(config, ...)
 
   local messages = load_history()
   local term_history = {}
-
-  print("OC Agent ready. Model: " .. config.model)
-  print("Type /help for commands.")
 
   -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
   -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。

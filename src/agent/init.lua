@@ -724,9 +724,11 @@ local function process_exchange(messages, config, user_input, persist, session)
       retried_400 = false
 
     -- 保存 provider 上报的 usage（/ctx 显示用）+ 运行时自动显示
+    -- TUI 模式（UI_INPUT ~= nil）跳过 [ctx] 行：状态栏 setStatusData 已实时
+    -- 显示 ctx%/cache%，内容区再打 [ctx] 行是命令行时期残留。
     if response.usage then
       LAST_USAGE = response.usage
-      if config.ctx_auto ~= false then show_ctx_line(response.usage, config) end
+      if config.ctx_auto ~= false and not UI_INPUT then show_ctx_line(response.usage, config) end
     end
 
     if response.reasoning_content then
@@ -929,7 +931,14 @@ local function main(config, ...)
     local event = require("event")
     local busy_session = nil  -- currently-processing session (opencode Active state)
 
-    while true do
+  -- REPL（无 TUI）模式欢迎语：TUI 模式不打印命令行时期的欢迎文本，
+  -- 由 "OC Agent TUI ready" 取代（避免残留）。
+  if not ui then
+    print("OC Agent ready. Model: " .. config.model)
+    print("Type /help for commands.")
+  end
+
+  while true do
       local sig = {event.pull("modem_message")}
       if sig[1] == "modem_message" then
         local sender = sig[3]
@@ -992,9 +1001,6 @@ local function main(config, ...)
 
   local messages = load_history()
   local term_history = {}
-
-  print("OC Agent ready. Model: " .. config.model)
-  print("Type /help for commands.")
 
   -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
   -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。

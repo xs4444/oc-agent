@@ -608,8 +608,9 @@ function tui.history()
 end
 
 -- 进入 TUI 时显示会话历史（填充内容区，避免空屏/下半空白）:
--- 最近优先，最多 30 条，每条截断 200 字符；跳过 folded 折叠段与空内容；
+-- 最近优先，最多 30 条；跳过 folded 折叠段与空内容；
 -- 摘要消息（[对话摘要] system）以 dim 色显示。按旧→新顺序打印。
+-- 当前不截断：完整显示（内容区可滚动查看全文）。
 function tui.printHistory(messages)
   if type(messages) ~= "table" then return end
   local collected = {}
@@ -618,14 +619,14 @@ function tui.printHistory(messages)
     local m = messages[i]
     if m and not m.folded then
       if m.role == "user" then
-        local c = tostring(m.content or ""):sub(1, 200)
+        local c = tostring(m.content or "")
         if c ~= "" then collected[#collected + 1] = {role = "user", text = c} end
       elseif m.role == "assistant" and m.content then
-        local c = tostring(m.content):sub(1, 200)
+        local c = tostring(m.content)
         if c ~= "" then collected[#collected + 1] = {role = "assistant", text = c} end
       elseif m.role == "system" and type(m.content) == "string"
           and m.content:match("^%[对话摘要%]") then
-        collected[#collected + 1] = {role = "system", text = tostring(m.content):sub(1, 200)}
+        collected[#collected + 1] = {role = "system", text = m.content}
       end
     end
   end
