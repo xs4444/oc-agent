@@ -5,7 +5,7 @@
     "debug.lua": 6216,
     "execute.lua": 2769,
     "http.lua": 4417,
-    "init.lua": 50827,
+    "init.lua": 51033,
     "json.lua": 6280,
     "session.lua": 18744,
     "subagent.lua": 4121,
@@ -21,5 +21,5 @@
     "tui.lua": 23951,
     "docs.lua": 14689
   },
-  "version": "2026-08-08T1134"
+  "version": "2026-08-08T1201"
 }
