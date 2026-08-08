@@ -542,9 +542,11 @@ function tui.readInput()
         tui.scrollDown(state.height - 4)
       elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
         state.completionCycle = nil
-      elseif ch == 9 or code == 15 then -- Tab: 补全循环（char 或 code 双判断——
-        -- oc-ai 用 char==9；荒野大师等模拟器对 Tab 可能只派发 char 不派发
-        -- code 15（实测原生 shell Tab 可用而我们 code 判断接不住））
+      elseif ch == 9 or code == 15
+          or (ch == 32 and keyboard.isControlDown and keyboard.isControlDown()) then
+        -- 补全触发: Tab（char 或 code 双判断——oc-ai 用 char==9）或 Ctrl+Space。
+        -- 荒野大师全屏 TUI 实测: Home/End/方向键/Ctrl 组合全有效但 Tab 事件
+        -- 被游戏客户端拦截（Minecraft Tab=玩家列表），故加 Ctrl+Space 备用触发。
         local cands = completionCandidates(state.inputBuffer)
         -- 可见诊断反馈: 无候选/有候选都更新状态栏, 用于区分
         -- "Tab 事件没到达"(状态栏无变化) vs "候选为空"(显示 Tab: no match)
