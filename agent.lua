@@ -248,30 +248,6 @@ local RETRY_DELAY_CAP = 300        -- 单次等待封顶（秒）
 -- 避免 e2e/回归在端点持续故障时长时间挂起
 local MAX_RETRY_BUDGET = _TEST_MODE and 60 or 3600
 
--- POST with automatic retry（指数退避 + 总预算上限）
-local function http_post(url, headers, body)
-  local attempt = 0
-  local deadline = os.clock() + MAX_RETRY_BUDGET
-  while true do
-    attempt = attempt + 1
-    local code, resp, err = http_post_once(url, headers, body)
-    local transient = err ~= nil or code == 429 or (code and code >= 500)
-    if not transient then
-      return code, resp, err
-    end
-    local now = os.clock()
-    if now >= deadline then
-      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
-      return code, resp, err
-    end
-    local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
-    if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
-    local remaining = deadline - now
-    if wait > remaining then wait = remaining end
-    os.sleep(wait)
-  end
-end
-
 -- Single request attempt. Returns code, body, err.
 local function http_post_once(url, headers, body)
   local internet = require("internet")
@@ -318,7 +294,7 @@ local function http_post_once(url, headers, body)
   return code or 0, response_body, nil
 end
 
--- POST with automatic retry（指数退避 + 总预算上限，见上方常量说明）
+-- POST with automatic retry（指数退避 + 总预算上限）
 local function http_post(url, headers, body)
   local attempt = 0
   local deadline = os.clock() + MAX_RETRY_BUDGET
@@ -486,7 +462,8 @@ local COMPACT_KEEP_MAX = 8      -- 保留条数封顶（防小消息全保留、
 local COMPACT_TRIGGER_COUNT = 48  -- 条数兜底（trim 60 条的 80%，防海量小消息退化）
 local COMPACT_WINDOW_RATIO = 0.6  -- 主触发: 估算 tokens ≥ 窗口 × 0.6（tokens 上限阈值驱动）
 
--- 估算 token（与 init.lua 同款）: 英文 ~4 字符/token，中文按 0.45 token/字节
+-- 估算 token（唯一实现，init.lua 引用本模块导出）: 英文 ~4 字符/token，
+-- 中文按 0.45 token/字节
 local function estimate_tokens(s)
   if not s then return 0 end
   s = tostring(s)
@@ -577,12 +554,13 @@ local function summarize_history(messages, config, previous_summary)
 
   -- Anchored summary (opencode-style): when a previous summary exists, ask the
   -- model to UPDATE it instead of summarizing from scratch. Keeps older facts
-  -- stable and saves tokens. KEEP 指令（opencode-acp 移植）: 行号标记
-  -- 关键消息原文，压缩后由 expand_keep_markers 展开。
-  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
+  -- stable and saves tokens. KEEP/REF 指令（opencode-acp 移植）: KEEP 行号标记
+  -- 嵌入关键原文，REF 行号标记做省 token 的引用指针；压缩后由
+  -- expand_keep_markers 展开。七节骨架（reasonix compact 借鉴）。
+  local sys_prompt = "You are a conversation summarizer for an AI agent running inside OpenComputers (Minecraft). Keep: user goals and questions, decisions, tool results that matter, file paths, component addresses, and any constraints. Preserve factual details. Output only the summary, no preamble.\n\nOrganize the summary with these sections: Standing facts（持续成立的事实）、Goal（当前目标）、Decisions（已做的决定及理由）、Files（涉及的文件与改动）、Commands（重要命令）、Errors（关键错误与教训）、Pending（未完成事项）。Omit sections that have nothing to report.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it in the summary with a marker: [[KEEP:N]] followed by the original text in quotes. For less critical messages, reference them cheaply with [[REF:N|简短描述]] instead of embedding the full text. Use at most 3 KEEP markers and at most 5 REF markers."
   local user_prompt
   if previous_summary and previous_summary ~= "" then
-    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. Use at most 3 markers."
+    sys_prompt = "You maintain an anchored summary for an AI agent conversation. Update the previous summary below using the new conversation history: keep still-true details, remove stale ones, merge new facts. Keep it concise. Output only the updated summary.\n\nOrganize the summary with these sections: Standing facts（持续成立的事实）、Goal（当前目标）、Decisions（已做的决定及理由）、Files（涉及的文件与改动）、Commands（重要命令）、Errors（关键错误与教训）、Pending（未完成事项）。Omit sections that have nothing to report.\n\nTranscript lines are numbered [N]. If any message is critical to preserve VERBATIM (exact tool result, exact error text, exact user request), inline it with a marker: [[KEEP:N]] followed by the original text in quotes. For less critical messages, reference them cheaply with [[REF:N|简短描述]] instead of embedding the full text. Use at most 3 KEEP markers and at most 5 REF markers."
     user_prompt = "<previous-summary>\n" .. previous_summary .. "\n</previous-summary>\n\n<new-history>\n" .. transcript .. "\n</new-history>\n\nUpdate the summary."
   else
     user_prompt = "Summarize this conversation:\n\n" .. transcript
@@ -602,14 +580,17 @@ local function summarize_history(messages, config, previous_summary)
   return summary
 end
 
--- KEEP 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
--- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；越界引用保留原样并
--- 警告（非阻塞质量门——引用解析率是压缩质量指标，失败不阻断压缩）。
+-- KEEP/REF 标记展开（opencode-acp keep-markers 移植）: 摘要里的 [[KEEP:N]]
+-- 替换为对应消息原文（截断 KEEP_EMBED_MAX_CHARS）；[[REF:N|desc]] 只展开为
+-- 引用指针 "[消息 N] desc"（描述来自摘要本身，不嵌入原文——省 token）。
+-- 越界引用保留原样并警告（非阻塞质量门——引用解析率是压缩质量指标，
+-- 失败不阻断压缩）。
 local KEEP_PATTERN = "%[%[KEEP:(%d+)%]%]"
+local REF_PATTERN = "%[%[REF:(%d+)%|([^%]]-)%]%]"
 local KEEP_EMBED_MAX_CHARS = 1000
 
 local function expand_keep_markers(summary, transcript_parts)
-  return (summary:gsub(KEEP_PATTERN, function(idx_s)
+  summary = (summary:gsub(KEEP_PATTERN, function(idx_s)
     local idx = tonumber(idx_s)
     local m = transcript_parts and transcript_parts[idx]
     if not m then
@@ -633,6 +614,16 @@ local function expand_keep_markers(summary, transcript_parts)
     local label = m.role or "?"
     return "\n--- [KEEP:" .. idx_s .. ": " .. label .. "] ---\n"
       .. content .. "\n--- end ---\n"
+  end))
+  -- REF 引用指针: 展开为 "[消息 N] desc"（不嵌原文）
+  return (summary:gsub(REF_PATTERN, function(idx_s, desc)
+    local idx = tonumber(idx_s)
+    local m = transcript_parts and transcript_parts[idx]
+    if not m then
+      print("[compact] REF 引用越界: " .. idx_s)
+      return "[[REF:" .. idx_s .. "|" .. desc .. "]]"
+    end
+    return "[消息 " .. idx .. "] " .. desc
   end))
 end
 
@@ -835,6 +826,8 @@ return {
   list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
+  -- 单一 token 估算实现（init.lua 引用，避免重复定义）
+  estimate_tokens = estimate_tokens,
 }
 end
 
@@ -1635,7 +1628,12 @@ function tui.init(config)
   config = config or {}
   if config.monochrome then tui.colors = tui.monoColors end
   local ok, w, h = pcall(function()
-    return component.gpu and component.gpu.getResolution()
+    -- 注意: 不能写 `return component.gpu and component.gpu.getResolution()`
+    -- —— Lua 的 and 只保留第一个返回值, getResolution 的高度会丢失(h=nil),
+    -- 导致恒走兜底 80x25。须显式分支保留多返回值。
+    local g = component.gpu
+    if g then return g.getResolution() end
+    return nil
   end)
   -- 异常分辨率兜底（某些模拟器/远控返回怪异值 → 标准 80x25）
   if not ok or type(w) ~= "number" or type(h) ~= "number"
@@ -2012,17 +2010,48 @@ function tui.readInput()
           state.completionCycle = nil
         end
       elseif code == 203 then -- Left（不跨行）
-        if state.inputCursor > line_start then state.inputCursor = state.inputCursor - 1 end
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          -- Ctrl+Left: 前一个单词边界（字符索引）
+          local pos = state.inputCursor
+          while pos > line_start and usub(state.inputBuffer, pos, pos):match("%s") do
+            pos = pos - 1
+          end
+          while pos > line_start and not usub(state.inputBuffer, pos, pos):match("%s") do
+            pos = pos - 1
+          end
+          state.inputCursor = pos
+        elseif state.inputCursor > line_start then
+          state.inputCursor = state.inputCursor - 1
+        end
         state.completionCycle = nil
       elseif code == 205 then -- Right
-        if state.inputCursor < ulen(state.inputBuffer) then
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          -- Ctrl+Right: 下一个单词边界（字符索引）
+          local len = ulen(state.inputBuffer)
+          local pos = state.inputCursor
+          while pos < len and not usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
+            pos = pos + 1
+          end
+          while pos < len and usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
+            pos = pos + 1
+          end
+          state.inputCursor = pos
+        elseif state.inputCursor < ulen(state.inputBuffer) then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
-      elseif code == 199 then -- Home（行首）
-        state.inputCursor = line_start
-      elseif code == 207 then -- End（buffer 尾 = 最后一行尾）
-        state.inputCursor = ulen(state.inputBuffer)
+      elseif code == 199 then -- Home（行首; Ctrl=滚到顶）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollToTop()
+        else
+          state.inputCursor = line_start
+        end
+      elseif code == 207 then -- End（buffer 尾 = 最后一行尾; Ctrl=滚到底）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollToBottom()
+        else
+          state.inputCursor = ulen(state.inputBuffer)
+        end
       elseif code == 211 then -- Delete（最后一行内）
         local len = ulen(state.inputBuffer)
         if state.inputCursor < len then
@@ -2030,8 +2059,10 @@ function tui.readInput()
             .. usub(state.inputBuffer, state.inputCursor + 2)
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: 历史上翻（多行 buffer 时禁用——防覆盖粘贴内容）
-        if line_start == 0 and #state.cmdHistory > 0 then
+      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 否则历史上翻（多行 buffer 时禁用）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollUp(1)
+        elseif line_start == 0 and #state.cmdHistory > 0 then
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -2039,8 +2070,10 @@ function tui.readInput()
             state.inputCursor = ulen(state.inputBuffer)
           end
         end
-      elseif code == 208 then -- Down: 历史下翻（多行时禁用）
-        if line_start == 0 and state.cmdHistoryIndex > 0 then
+      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 否则历史下翻（多行时禁用）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollDown(1)
+        elseif line_start == 0 and state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             state.inputBuffer = state.savedInput
@@ -2053,6 +2086,8 @@ function tui.readInput()
         tui.scrollUp(state.height - 4)
       elseif code == 209 then -- PgDn: 下滚
         tui.scrollDown(state.height - 4)
+      elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
+        state.completionCycle = nil
       elseif code == 15 then -- Tab: 补全循环
         local cands = completionCandidates(state.inputBuffer)
         if #cands > 0 then
@@ -2076,6 +2111,13 @@ function tui.readInput()
         state.inputCursor = state.inputCursor + ulen(char)
         state.completionCycle = nil
         pcall(tui.drawInput)
+      end
+    elseif ev == "scroll" then
+      -- 鼠标滚轮: char == 1 上滚 3 行, -1 下滚 3 行（oc-ai 同）
+      if char == 1 then
+        tui.scrollUp(3)
+      elseif char == -1 then
+        tui.scrollDown(3)
       end
     end
   end
@@ -2164,7 +2206,11 @@ end
 package.preload["agent.tools.file"] = function()
 -- ═══════════════════════════════════════════════════════════════
 -- agent.tools.file — file tools: read_file / edit_file / append_file
--- / write_file / list_directory.
+-- / write_file / list_directory / search_files / glob.
+--
+-- search_files and glob are ported from oc-ai lib/cmn-utils/grep.lua
+-- and glob.lua (recursive directory search + line numbers + literal/
+-- Lua pattern + glob filter + max results/line length caps).
 --
 -- Module contract: exports {tools = {...}, exec = function(name, args,
 -- deps)}. exec returns nil for tool names it does not handle. deps is
@@ -2197,7 +2243,225 @@ local tools = {
     description="List files in a directory",
     parameters={type="object", properties={path={type="string", description="Directory path"}}, required={"path"}}
   }},
+  {type="function", ["function"]={
+    name="search_files",
+    description="Search file contents for a pattern, returning matching lines as 'path:line: content' (one per line). Recurses directories. pattern is a Lua pattern by default; set literal=true to match a literal string. path is the file or directory to search (default: current directory). glob restricts which files are searched (e.g. '*.lua'). max_results caps the number of matches (default 50); max_line_length truncates long lines (default 200).",
+    parameters={type="object", properties={
+      pattern={type="string", description="Pattern to search for (Lua pattern unless literal=true)"},
+      path={type="string", description="File or directory to search (default: current directory)"},
+      glob={type="string", description="Only search files matching this glob pattern (e.g. '*.lua')"},
+      literal={type="boolean", description="Treat pattern as a literal string (default false)"},
+      max_results={type="number", description="Maximum number of results (default 50)"},
+      max_line_length={type="number", description="Maximum line length to return (default 200)"}
+    }, required={"pattern"}}
+  }},
+  {type="function", ["function"]={
+    name="glob",
+    description="Find files matching a glob pattern, recursively. Returns matching paths relative to path (one per line). Supports '*' (within a path segment) and '**' (across segments), e.g. '*.lua' or 'lib/**/*.lua'. path is the starting directory (default: current directory).",
+    parameters={type="object", properties={
+      pattern={type="string", description="Glob pattern to match (e.g. '*.lua', 'lib/**/*.lua')"},
+      path={type="string", description="Starting directory (default: current directory)"}
+    }, required={"pattern"}}
+  }},
 }
+
+-- ═══════════════════════════════════════════════════════════════
+-- search_files / glob — grep/glob file search (ported from oc-ai
+-- lib/cmn-utils/grep.lua and lib/cmn-utils/glob.lua).
+--
+-- Path handling is deliberately portable: io.open works in every
+-- environment (real OpenOS, host mock, tests), so it is the primary
+-- file/dir discriminator; fs.isDirectory / fs.list are used as
+-- fallbacks for hosts whose isDirectory is unreliable (e.g. oc_mock
+-- returns false always). fs.concat/fs.name are not used because the
+-- mock lacks them — plain string ops instead.
+-- ═══════════════════════════════════════════════════════════════
+
+-- Escape Lua pattern magic characters for literal search
+local function escape_literal(str)
+  return (str:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+-- Convert a glob pattern to a Lua pattern. Supports '*' (within a
+-- path segment) and '**' (across segments): e.g. '*.lua', 'lib/**/*.lua'.
+local function glob_to_lua_pattern(glob_pat)
+  local pat = glob_pat
+  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
+  pat = (pat:gsub("%*%*", "\001"))
+  pat = (pat:gsub("%*", "[^/]*"))
+  pat = (pat:gsub("\001", ".*"))
+  return "^" .. pat .. "$"
+end
+
+-- Simple name glob match ('*' = anything), used for the search_files
+-- glob filter on file names (e.g. '*.lua'). Returns true when no
+-- filter is given.
+local function glob_match(name, pattern)
+  if not pattern then return true end
+  local pat = pattern
+  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
+  pat = (pat:gsub("%*", ".*"))
+  return name:match("^" .. pat .. "$") ~= nil
+end
+
+-- Last path component (portable fs.name)
+local function path_name(p)
+  local name = p:match("([^/\\]+)[/\\]*$")
+  return name or p
+end
+
+-- Classify a path: "file", "dir" or "missing". io.open first (works
+-- everywhere — opening a directory fails), then fs.isDirectory, then
+-- fs.list (for hosts whose isDirectory always returns false).
+local function classify_path(path, fs)
+  local f = io.open(path, "r")
+  if f then
+    f:close()
+    return "file"
+  end
+  if fs and fs.isDirectory then
+    local ok, r = pcall(fs.isDirectory, path)
+    if ok and r then return "dir" end
+  end
+  if fs and fs.list then
+    local ok, it = pcall(fs.list, path)
+    if ok and type(it) == "function" then
+      if it() then return "dir" end
+    end
+  end
+  return "missing"
+end
+
+-- search_files: recursive content search.
+-- args: pattern, path, glob, literal, max_results, max_line_length.
+-- Returns one 'path:line: content' line per match.
+local function search_files_code(args)
+  local ok_fs, fs = pcall(require, "filesystem")
+  local pattern = args.pattern
+  if type(pattern) ~= "string" or pattern == "" then
+    error("pattern must be a non-empty string")
+  end
+  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
+  local max_results = tonumber(args.max_results) or 50
+  local max_line_length = tonumber(args.max_line_length) or 200
+  local glob_filter = args.glob
+
+  local pat = pattern
+  if args.literal then
+    pat = escape_literal(pat)
+  end
+
+  local results = {}
+  local truncated = false
+
+  -- Search one file; returns true when the result cap is reached.
+  local function search_file(full_path, rel_path)
+    local f = io.open(full_path, "r")
+    if not f then return false end
+    local line_num = 0
+    for line in f:lines() do
+      line_num = line_num + 1
+      local ok_find, found = pcall(line.find, line, pat)
+      if ok_find and found then
+        results[#results + 1] = rel_path .. ":" .. line_num .. ": "
+          .. line:sub(1, max_line_length)
+        if #results >= max_results then
+          truncated = true
+          f:close()
+          return true
+        end
+      end
+    end
+    f:close()
+    return false
+  end
+
+  local stopped = false
+  local function walk(dir, prefix)
+    if stopped then return end
+    local kind = classify_path(dir, fs)
+    if kind == "file" then
+      -- Single-file target: glob filter applies to the file name
+      if glob_match(path_name(dir), glob_filter) then
+        if search_file(dir, prefix) then stopped = true end
+      end
+      return
+    end
+    if kind ~= "dir" then return end
+    local ok_list, it = pcall(function() return fs.list(dir) end)
+    if not ok_list or type(it) ~= "function" then return end
+    for entry in it do
+      if stopped then return end
+      local full = dir .. "/" .. entry
+      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+      local sub = classify_path(full, fs)
+      if sub == "dir" then
+        walk(full, rel)
+      elseif sub == "file" then
+        if glob_match(entry, glob_filter) then
+          if search_file(full, rel) then
+            stopped = true
+            return
+          end
+        end
+      end
+    end
+  end
+
+  local base_kind = classify_path(base, fs)
+  local prefix = base_kind == "file" and path_name(base) or ""
+  walk(base, prefix)
+
+  if #results == 0 then
+    return "No matches for '" .. tostring(args.pattern) .. "' in " .. base
+  end
+  local out = {("Match " .. #results .. " for '" .. tostring(args.pattern)
+    .. "' in " .. base .. ":")}
+  for i = 1, #results do
+    out[#out + 1] = results[i]
+  end
+  if truncated then
+    out[#out + 1] = "(results truncated at " .. max_results .. ")"
+  end
+  return table.concat(out, "\n")
+end
+
+-- glob: recursive glob pattern match over relative paths.
+-- args: pattern, path.
+local function glob_code(args)
+  local ok_fs, fs = pcall(require, "filesystem")
+  local pattern = args.pattern
+  if type(pattern) ~= "string" or pattern == "" then
+    error("pattern must be a non-empty string")
+  end
+  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
+  local lua_pat = glob_to_lua_pattern(pattern)
+  local matches = {}
+
+  local function walk(dir, prefix)
+    if classify_path(dir, fs) ~= "dir" then return end
+    local ok_list, it = pcall(function() return fs.list(dir) end)
+    if not ok_list or type(it) ~= "function" then return end
+    for entry in it do
+      local full = dir .. "/" .. entry
+      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+      if classify_path(full, fs) == "dir" then
+        walk(full, rel)
+      else
+        if rel:match(lua_pat) then
+          matches[#matches + 1] = rel
+        end
+      end
+    end
+  end
+
+  walk(base, "")
+  table.sort(matches)
+  if #matches == 0 then
+    return "No files match '" .. tostring(args.pattern) .. "' in " .. base
+  end
+  return table.concat(matches, "\n")
+end
 
 local function exec(name, args, deps)
   if name == "read_file" then
@@ -2318,6 +2582,14 @@ local function exec(name, args, deps)
       if #parts == 0 then return "(empty)" end
       return table.concat(parts, "\n")
     end)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "search_files" then
+    local ok, result = pcall(search_files_code, args)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "glob" then
+    local ok, result = pcall(glob_code, args)
     return ok and result or ("Error: " .. tostring(result))
   end
 
@@ -2827,7 +3099,7 @@ local GUARDS = {
   {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use read_file('/etc/os-release') for system info, or component_list/component_doc."},
   {pat = "^%s*head", hint = "head: not available in OpenOS. Use read_file with offset=1 and limit=N to read the first N lines."},
   {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
-  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use list_directory to find files, read_file to read, text_ops to search."},
+  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use search_files to search file contents, glob to find files."},
   {pat = "^%s*wc", hint = "wc: not available in OpenOS. Use read_file then text_ops op=length to count."},
   {pat = "^%s*curl", hint = "curl: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
   {pat = "^%s*wget", hint = "wget: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
@@ -3186,6 +3458,7 @@ local trim_history, compact_history, should_compact, summarize_history =
   session_mod.trim_history, session_mod.compact_history, session_mod.should_compact, session_mod.summarize_history
 local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
+local estimate_tokens = session_mod.estimate_tokens
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
 
 -- Tool registry + execution dispatcher (Phase 1 split). The deps
@@ -3289,18 +3562,6 @@ end
 
 -- 最近一次 LLM 响应的 usage（provider 上报；opencode TUI 同款数据源）
 local LAST_USAGE = nil
-
--- 粗略 token 估算（无 tokenizer，仅显示用途）: 英文 ~4 字符/token，
--- 中文按字节 3B/字 ≈ 0.45 token/字节
-local function estimate_tokens(s)
-  if not s then return 0 end
-  s = tostring(s)
-  local ascii, non_ascii = 0, 0
-  for i = 1, #s do
-    if s:byte(i) < 128 then ascii = ascii + 1 else non_ascii = non_ascii + 1 end
-  end
-  return math.floor(ascii / 4 + non_ascii * 0.45)
-end
 
 local function fmt_num(n)
   local s = tostring(math.floor(n or 0))
@@ -3794,8 +4055,15 @@ local function process_exchange(messages, config, user_input, persist, session)
 
   local final_text = {}
   local retried_400 = false
+  -- 工具循环轮次上限（oc-ai maxSteps / reasonix tool-round cap 借鉴）:
+  -- 每轮请求 +1；超过后注入提示消息，再做一次收尾请求。
+  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps) or 12
+  local tool_steps = 0
+  local tool_cap_reached = false
+  local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
   while true do
     io.write("Thinking...\n")
+    tool_steps = tool_steps + 1
     local response = chat(messages, config)
 
     if response.error then
@@ -3844,6 +4112,11 @@ local function process_exchange(messages, config, user_input, persist, session)
       final_text[#final_text + 1] = response.content
     end
 
+    local has_tool_calls = response.tool_calls and #response.tool_calls > 0
+    -- 任务1: 本轮触顶（超过轮次上限且模型还想调用工具）——不执行本轮工具，
+    -- 注入提示后做最后一次收尾请求
+    local cap_trigger = has_tool_calls and not tool_cap_reached and tool_steps > MAX_TOOL_STEPS
+
     local assistant_msg = {role = "assistant", content = response.content or ""}
     -- reasoning_content 必须完整传回（DeepSeek/Kimi thinking mode 要求：
     -- 网关校验后续请求中的 reasoning_content，缺失返回 400
@@ -3851,7 +4124,9 @@ local function process_exchange(messages, config, user_input, persist, session)
     if response.reasoning_content and response.reasoning_content ~= "" then
       assistant_msg.reasoning_content = response.reasoning_content
     end
-    if response.tool_calls then
+    -- 触顶轮（提示轮/收尾轮）丢弃 tool_calls：不执行、不入历史，
+    -- 防悬空 tool_calls（assistant 带 tool_calls 却无 tool 响应 → 网关 400）
+    if has_tool_calls and not tool_cap_reached and not cap_trigger then
       assistant_msg.tool_calls = response.tool_calls
     end
     messages[#messages + 1] = assistant_msg
@@ -3860,66 +4135,127 @@ local function process_exchange(messages, config, user_input, persist, session)
       else append_history(assistant_msg) end
     end
 
-    if not response.tool_calls or #response.tool_calls == 0 then
-      break
-    end
-
-    for _, tc in ipairs(response.tool_calls) do
-      local fn = tc["function"]
-      if fn then
-        local tool_name = fn.name or "?"
-        local tool_args = fn.arguments
-        -- TUI: 状态栏显示正在运行的工具
-        if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
-        local ok_call, result = pcall(execute_tool, tool_name, tool_args)
-        if not ok_call then
-          result = "Error: " .. tostring(result)
+    -- ── 任务2: reasoning-only 轮接受 + 空回答重试网（reasonix 借鉴）──
+    if not has_tool_calls then
+      local content_blank = not response.content or response.content:gsub("%s", "") == ""
+      local has_reasoning = response.reasoning_content ~= nil and response.reasoning_content ~= ""
+      if content_blank and has_reasoning and response.finish_reason == "stop" then
+        -- 情形 A（reasoningOnlyFinishHonoured）: content 空 + reasoning 非空 +
+        -- finish=stop → 接受该轮不重试（thinking 模式常见: 模型先想后答）
+        if #final_text == 0 then
+          print("[reasoning-only] 接受 reasoning-only 轮（无可见回答）")
+          return {content = "(模型仅产出思考未给出可见回答)", text = "(模型仅产出思考未给出可见回答)"}
         end
-        if type(result) == "string" and #result > MAX_TOOL_RESULT then
-          result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
-        end
-
-        -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
-        local KEY_FIELD = {
-          read_file="path", write_file="path", edit_file="path", append_file="path",
-          list_directory="path", shell_execute="command", component_doc="address",
-          component_invoke="method", web_search="query", subagent_call="task",
-          calc="expression", json_query="path", text_ops="op", component_list="filter",
-        }
-        local param_str = ""
-        local kf = KEY_FIELD[tool_name]
-        if kf and tool_args then
-          param_str = tool_args:match('"' .. kf .. '"%s*:%s*"([^"]*)"')
-                   or tool_args:match('"' .. kf .. '"%s*:%s*(%d+)') or ""
-          if #param_str > 30 then param_str = param_str:sub(1, 28) .. ".." end
-        end
-        local result_brief = ""
-        if type(result) == "string" then
-          result_brief = result:gsub("\n", " | "):sub(1, 60)
-          if #result > 60 then result_brief = result_brief .. "..." end
-        end
-        print("[" .. tool_name .. (param_str ~= "" and (" " .. param_str) or "") .. "] " .. result_brief)
-        local tool_msg = {
-          role = "tool",
-          tool_call_id = tc.id,
-          content = result
-        }
-        messages[#messages + 1] = tool_msg
-        if persist then
-          if session then append_session_history(session, tool_msg)
-          else append_history(tool_msg) end
+        break
+      elseif content_blank and not has_reasoning
+          and (response.finish_reason == "stop" or response.finish_reason == "length") then
+        -- 情形 B: 纯空回答 → 注入重试消息（限一次）
+        if not retried_empty then
+          retried_empty = true
+          print("[empty-reply] 空回答，注入重试消息（限一次）")
+          local retry_msg = {role = "user", content = "你的回复内容为空，请直接回答用户的问题。"}
+          messages[#messages + 1] = retry_msg
+          if persist then
+            if session then append_session_history(session, retry_msg)
+            else append_history(retry_msg) end
+          end
+          -- 继续循环（不 break）
+        else
+          break
         end
       else
-        local err_msg = "malformed tool_call (missing 'function')"
-        print("[error] " .. err_msg)
-        local tool_msg = {role = "tool", tool_call_id = tc.id or "?", content = "Error: " .. err_msg}
+        break
+      end
+    elseif tool_cap_reached then
+      -- 任务1 触顶收尾: 丢弃 tool_calls 只取 content（content 空 → 错误）
+      if #final_text == 0 then
+        print("[tool-cap] 触顶后仍返回工具调用且无 content，终止")
+        return {error = "工具循环超出轮次上限"}
+      end
+      break
+    elseif cap_trigger then
+      -- 任务1 触顶: 注入提示消息，再做一次收尾请求（本轮工具不执行）
+      tool_cap_reached = true
+      local notice = "已达到工具调用轮次上限（" .. MAX_TOOL_STEPS .. " 轮）。请基于已获得的工具结果立即给出最终回答，不要再调用工具。"
+      print("[tool-cap] " .. notice)
+      local notice_msg = {role = "user", content = notice}
+      messages[#messages + 1] = notice_msg
+      if persist then
+        if session then append_session_history(session, notice_msg)
+        else append_history(notice_msg) end
+      end
+    elseif response.finish_reason == "length" then
+      -- 任务3（pi agent-loop 借鉴）: finish_reason=length 时工具参数可能被
+      -- 截断，不执行任何工具——为每个调用生成错误结果，让模型修正/收尾
+      print("[truncated] finish_reason=length，截断工具调用不执行")
+      for i, tc in ipairs(response.tool_calls) do
+        local trunc_err = "Error: tool call truncated (finish_reason=length), parameters incomplete — do NOT retry the same call. Summarize progress and answer directly."
+        local tool_msg = {role = "tool", tool_call_id = tc.id or ("call_" .. (i - 1)), content = trunc_err}
         messages[#messages + 1] = tool_msg
         if persist then
           if session then append_session_history(session, tool_msg)
           else append_history(tool_msg) end
         end
       end
-    end
+      -- 继续循环让模型修正
+    else
+      for _, tc in ipairs(response.tool_calls) do
+          local fn = tc["function"]
+          if fn then
+            local tool_name = fn.name or "?"
+            local tool_args = fn.arguments
+            -- TUI: 状态栏显示正在运行的工具
+            if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
+            local ok_call, result = pcall(execute_tool, tool_name, tool_args)
+            if not ok_call then
+              result = "Error: " .. tostring(result)
+            end
+            if type(result) == "string" and #result > MAX_TOOL_RESULT then
+              result = result:sub(1, MAX_TOOL_RESULT) .. "\n...[truncated " .. (#result - MAX_TOOL_RESULT) .. " chars]"
+            end
+
+            -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
+            local KEY_FIELD = {
+              read_file="path", write_file="path", edit_file="path", append_file="path",
+              list_directory="path", shell_execute="command", component_doc="address",
+              component_invoke="method", web_search="query", subagent_call="task",
+              calc="expression", json_query="path", text_ops="op", component_list="filter",
+            }
+            local param_str = ""
+            local kf = KEY_FIELD[tool_name]
+            if kf and tool_args then
+              param_str = tool_args:match('"' .. kf .. '"%s*:%s*"([^"]*)"')
+                       or tool_args:match('"' .. kf .. '"%s*:%s*(%d+)') or ""
+              if #param_str > 30 then param_str = param_str:sub(1, 28) .. ".." end
+            end
+            local result_brief = ""
+            if type(result) == "string" then
+              result_brief = result:gsub("\n", " | "):sub(1, 60)
+              if #result > 60 then result_brief = result_brief .. "..." end
+            end
+            print("[" .. tool_name .. (param_str ~= "" and (" " .. param_str) or "") .. "] " .. result_brief)
+            local tool_msg = {
+              role = "tool",
+              tool_call_id = tc.id,
+              content = result
+            }
+            messages[#messages + 1] = tool_msg
+            if persist then
+              if session then append_session_history(session, tool_msg)
+              else append_history(tool_msg) end
+            end
+          else
+            local err_msg = "malformed tool_call (missing 'function')"
+            print("[error] " .. err_msg)
+            local tool_msg = {role = "tool", tool_call_id = tc.id or "?", content = "Error: " .. err_msg}
+            messages[#messages + 1] = tool_msg
+            if persist then
+              if session then append_session_history(session, tool_msg)
+              else append_history(tool_msg) end
+            end
+          end
+        end
+      end
     end
   end
 
@@ -4019,10 +4355,9 @@ local function main(config, ...)
                 print("[subagent] reply sent for " .. tostring(req.id))
               else
                 print("[subagent] FAILED to send reply for " .. tostring(req.id))
-end
-      end
-      ::continue_tc::
-    end
+              end
+            end
+          end
         end
       end
     end

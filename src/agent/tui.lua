@@ -77,7 +77,12 @@ function tui.init(config)
   config = config or {}
   if config.monochrome then tui.colors = tui.monoColors end
   local ok, w, h = pcall(function()
-    return component.gpu and component.gpu.getResolution()
+    -- 注意: 不能写 `return component.gpu and component.gpu.getResolution()`
+    -- —— Lua 的 and 只保留第一个返回值, getResolution 的高度会丢失(h=nil),
+    -- 导致恒走兜底 80x25。须显式分支保留多返回值。
+    local g = component.gpu
+    if g then return g.getResolution() end
+    return nil
   end)
   -- 异常分辨率兜底（某些模拟器/远控返回怪异值 → 标准 80x25）
   if not ok or type(w) ~= "number" or type(h) ~= "number"
@@ -454,17 +459,48 @@ function tui.readInput()
           state.completionCycle = nil
         end
       elseif code == 203 then -- Left（不跨行）
-        if state.inputCursor > line_start then state.inputCursor = state.inputCursor - 1 end
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          -- Ctrl+Left: 前一个单词边界（字符索引）
+          local pos = state.inputCursor
+          while pos > line_start and usub(state.inputBuffer, pos, pos):match("%s") do
+            pos = pos - 1
+          end
+          while pos > line_start and not usub(state.inputBuffer, pos, pos):match("%s") do
+            pos = pos - 1
+          end
+          state.inputCursor = pos
+        elseif state.inputCursor > line_start then
+          state.inputCursor = state.inputCursor - 1
+        end
         state.completionCycle = nil
       elseif code == 205 then -- Right
-        if state.inputCursor < ulen(state.inputBuffer) then
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          -- Ctrl+Right: 下一个单词边界（字符索引）
+          local len = ulen(state.inputBuffer)
+          local pos = state.inputCursor
+          while pos < len and not usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
+            pos = pos + 1
+          end
+          while pos < len and usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
+            pos = pos + 1
+          end
+          state.inputCursor = pos
+        elseif state.inputCursor < ulen(state.inputBuffer) then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
-      elseif code == 199 then -- Home（行首）
-        state.inputCursor = line_start
-      elseif code == 207 then -- End（buffer 尾 = 最后一行尾）
-        state.inputCursor = ulen(state.inputBuffer)
+      elseif code == 199 then -- Home（行首; Ctrl=滚到顶）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollToTop()
+        else
+          state.inputCursor = line_start
+        end
+      elseif code == 207 then -- End（buffer 尾 = 最后一行尾; Ctrl=滚到底）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollToBottom()
+        else
+          state.inputCursor = ulen(state.inputBuffer)
+        end
       elseif code == 211 then -- Delete（最后一行内）
         local len = ulen(state.inputBuffer)
         if state.inputCursor < len then
@@ -472,8 +508,10 @@ function tui.readInput()
             .. usub(state.inputBuffer, state.inputCursor + 2)
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: 历史上翻（多行 buffer 时禁用——防覆盖粘贴内容）
-        if line_start == 0 and #state.cmdHistory > 0 then
+      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 否则历史上翻（多行 buffer 时禁用）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollUp(1)
+        elseif line_start == 0 and #state.cmdHistory > 0 then
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -481,8 +519,10 @@ function tui.readInput()
             state.inputCursor = ulen(state.inputBuffer)
           end
         end
-      elseif code == 208 then -- Down: 历史下翻（多行时禁用）
-        if line_start == 0 and state.cmdHistoryIndex > 0 then
+      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 否则历史下翻（多行时禁用）
+        if keyboard.isControlDown and keyboard.isControlDown() then
+          tui.scrollDown(1)
+        elseif line_start == 0 and state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             state.inputBuffer = state.savedInput
@@ -495,6 +535,8 @@ function tui.readInput()
         tui.scrollUp(state.height - 4)
       elseif code == 209 then -- PgDn: 下滚
         tui.scrollDown(state.height - 4)
+      elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
+        state.completionCycle = nil
       elseif code == 15 then -- Tab: 补全循环
         local cands = completionCandidates(state.inputBuffer)
         if #cands > 0 then
@@ -518,6 +560,13 @@ function tui.readInput()
         state.inputCursor = state.inputCursor + ulen(char)
         state.completionCycle = nil
         pcall(tui.drawInput)
+      end
+    elseif ev == "scroll" then
+      -- 鼠标滚轮: char == 1 上滚 3 行, -1 下滚 3 行（oc-ai 同）
+      if char == 1 then
+        tui.scrollUp(3)
+      elseif char == -1 then
+        tui.scrollDown(3)
       end
     end
   end

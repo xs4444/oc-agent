@@ -1,6 +1,10 @@
 -- ═══════════════════════════════════════════════════════════════
 -- agent.tools.file — file tools: read_file / edit_file / append_file
--- / write_file / list_directory.
+-- / write_file / list_directory / search_files / glob.
+--
+-- search_files and glob are ported from oc-ai lib/cmn-utils/grep.lua
+-- and glob.lua (recursive directory search + line numbers + literal/
+-- Lua pattern + glob filter + max results/line length caps).
 --
 -- Module contract: exports {tools = {...}, exec = function(name, args,
 -- deps)}. exec returns nil for tool names it does not handle. deps is
@@ -33,7 +37,225 @@ local tools = {
     description="List files in a directory",
     parameters={type="object", properties={path={type="string", description="Directory path"}}, required={"path"}}
   }},
+  {type="function", ["function"]={
+    name="search_files",
+    description="Search file contents for a pattern, returning matching lines as 'path:line: content' (one per line). Recurses directories. pattern is a Lua pattern by default; set literal=true to match a literal string. path is the file or directory to search (default: current directory). glob restricts which files are searched (e.g. '*.lua'). max_results caps the number of matches (default 50); max_line_length truncates long lines (default 200).",
+    parameters={type="object", properties={
+      pattern={type="string", description="Pattern to search for (Lua pattern unless literal=true)"},
+      path={type="string", description="File or directory to search (default: current directory)"},
+      glob={type="string", description="Only search files matching this glob pattern (e.g. '*.lua')"},
+      literal={type="boolean", description="Treat pattern as a literal string (default false)"},
+      max_results={type="number", description="Maximum number of results (default 50)"},
+      max_line_length={type="number", description="Maximum line length to return (default 200)"}
+    }, required={"pattern"}}
+  }},
+  {type="function", ["function"]={
+    name="glob",
+    description="Find files matching a glob pattern, recursively. Returns matching paths relative to path (one per line). Supports '*' (within a path segment) and '**' (across segments), e.g. '*.lua' or 'lib/**/*.lua'. path is the starting directory (default: current directory).",
+    parameters={type="object", properties={
+      pattern={type="string", description="Glob pattern to match (e.g. '*.lua', 'lib/**/*.lua')"},
+      path={type="string", description="Starting directory (default: current directory)"}
+    }, required={"pattern"}}
+  }},
 }
+
+-- ═══════════════════════════════════════════════════════════════
+-- search_files / glob — grep/glob file search (ported from oc-ai
+-- lib/cmn-utils/grep.lua and lib/cmn-utils/glob.lua).
+--
+-- Path handling is deliberately portable: io.open works in every
+-- environment (real OpenOS, host mock, tests), so it is the primary
+-- file/dir discriminator; fs.isDirectory / fs.list are used as
+-- fallbacks for hosts whose isDirectory is unreliable (e.g. oc_mock
+-- returns false always). fs.concat/fs.name are not used because the
+-- mock lacks them — plain string ops instead.
+-- ═══════════════════════════════════════════════════════════════
+
+-- Escape Lua pattern magic characters for literal search
+local function escape_literal(str)
+  return (str:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+-- Convert a glob pattern to a Lua pattern. Supports '*' (within a
+-- path segment) and '**' (across segments): e.g. '*.lua', 'lib/**/*.lua'.
+local function glob_to_lua_pattern(glob_pat)
+  local pat = glob_pat
+  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
+  pat = (pat:gsub("%*%*", "\001"))
+  pat = (pat:gsub("%*", "[^/]*"))
+  pat = (pat:gsub("\001", ".*"))
+  return "^" .. pat .. "$"
+end
+
+-- Simple name glob match ('*' = anything), used for the search_files
+-- glob filter on file names (e.g. '*.lua'). Returns true when no
+-- filter is given.
+local function glob_match(name, pattern)
+  if not pattern then return true end
+  local pat = pattern
+  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
+  pat = (pat:gsub("%*", ".*"))
+  return name:match("^" .. pat .. "$") ~= nil
+end
+
+-- Last path component (portable fs.name)
+local function path_name(p)
+  local name = p:match("([^/\\]+)[/\\]*$")
+  return name or p
+end
+
+-- Classify a path: "file", "dir" or "missing". io.open first (works
+-- everywhere — opening a directory fails), then fs.isDirectory, then
+-- fs.list (for hosts whose isDirectory always returns false).
+local function classify_path(path, fs)
+  local f = io.open(path, "r")
+  if f then
+    f:close()
+    return "file"
+  end
+  if fs and fs.isDirectory then
+    local ok, r = pcall(fs.isDirectory, path)
+    if ok and r then return "dir" end
+  end
+  if fs and fs.list then
+    local ok, it = pcall(fs.list, path)
+    if ok and type(it) == "function" then
+      if it() then return "dir" end
+    end
+  end
+  return "missing"
+end
+
+-- search_files: recursive content search.
+-- args: pattern, path, glob, literal, max_results, max_line_length.
+-- Returns one 'path:line: content' line per match.
+local function search_files_code(args)
+  local ok_fs, fs = pcall(require, "filesystem")
+  local pattern = args.pattern
+  if type(pattern) ~= "string" or pattern == "" then
+    error("pattern must be a non-empty string")
+  end
+  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
+  local max_results = tonumber(args.max_results) or 50
+  local max_line_length = tonumber(args.max_line_length) or 200
+  local glob_filter = args.glob
+
+  local pat = pattern
+  if args.literal then
+    pat = escape_literal(pat)
+  end
+
+  local results = {}
+  local truncated = false
+
+  -- Search one file; returns true when the result cap is reached.
+  local function search_file(full_path, rel_path)
+    local f = io.open(full_path, "r")
+    if not f then return false end
+    local line_num = 0
+    for line in f:lines() do
+      line_num = line_num + 1
+      local ok_find, found = pcall(line.find, line, pat)
+      if ok_find and found then
+        results[#results + 1] = rel_path .. ":" .. line_num .. ": "
+          .. line:sub(1, max_line_length)
+        if #results >= max_results then
+          truncated = true
+          f:close()
+          return true
+        end
+      end
+    end
+    f:close()
+    return false
+  end
+
+  local stopped = false
+  local function walk(dir, prefix)
+    if stopped then return end
+    local kind = classify_path(dir, fs)
+    if kind == "file" then
+      -- Single-file target: glob filter applies to the file name
+      if glob_match(path_name(dir), glob_filter) then
+        if search_file(dir, prefix) then stopped = true end
+      end
+      return
+    end
+    if kind ~= "dir" then return end
+    local ok_list, it = pcall(function() return fs.list(dir) end)
+    if not ok_list or type(it) ~= "function" then return end
+    for entry in it do
+      if stopped then return end
+      local full = dir .. "/" .. entry
+      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+      local sub = classify_path(full, fs)
+      if sub == "dir" then
+        walk(full, rel)
+      elseif sub == "file" then
+        if glob_match(entry, glob_filter) then
+          if search_file(full, rel) then
+            stopped = true
+            return
+          end
+        end
+      end
+    end
+  end
+
+  local base_kind = classify_path(base, fs)
+  local prefix = base_kind == "file" and path_name(base) or ""
+  walk(base, prefix)
+
+  if #results == 0 then
+    return "No matches for '" .. tostring(args.pattern) .. "' in " .. base
+  end
+  local out = {("Match " .. #results .. " for '" .. tostring(args.pattern)
+    .. "' in " .. base .. ":")}
+  for i = 1, #results do
+    out[#out + 1] = results[i]
+  end
+  if truncated then
+    out[#out + 1] = "(results truncated at " .. max_results .. ")"
+  end
+  return table.concat(out, "\n")
+end
+
+-- glob: recursive glob pattern match over relative paths.
+-- args: pattern, path.
+local function glob_code(args)
+  local ok_fs, fs = pcall(require, "filesystem")
+  local pattern = args.pattern
+  if type(pattern) ~= "string" or pattern == "" then
+    error("pattern must be a non-empty string")
+  end
+  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
+  local lua_pat = glob_to_lua_pattern(pattern)
+  local matches = {}
+
+  local function walk(dir, prefix)
+    if classify_path(dir, fs) ~= "dir" then return end
+    local ok_list, it = pcall(function() return fs.list(dir) end)
+    if not ok_list or type(it) ~= "function" then return end
+    for entry in it do
+      local full = dir .. "/" .. entry
+      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+      if classify_path(full, fs) == "dir" then
+        walk(full, rel)
+      else
+        if rel:match(lua_pat) then
+          matches[#matches + 1] = rel
+        end
+      end
+    end
+  end
+
+  walk(base, "")
+  table.sort(matches)
+  if #matches == 0 then
+    return "No files match '" .. tostring(args.pattern) .. "' in " .. base
+  end
+  return table.concat(matches, "\n")
+end
 
 local function exec(name, args, deps)
   if name == "read_file" then
@@ -154,6 +376,14 @@ local function exec(name, args, deps)
       if #parts == 0 then return "(empty)" end
       return table.concat(parts, "\n")
     end)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "search_files" then
+    local ok, result = pcall(search_files_code, args)
+    return ok and result or ("Error: " .. tostring(result))
+
+  elseif name == "glob" then
+    local ok, result = pcall(glob_code, args)
     return ok and result or ("Error: " .. tostring(result))
   end
 

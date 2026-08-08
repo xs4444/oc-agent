@@ -496,7 +496,7 @@ local EXPECTED_TOOLS = {
   "json_query", "calc", "text_ops",
   "component_list", "component_doc", "component_invoke",
   "web_search", "shell_execute", "subagent_call", "ask_user",
-  "compact_history",
+  "compact_history", "search_files", "glob",
 }
 local tools_have = {}
 for _, t in ipairs(agent_test.TOOLS) do
@@ -989,6 +989,47 @@ test("KEEP truncates long embed", keep_long
   and keep_long[1].content:find("tail-marker") == nil,
   tostring(keep_long and keep_long[1].content or nil):sub(1, 300))
 
+-- 任务4: REF 双标记（opencode-acp keep-markers）——[[REF:N|desc]] 展开为
+-- "[消息 N] desc" 引用指针（不嵌原文）
+agent_test.set_chat(keep_mock_chat)
+keep_mock_summary = "summary [[REF:2|关键事实]] [[REF:1|次要]]"
+local ref_compacted = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("REF expands to pointer [消息 N] desc", ref_compacted
+  and ref_compacted[1].content:find("[消息 2] 关键事实", 1, true) ~= nil
+  and ref_compacted[1].content:find("[消息 1] 次要", 1, true) ~= nil,
+  tostring(ref_compacted and ref_compacted[1].content or nil):sub(1, 300))
+test("REF does not embed original text", ref_compacted
+  and ref_compacted[1].content:find("critical secret value", 1, true) == nil,
+  tostring(ref_compacted and ref_compacted[1].content or nil):sub(1, 300))
+
+-- REF 越界引用: 保留原标记 + 不崩溃
+agent_test.set_chat(keep_mock_chat)
+keep_mock_summary = "s [[REF:99|越界描述]]"
+local ref_oob = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("REF out-of-range marker survives", ref_oob
+  and ref_oob[1].content:find("[[REF:99|越界描述]]", 1, true) ~= nil,
+  tostring(ref_oob and ref_oob[1].content or nil):sub(1, 200))
+
+-- 任务4/5: 摘要指令含 REF 说明 + 七节骨架（reasonix compact 借鉴）
+local section_captured = nil
+local function section_mock_chat(msgs, cfg)
+  if msgs and msgs[1] then section_captured = msgs[1].content end
+  return {content = "ok"}
+end
+agent_test.set_chat(section_mock_chat)
+agent_test.summarize_history(keep_msgs, {model = "m", api_key = ""})
+agent_test.set_chat(agent_test.chat)
+test("summary prompt instructs REF markers",
+  section_captured and section_captured:find("[[REF", 1, true) ~= nil,
+  tostring(section_captured):sub(1, 300))
+test("summary prompt has structured sections (Standing facts)",
+  section_captured and section_captured:find("Standing facts", 1, true) ~= nil
+  and section_captured:find("Pending", 1, true) ~= nil
+  and section_captured:find("Decisions", 1, true) ~= nil,
+  tostring(section_captured):sub(1, 300))
+
 print("")
 print("═══════════════════════════════════════")
 print("Model-Driven Compaction Tests")
@@ -1214,6 +1255,173 @@ if ok_tui and type(tui_mod) == "table" then
   -- 清理
   pcall(tui_mod.cleanup)
 end
+
+print("")
+print("═══════════════════════════════════════")
+print("Tool Loop Guards (chat 层借鉴) Tests")
+print("═══════════════════════════════════════")
+
+-- 脚本化 chat 响应: 按序返回 mock LLM 响应（tool_calls / reasoning-only /
+-- 空回答 / length 截断）。用法: 设置 next_llm 表，然后 process_exchange。
+local next_llm = nil
+local llm_idx = 0
+local orig_request = internet.request
+internet.request = function(url, data, headers, method)
+  if next_llm and type(next_llm[llm_idx + 1]) == "table" then
+    llm_idx = llm_idx + 1
+    local body = json.encode(next_llm[llm_idx])
+    local started = false
+    local handle = {}
+    setmetatable(handle, {
+      __call = function()
+        if started then return nil end
+        started = true
+        return body
+      end,
+      __index = { response = function() return 200 end },
+    })
+    return handle
+  end
+  return orig_request(url, data, headers, method)
+end
+local function llm_tool_calls(calls, finish)
+  return {choices = {{message = {role = "assistant", content = nil, tool_calls = calls},
+    finish_reason = finish or "stop"}}}
+end
+local function llm_content(content, reasoning, finish)
+  local msg = {role = "assistant", content = content}
+  if reasoning then msg.reasoning_content = reasoning end
+  return {choices = {{message = msg, finish_reason = finish or "stop"}}}
+end
+
+-- 任务1: 工具轮次上限——超过 max_tool_steps 后注入提示，再做一次请求
+do
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    llm_tool_calls({{id = "call_2", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_3", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"3+3"}'}}}),
+    llm_content("最终答案"),
+  }
+  llm_idx = 0
+  local cap_msgs = {}
+  local cap_res = agent_test.process_exchange(cap_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000, max_tool_steps = 2}, "测试", false)
+  local cap_joined = ""
+  for _, m in ipairs(cap_msgs) do
+    if m.content and type(m.content) == "string" then cap_joined = cap_joined .. m.content end
+  end
+  test("tool cap: final answer returned", cap_res and cap_res.text == "最终答案",
+    tostring(cap_res and cap_res.text))
+  test("tool cap: notice message injected", cap_joined:find("已达到工具调用轮次上限", 1, true) ~= nil,
+    cap_joined:sub(1, 300))
+  test("tool cap: 2 tool rounds executed before notice",
+    (function()
+      local tools = 0
+      for _, m in ipairs(cap_msgs) do if m.role == "tool" then tools = tools + 1 end end
+      return tools == 2, "tools=" .. tostring(tools)
+    end)())
+  next_llm = nil
+end
+
+-- 任务1 触顶收尾: 触顶后的最后请求仍返回 tool_calls → 丢弃只取 content
+do
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    llm_tool_calls({{id = "call_2", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_3", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"3+3"}'}}}),
+    llm_tool_calls({{id = "call_4", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"4+4"}'}}}),
+  }
+  llm_idx = 0
+  local cap_msgs2 = {}
+  local cap_res2 = agent_test.process_exchange(cap_msgs2,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000, max_tool_steps = 2}, "测试", false)
+  local cap_tools2 = 0
+  for _, m in ipairs(cap_msgs2) do if m.role == "tool" then cap_tools2 = cap_tools2 + 1 end end
+  test("tool cap: final tool_calls dropped, only 2 tools run", cap_tools2 == 2,
+    "tools=" .. tostring(cap_tools2))
+  test("tool cap: no final text → error", cap_res2 and cap_res2.error and
+    cap_res2.error:find("轮次上限", 1, true) ~= nil,
+    tostring(cap_res2 and cap_res2.error))
+  next_llm = nil
+end
+
+-- 任务2 情形 A: reasoning-only 轮（content 空 + reasoning 非空 + finish=stop）→ 接受不重试
+do
+  next_llm = {
+    llm_content(nil, "让我想想这个问题的解法", "stop"),
+  }
+  llm_idx = 0
+  local ro_msgs = {}
+  local ro_res = agent_test.process_exchange(ro_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  test("reasoning-only: accepted without retry", ro_res and ro_res.error == nil,
+    tostring(ro_res and (ro_res.error or ro_res.text)))
+  test("reasoning-only: placeholder text returned", ro_res and ro_res.content and
+    ro_res.content:find("仅产出思考", 1, true) ~= nil,
+    tostring(ro_res and (ro_res.content or ro_res.text)))
+  next_llm = nil
+end
+
+-- 任务2 情形 B: 纯空回答 → 注入重试消息一次，第二次正常返回
+do
+  next_llm = {
+    llm_content(nil, nil, "stop"),   -- 空回答
+    llm_content("这是真正的答案", nil, "stop"),
+  }
+  llm_idx = 0
+  local er_msgs = {}
+  local er_res = agent_test.process_exchange(er_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  local er_joined = ""
+  for _, m in ipairs(er_msgs) do
+    if m.content and type(m.content) == "string" then er_joined = er_joined .. m.content end
+  end
+  test("empty reply: retry message injected once", er_joined:find("你的回复内容为空", 1, true) ~= nil,
+    er_joined:sub(1, 200))
+  test("empty reply: final answer after retry", er_res and er_res.text == "这是真正的答案",
+    tostring(er_res and er_res.text))
+  next_llm = nil
+end
+
+-- 任务3: finish_reason=length 截断 → 不执行残缺工具调用，注入错误结果让模型修正
+do
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1'}}}, "length"),
+    llm_content("修正后的最终回答", nil, "stop"),
+  }
+  llm_idx = 0
+  local tl_msgs = {}
+  local tl_res = agent_test.process_exchange(tl_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  local tl_joined = ""
+  local tl_calc_ran = false
+  for _, m in ipairs(tl_msgs) do
+    if m.content and type(m.content) == "string" then tl_joined = tl_joined .. m.content end
+    if m.role == "tool" and tostring(m.content):find("truncated", 1, true) ~= nil then
+      tl_calc_ran = true
+    end
+  end
+  test("length-truncated: tool NOT executed, truncated error injected", tl_calc_ran,
+    tl_joined:sub(1, 300))
+  test("length-truncated: model corrects and answers", tl_res and tl_res.text == "修正后的最终回答",
+    tostring(tl_res and tl_res.text))
+  next_llm = nil
+end
+
+internet.request = orig_request
 
 print("")
 print("═══════════════════════════════════════")
