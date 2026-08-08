@@ -23,7 +23,7 @@ local function fetch(url)
   return table.concat(chunks)
 end
 
--- 从 data API JSON 提取最新版本 tag（versions 数组里排前的 "version" 值）
+-- 从 jsDelivr data API JSON 提取最新版本 tag（versions 数组里排前的 "version" 值）
 local function latest_tag()
   local body = fetch(DATA_API)
   if not body then return nil end
@@ -31,6 +31,15 @@ local function latest_tag()
   local ver = body:match('"versions"%s*:%s*%[%s*{%s*"version"%s*:%s*"([^"]+)"')
   if ver and ver ~= "" then return ver end
   return nil
+end
+
+-- 从 GitHub tags API 提取最新 tag（实时权威源；jsDelivr data API 索引
+-- 滞后是已知问题——v0.3.19~29 连续多版 watch 未检出，必须双源检测）
+local function github_tag()
+  local body = fetch("https://api.github.com/repos/" .. REPO .. "/tags")
+  if not body then return nil end
+  -- [{"name":"v0.3.29","zipball_url":...},...] 第一个即最新（按时间倒序）
+  return body:match('"name"%s*:%s*"([^"]+)"')
 end
 
 -- 读取本地已安装版本（agent 安装目录下的 version.txt，由 install.lua 写入）
@@ -44,11 +53,33 @@ local function current_version()
   return "(未知)"
 end
 
--- 确定目标 ref: 优先最新 tag，查不到则回退 @master
-local tag = latest_tag()
+-- 确定目标 ref: 双源检测（GitHub tags API 实时权威，jsDelivr data API
+-- 回退——jsDelivr 索引滞后是已知问题），两者都取最新，取较新者
+local function pick_newer(a, b)
+  if not a then return b end
+  if not b then return a end
+  -- 版本号比较: 数字段逐段比（v0.3.29 > v0.3.28）
+  local function parts(v)
+    local t = {}
+    for x in tostring(v):gmatch("%d+") do t[#t + 1] = tonumber(x) end
+    return t
+  end
+  local pa, pb = parts(a), parts(b)
+  for i = 1, math.max(#pa, #pb) do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x ~= y then return x > y and a or b end
+  end
+  return a
+end
+
+local tag_gh = github_tag()
+local tag_js = latest_tag()
+local tag = pick_newer(tag_gh, tag_js)
 local ref = tag or "master"
 
 print("检查最新版本...")
+print("  GitHub 源:  " .. tostring(tag_gh or "?"))
+print("  jsDelivr 源: " .. tostring(tag_js or "?"))
 print("  ref: " .. (tag and ("@" .. tag .. " (tag)") or "@master (回退)"))
 
 local latest
@@ -69,9 +100,22 @@ end
 print("")
 
 print("下载最新安装器...")
-local code = fetch(BASE .. "@" .. ref .. "/install.lua")
-if not code or #code < 100 then
-  print("安装器下载异常（" .. tostring(#(code or "")) .. " 字节），可能是 CDN 缓存延迟")
+-- 双源: jsDelivr CDN 优先，GitHub raw 回退（jsDelivr 索引滞后时 GitHub 仍可达）
+local code, code_err
+for _, base in ipairs({
+  BASE .. "@" .. ref,
+  "https://raw.githubusercontent.com/" .. REPO .. "/" .. ref,
+}) do
+  local body = fetch(base .. "/install.lua")
+  if body and #body >= 100 then
+    code = body
+    print("  来源: " .. base .. "/install.lua")
+    break
+  end
+  code_err = code_err or tostring(#(body or ""))
+end
+if not code then
+  print("安装器下载异常（" .. tostring(code_err) .. " 字节），请检查网络或稍后重试")
   return
 end
 
