@@ -4168,11 +4168,24 @@ local function process_exchange(messages, config, user_input, persist, session)
   local final_text = {}
   local retried_400 = false
   -- 工具循环轮次上限（oc-ai maxSteps / reasonix tool-round cap 借鉴）:
-  -- 每轮请求 +1；超过后注入提示消息，再做一次收尾请求。
-  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps) or 12
+  -- 安全网防无限循环；正常探索不触发（opencode 默认 Infinity）。可配
+  -- config.max_tool_steps 覆盖。
+  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps) or 40
   local tool_steps = 0
   local tool_cap_reached = false
   local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
+  -- 重复调用检测（doom-loop 护栏，opencode 借鉴）: 记录最近工具调用签名
+  -- （name + arguments 摘要，最多 8 条）；最近 4 条内同签名 ≥3 次 → 循环。
+  -- 与 cap_trigger 是两套独立机制；重复检测优先于工具执行。
+  local recent_calls = {}
+  local loop_warned = false
+  local function call_signature(tc)
+    local fn = tc and tc["function"]
+    local name = fn and fn.name or "?"
+    local args = fn and fn.arguments or ""
+    if type(args) ~= "string" then args = tostring(args) end
+    return name .. ":" .. args:sub(1, 120)
+  end
   while true do
     -- TUI 模式（UI_INPUT ~= nil）不输出 "Thinking..."：状态栏 setStatus
     -- 已实时显示；io.write 直写终端会与 TUI 屏幕叠加产生多状态行残留。
@@ -4239,6 +4252,53 @@ local function process_exchange(messages, config, user_input, persist, session)
     -- 注入提示后做最后一次收尾请求
     local cap_trigger = has_tool_calls and not tool_cap_reached and tool_steps > MAX_TOOL_STEPS
 
+    -- ── 重复调用检测（doom-loop 护栏，opencode 借鉴）──
+    -- 签名 = name:arguments 摘要（前 120 字符）。基于此前轮次记录的
+    -- recent_calls（最多 8 条）判定: 最近 4 条内同签名出现 ≥3 次 → 循环。
+    -- 首次触发注入 tool 错误消息提示一次（loop_action="warn"）；随后 2 轮内
+    -- 再次触发 → 硬收尾丢弃 tool_calls 只取 content（"stop"，防烧钱）。
+    -- 与 cap_trigger 独立；重复检测优先于工具执行。
+    local round_sigs = {}
+    if has_tool_calls then
+      for _, tc in ipairs(response.tool_calls) do
+        local fn = tc["function"]
+        local name = fn and fn.name or "?"
+        local args = fn and fn.arguments or ""
+        if type(args) ~= "string" then args = tostring(args) end
+        round_sigs[#round_sigs + 1] = name .. ":" .. args:sub(1, 120)
+      end
+    end
+    local loop_action = nil  -- nil = 正常 | "warn" = 提示一次 | "stop" = 硬收尾
+    local loop_sig = nil     -- 触发检测的签名（用于错误消息取工具名）
+    if has_tool_calls and #round_sigs > 0 then
+      local counts = {}
+      local wstart = math.max(1, #recent_calls - 3)
+      for i = wstart, #recent_calls do
+        local s = recent_calls[i]
+        counts[s] = (counts[s] or 0) + 1
+      end
+      for _, sig in ipairs(round_sigs) do
+        if counts[sig] and counts[sig] >= 3 then
+          loop_sig = sig
+          if loop_warned then
+            loop_action = (tool_steps - loop_warn_step <= 2) and "stop" or "warn"
+          else
+            loop_action = "warn"
+          end
+          break
+        end
+      end
+      -- 记录本轮签名（无论执行与否——模型确实尝试了这些调用）
+      for _, sig in ipairs(round_sigs) do
+        recent_calls[#recent_calls + 1] = sig
+      end
+      if #recent_calls > 8 then
+        local keep = {}
+        for i = #recent_calls - 7, #recent_calls do keep[#keep + 1] = recent_calls[i] end
+        recent_calls = keep
+      end
+    end
+
     local assistant_msg = {role = "assistant", content = response.content or ""}
     -- reasoning_content 必须完整传回（DeepSeek/Kimi thinking mode 要求：
     -- 网关校验后续请求中的 reasoning_content，缺失返回 400
@@ -4246,9 +4306,9 @@ local function process_exchange(messages, config, user_input, persist, session)
     if response.reasoning_content and response.reasoning_content ~= "" then
       assistant_msg.reasoning_content = response.reasoning_content
     end
-    -- 触顶轮（提示轮/收尾轮）丢弃 tool_calls：不执行、不入历史，
+    -- 触顶轮/重复循环收尾轮丢弃 tool_calls：不执行、不入历史，
     -- 防悬空 tool_calls（assistant 带 tool_calls 却无 tool 响应 → 网关 400）
-    if has_tool_calls and not tool_cap_reached and not cap_trigger then
+    if has_tool_calls and not tool_cap_reached and not cap_trigger and loop_action ~= "stop" then
       assistant_msg.tool_calls = response.tool_calls
     end
     messages[#messages + 1] = assistant_msg
@@ -4298,7 +4358,7 @@ local function process_exchange(messages, config, user_input, persist, session)
     elseif cap_trigger then
       -- 任务1 触顶: 注入提示消息，再做一次收尾请求（本轮工具不执行）
       tool_cap_reached = true
-      local notice = "已达到工具调用轮次上限（" .. MAX_TOOL_STEPS .. " 轮）。请基于已获得的工具结果立即给出最终回答，不要再调用工具。"
+      local notice = "已达到工具调用轮次上限（" .. MAX_TOOL_STEPS .. " 轮）。请总结已有进展并给出最终回答；如需继续探索请明确说明下一步要做什么。"
       print("[tool-cap] " .. notice)
       local notice_msg = {role = "user", content = notice}
       messages[#messages + 1] = notice_msg
@@ -4306,6 +4366,35 @@ local function process_exchange(messages, config, user_input, persist, session)
         if session then append_session_history(session, notice_msg)
         else append_history(notice_msg) end
       end
+    elseif loop_action == "warn" then
+      -- 重复循环首次检测: 注入 tool 错误消息提示一次，本轮不执行工具
+      loop_warned = true
+      loop_warn_step = tool_steps
+      local name = (loop_sig or round_sigs[1] or "?"):match("^([^:]+)") or "?"
+      local err_msg = "Error: repeated tool call detected (" .. name
+        .. " called 3 times with identical arguments in recent rounds). You appear to be looping. Stop retrying this call; change strategy or answer directly with what you have."
+      print("[loop-guard] " .. err_msg)
+      -- assistant_msg 已携带全部 tool_calls → 每个调用都要有 tool 响应配对
+      -- （防悬空 tool_calls → 网关 400）。首条注入完整错误，其余简短跳过说明。
+      for i, tc in ipairs(response.tool_calls) do
+        local tool_msg = {role = "tool",
+          tool_call_id = tc.id or ("call_" .. (i - 1)),
+          content = (i == 1) and err_msg
+            or "skipped: loop detected (see previous tool error)"}
+        messages[#messages + 1] = tool_msg
+        if persist then
+          if session then append_session_history(session, tool_msg)
+          else append_history(tool_msg) end
+        end
+      end
+      -- 继续循环让模型修正
+    elseif loop_action == "stop" then
+      -- 提示后 2 轮内仍重复 → 丢弃 tool_calls 只取 content 收尾（防烧钱）
+      if #final_text == 0 then
+        print("[loop-guard] 提示后仍重复调用且无 content，终止")
+        return {error = "工具循环重复调用（doom loop），已终止"}
+      end
+      break
     elseif response.finish_reason == "length" then
       -- 任务3（pi agent-loop 借鉴）: finish_reason=length 时工具参数可能被
       -- 截断，不执行任何工具——为每个调用生成错误结果，让模型修正/收尾
