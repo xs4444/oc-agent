@@ -1395,6 +1395,125 @@ do
   next_llm = nil
 end
 
+-- ── 重复调用检测（doom-loop 护栏，opencode 借鉴）──
+-- 测试1: 连续 5 轮同一工具调用（同 name 同 args）→ 第 4 轮出现 loop 错误、
+-- 本轮工具不执行（前 3 轮已执行）；第 5 轮含 content → 丢弃 tool_calls 收尾
+do
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    llm_tool_calls({{id = "call_2", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    llm_tool_calls({{id = "call_3", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    llm_tool_calls({{id = "call_4", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+    -- 第 5 轮: 仍返回同一调用 + 附带 content（模拟模型被提示后给出回答）
+    {choices = {{message = {role = "assistant", content = "收尾回答",
+      tool_calls = {{id = "call_5", type = "function",
+        ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}},
+      finish_reason = "stop"}}},
+  }
+  llm_idx = 0
+  local lp_msgs = {}
+  local lp_res = agent_test.process_exchange(lp_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  next_llm = nil
+  local loop_errs = 0
+  local calc_runs = 0
+  for _, m in ipairs(lp_msgs) do
+    if m.role == "tool" and tostring(m.content):find("repeated tool call detected", 1, true) ~= nil then
+      loop_errs = loop_errs + 1
+    elseif m.role == "tool" then
+      calc_runs = calc_runs + 1
+    end
+  end
+  test("loop detect: loop error message injected", loop_errs == 1,
+    "loop_errs=" .. tostring(loop_errs))
+  test("loop detect: tool executed only in first 3 rounds", calc_runs == 3,
+    "calc_runs=" .. tostring(calc_runs))
+  test("loop detect: final content ends the exchange", lp_res and not lp_res.error
+    and lp_res.text == "收尾回答", tostring(lp_res and (lp_res.text or lp_res.error)))
+end
+
+-- 测试2: 重复检测只提示一次（loop 错误消息仅出现 1 次，不重复轰炸）
+do
+  next_llm = {
+    llm_tool_calls({{id = "call_1", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_2", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_3", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_4", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_tool_calls({{id = "call_5", type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+    llm_content("完成了", nil, "stop"),
+  }
+  llm_idx = 0
+  local sw_msgs = {}
+  local sw_res = agent_test.process_exchange(sw_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  next_llm = nil
+  local sw_errs = 0
+  for _, m in ipairs(sw_msgs) do
+    if m.role == "tool" and tostring(m.content):find("repeated tool call detected", 1, true) ~= nil then
+      sw_errs = sw_errs + 1
+    end
+  end
+  test("loop detect: warned exactly once (no repeat spam)", sw_errs == 1,
+    "sw_errs=" .. tostring(sw_errs))
+  test("loop detect: 5th identical call hard-stops (content 空 → error)",
+    sw_res and sw_res.error and sw_res.error:find("重复调用", 1, true) ~= nil,
+    tostring(sw_res and (sw_res.error or sw_res.text)))
+  next_llm = nil
+end
+
+-- 测试3: 正常探索（12 轮不同工具调用）不触发轮次上限（默认 40）也不误判循环
+do
+  local explore = {}
+  local names = {"calc", "json_query", "text_ops"}
+  local args = {
+    '{"expression":"1+1"}',
+    '{"json":"{\\"a\\":1}","path":"a"}',
+    '{"op":"upper","text":"hi"}',
+  }
+  for i = 1, 12 do
+    explore[#explore + 1] = llm_tool_calls({{id = "call_" .. i, type = "function",
+      ["function"] = {name = names[((i - 1) % 3) + 1],
+        arguments = args[((i - 1) % 3) + 1]}}})
+  end
+  explore[#explore + 1] = llm_content("探索完成", nil, "stop")
+  next_llm = explore
+  llm_idx = 0
+  local ex_msgs = {}
+  local ex_res = agent_test.process_exchange(ex_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  next_llm = nil
+  local ex_joined = ""
+  local ex_tools = 0
+  local ex_loop = 0
+  for _, m in ipairs(ex_msgs) do
+    if m.content and type(m.content) == "string" then ex_joined = ex_joined .. m.content end
+    if m.role == "tool" then ex_tools = ex_tools + 1 end
+    if m.role == "tool" and tostring(m.content):find("repeated tool call detected", 1, true) then
+      ex_loop = ex_loop + 1
+    end
+  end
+  test("exploration: 12 distinct tool calls all execute", ex_tools == 12,
+    "ex_tools=" .. tostring(ex_tools))
+  test("exploration: no cap notice (default 40 not reached)", ex_joined:find("轮次上限", 1, true) == nil,
+    ex_joined:sub(1, 200))
+  test("exploration: no false loop detection", ex_loop == 0,
+    "ex_loop=" .. tostring(ex_loop))
+  test("exploration: final answer returned", ex_res and ex_res.text == "探索完成",
+    tostring(ex_res and ex_res.text))
+end
+
 -- 任务2 情形 A: reasoning-only 轮（content 空 + reasoning 非空 + finish=stop）→ 接受不重试
 do
   next_llm = {
