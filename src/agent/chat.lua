@@ -172,7 +172,11 @@ local function chat(messages, config)
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
     tools = tools_mod.list(),
-    max_tokens = 2048,
+    -- 输出预算: dsv4 等 thinking 模型思考强度高（reasoning 可占大量输出
+    -- token），2048 曾导致"长思考挤掉可见回答 → content 空"（真机 gist
+    -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 16384，config.max_tokens
+    -- 可覆盖（zen free 端点通常上限 32768）。
+    max_tokens = tonumber(config.max_tokens) or 16384,
     temperature = 0.7
   })
 
