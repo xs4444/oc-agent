@@ -93,21 +93,30 @@ end
 
 function json.decode(str)
   local pos = 1
+  local n = #str
 
+  -- byte-based 跳过空白（兼容 Lua %s 全集: 空格/Tab/LF/FF/CR/VT——
+  -- 与旧版 str:find("^[%s]*") 行为一致）
   local function skip_ws()
-    local _, e = str:find("^[%s]*", pos)
-    if e then pos = e + 1 end
+    while pos <= n do
+      local b = str:byte(pos)
+      if b == 32 or b == 9 or b == 10 or b == 11 or b == 12 or b == 13 then
+        pos = pos + 1
+      else
+        break
+      end
+    end
   end
 
   local function parse_string()
-    pos = pos + 1
+    pos = pos + 1  -- skip opening quote
     local result = {}
-    while pos <= #str do
-      local c = str:sub(pos, pos)
-      if c == '"' then
+    while pos <= n do
+      local b = str:byte(pos)
+      if b == 34 then  -- closing quote
         pos = pos + 1
         return table.concat(result)
-      elseif c == "\\" then
+      elseif b == 92 then  -- backslash escape
         pos = pos + 1
         local esc = str:sub(pos, pos)
         if esc == "n" then result[#result+1] = "\n"
@@ -134,8 +143,15 @@ function json.decode(str)
         end
         pos = pos + 1
       else
-        result[#result+1] = c
-        pos = pos + 1
+        -- 批量收集普通字符段（byte 定位边界，一次 sub 取整段——
+        -- 替代逐字符 sub，消除每字符 1 个临时字符串对象）
+        local start = pos
+        while pos <= n do
+          local b2 = str:byte(pos)
+          if b2 == 34 or b2 == 92 then break end
+          pos = pos + 1
+        end
+        result[#result+1] = str:sub(start, pos - 1)
       end
     end
     error("json: unterminated string")
@@ -143,10 +159,11 @@ function json.decode(str)
 
   local function parse_number()
     local start = pos
-    if str:sub(pos, pos) == "-" then pos = pos + 1 end
-    while pos <= #str do
-      local c = str:sub(pos, pos)
-      if c:match("[0-9eE+%.%-]") then
+    if str:byte(pos) == 45 then pos = pos + 1 end  -- '-'
+    while pos <= n do
+      local b = str:byte(pos)
+      -- 0-9 e E + - .（与旧版 c:match("[0-9eE+%.%-]") 一致）
+      if (b >= 48 and b <= 57) or b == 101 or b == 69 or b == 43 or b == 45 or b == 46 then
         pos = pos + 1
       else
         break
@@ -161,13 +178,13 @@ function json.decode(str)
     pos = pos + 1
     local arr = {}
     skip_ws()
-    if str:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+    if str:byte(pos) == 93 then pos = pos + 1; return arr end  -- ']'
     while true do
       arr[#arr + 1] = parse_value()
       skip_ws()
-      local c = str:sub(pos, pos)
-      if c == "]" then pos = pos + 1; return arr end
-      if c ~= "," then error("json: expected ',' or ']' at " .. pos) end
+      local c = str:byte(pos)
+      if c == 93 then pos = pos + 1; return arr end
+      if c ~= 44 then error("json: expected ',' or ']' at " .. pos) end  -- ','
       pos = pos + 1
       skip_ws()
     end
@@ -177,35 +194,37 @@ function json.decode(str)
     pos = pos + 1
     local obj = {}
     skip_ws()
-    if str:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+    if str:byte(pos) == 125 then pos = pos + 1; return obj end  -- '}'
     while true do
       skip_ws()
-      if str:sub(pos, pos) ~= '"' then error("json: expected key string at " .. pos) end
+      if str:byte(pos) ~= 34 then error("json: expected key string at " .. pos) end  -- '"'
       local key = parse_string()
       skip_ws()
-      if str:sub(pos, pos) ~= ":" then error("json: expected ':' at " .. pos) end
+      if str:byte(pos) ~= 58 then error("json: expected ':' at " .. pos) end  -- ':'
       pos = pos + 1
       skip_ws()
       obj[key] = parse_value()
       skip_ws()
-      local c = str:sub(pos, pos)
-      if c == "}" then pos = pos + 1; return obj end
-      if c ~= "," then error("json: expected ',' or '}' at " .. pos) end
+      local c = str:byte(pos)
+      if c == 125 then pos = pos + 1; return obj end
+      if c ~= 44 then error("json: expected ',' or '}' at " .. pos) end
       pos = pos + 1
     end
   end
 
   parse_value = function()
     skip_ws()
-    local c = str:sub(pos, pos)
-    if c == '"' then return parse_string()
-    elseif c == "{" then return parse_object()
-    elseif c == "[" then return parse_array()
-    elseif str:sub(pos, pos+3) == "true" then pos = pos + 4; return true
-    elseif str:sub(pos, pos+4) == "false" then pos = pos + 5; return false
-    elseif str:sub(pos, pos+3) == "null" then pos = pos + 4; return nil
-    elseif c == "-" or (c >= "0" and c <= "9") then return parse_number()
-    else error("json: unexpected char '" .. c .. "' at " .. pos) end
+    local c = str:byte(pos)
+    if c == 34 then return parse_string()      -- '"'
+    elseif c == 123 then return parse_object()  -- '{'
+    elseif c == 91 then return parse_array()    -- '['
+    -- 关键字必须完整匹配（byte 只验证首字节，后续仍需校验——
+    -- 否则 "tru"/"f"/"n" 会被错误接受）
+    elseif c == 116 and str:sub(pos, pos + 3) == "true" then pos = pos + 4; return true
+    elseif c == 102 and str:sub(pos, pos + 4) == "false" then pos = pos + 5; return false
+    elseif c == 110 and str:sub(pos, pos + 3) == "null" then pos = pos + 4; return nil
+    elseif c == 45 or (c >= 48 and c <= 57) then return parse_number()
+    else error("json: unexpected char at " .. pos) end
   end
 
   local result = parse_value()
