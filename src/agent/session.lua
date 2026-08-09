@@ -159,8 +159,10 @@ local function build_transcript(messages)
 end
 
 -- Ask the LLM to summarize older messages. Independent minimal request
--- (no tools, no system prompt) so it can't recurse into compaction.
--- Returns summary string or nil on any failure.
+-- (no tools, no runtime block, no main system prompt — only the summary
+-- instruction + transcript, via chat() opts) so it can't recurse into
+-- compaction. Returns summary string or nil on failure (empty summary
+-- after one retry, or transport error).
 local function summarize_history(messages, config, previous_summary)
   local transcript = build_transcript(messages).text
 
@@ -180,15 +182,57 @@ local function summarize_history(messages, config, previous_summary)
 
   -- Route through the injected chat() (set via set_chat) so session.lua does
   -- not need its own HTTP stack; chat is nil until agent.lua finishes Section 5.
+  -- 摘要请求专用瘦身路径（opencode 裸摘要请求同款 + reasonix 'independent
+  -- minimal request ... so it can't recurse into compaction' 防递归）:
+  --   主请求带 ~5KB system + ~1KB runtime 尾块 + ~10KB tools 声明，摘要
+  --   请求全部跳过 → 请求体只剩 [摘要指令 system + transcript user] ≈1KB；
+  --   max_tokens 用摘要专用预算（config.summary_max_tokens 默认 16384）——
+  --   deepseek 强思考模型下 opencode 的 4096 不够（reasoning 先吃大部分
+  --   输出预算，可见摘要 content 被挤掉 → 摘要残缺 → 重复压缩）。
+  -- 摘要响应**不持久化**（只提取 content 写摘要消息），128KB 响应体上限
+  -- （response_body_limit）已保护——与主请求 8192（长 reasoning 进历史 →
+  -- encode OOM）不同场景，专用大 max_tokens 无 OOM 风险。
   local chat = injected_chat
   if type(chat) ~= "function" then return nil end
-  local response = chat({
-    {role = "system", content = sys_prompt},
-    {role = "user", content = user_prompt}
-  }, config)
-  if type(response) ~= "table" then return nil end
-  local summary = response.content
-  if not summary or summary == "" then return nil end
+  local summary_opts = {
+    skip_system = true,
+    skip_runtime = true,
+    skip_tools = true,
+    max_tokens = tonumber(config.summary_max_tokens) or 16384,
+  }
+  -- 请求一次摘要: 返回 (summary, fatal)。fatal=true = 传输/HTTP 失败
+  -- （不重试）；fatal=nil + summary=nil = content 空/空白（thinking 模型
+  -- reasoning 挤占输出预算的典型表现，可重试）。
+  local function request_summary(hint)
+    local prompt = user_prompt
+    if hint then prompt = prompt .. "\n\n" .. hint end
+    local response = chat({
+      {role = "system", content = sys_prompt},
+      {role = "user", content = prompt}
+    }, config, summary_opts)
+    if type(response) ~= "table" then return nil, true end
+    if response.error then return nil, true end
+    local s = response.content
+    if not s or s:gsub("%s", "") == "" then return nil end
+    return s
+  end
+
+  local summary, fatal = request_summary(nil)
+  if not summary then
+    if fatal then return nil end  -- 传输失败: 不重试（与空摘要区分）
+    -- 空摘要兜底（v0.3.33 空回答重试网简化版，摘要专用一次重试）:
+    -- thinking 模型 reasoning 挤占输出预算时 content 空/空白——注入
+    -- "直接输出摘要"提示再调一次；仍空返回 nil → compact_history 走
+    -- trim 兜底（force_trim/字节裁剪），不阻断压缩流程。
+    print("[compact] 摘要为空（可能被 reasoning 挤占），重试一次...")
+    summary, fatal = request_summary(
+      "Please output the summary directly as plain text now. Do not output reasoning/thinking content.")
+    if not summary then
+      print("[compact] 摘要重试仍" .. (fatal and "失败" or "为空")
+        .. "，放弃压缩（调用方走 trim 兜底）")
+      return nil
+    end
+  end
   return summary
 end
 

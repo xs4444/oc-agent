@@ -153,7 +153,8 @@ local function build_headers(config)
   return headers
 end
 
-local function chat(messages, config)
+local function chat(messages, config, opts)
+  opts = opts or {}
   -- 每次请求前同步 HTTP 策略（config 热更新生效）:
   --   retry_budget   : 交互式 TUI 场景默认 300s——3600s 预算对端点持续
   --                    故障是"无反馈挂起 1 小时"；300s 折中（瞬态故障
@@ -164,10 +165,19 @@ local function chat(messages, config)
   http_mod.set_budget(tonumber(config.retry_budget) or 300)
   http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
   http_mod.set_response_body_limit(tonumber(config.response_body_limit) or 131072)
-  local system_prompt = build_system_prompt()
 
+  -- 请求选项 opts（摘要专用瘦身，opencode 裸摘要请求同款 + reasonix
+  -- 'independent minimal request ... so it can't recurse into compaction'
+  -- 防递归）:
+  --   skip_system  : 不注入主 system prompt（~5KB）——调用方自带指令
+  --   skip_runtime : 不追加 runtime 尾块（~1KB，机器状态/上下文占用）
+  --   skip_tools   : 省略 tools 声明（~10KB）——摘要请求模型不调工具
+  --   max_tokens   : 覆盖输出预算（摘要专用 summary_max_tokens）
+  -- 默认（无 opts / 全 false）= 现状主请求路径，行为不变。
   local api_messages = {}
-  api_messages[#api_messages + 1] = {role = "system", content = system_prompt}
+  if not opts.skip_system then
+    api_messages[#api_messages + 1] = {role = "system", content = build_system_prompt()}
+  end
   for _, msg in ipairs(messages) do
     -- 投影式压缩（reasonix projection 精神）: folded 折叠段不进请求
     if not msg.folded then
@@ -177,23 +187,31 @@ local function chat(messages, config)
   -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
   -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容
   -- 端点都接受，且不影响工具调用循环。
-  api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
+  if not opts.skip_runtime then
+    api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
+  end
 
   -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
   -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
   -- 内存不足错误现在由 mem_pressure 提前折叠预防（process_exchange 开头
   -- 按 freeMemory 低谷强制压缩，folded 段不进请求体），此处为最后防线。
   -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
+  -- skip_tools: 省略字段（json encode 跳过 nil 键）——摘要请求体不含
+  -- tools 声明（opencode 裸摘要请求同款 tools:[] 语义）。注意不能用
+  -- `opts.skip_tools and nil or list()` 三元——nil 分支被 `or` 吞掉。
+  local req_tools = nil
+  if not opts.skip_tools then req_tools = tools_mod.list() end
   local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
-    tools = tools_mod.list(),
+    tools = req_tools,
     -- 输出预算: dsv4 等 thinking 模型思考强度高（reasoning 可占大量输出
     -- token），2048 曾导致"长思考挤掉可见回答 → content 空"（真机 gist
     -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 8192——16384 曾致
     -- 长 reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM 崩溃
-    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖。
-    max_tokens = tonumber(config.max_tokens) or 8192,
+    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖，摘要请求由
+    -- opts.max_tokens 覆盖（config.summary_max_tokens，见 session.lua）。
+    max_tokens = opts.max_tokens or tonumber(config.max_tokens) or 8192,
     temperature = 0.7
   })
   if not ok_enc then

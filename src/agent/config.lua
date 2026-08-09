@@ -71,6 +71,14 @@ local function load()
     -- mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节
     -- 真实下降（默认 100KB < byte_budget 150KB → 自动折叠先于裁剪）。
     if not data.mem_prefold_bytes then data.mem_prefold_bytes = 100000 end
+    -- 摘要请求专用输出预算（summary_max_tokens）: deepseek 强思考模型下
+    -- opencode 的 4096 不够——reasoning 先吃大部分输出预算，可见摘要
+    -- content 被挤掉 → 摘要残缺 → 上下文没压住 → 重复压缩。默认 16384。
+    -- 摘要响应**不持久化**（只提取 content 写入摘要消息），128KB 响应体
+    -- 上限（response_body_limit）已保护——与主请求 max_tokens 8192（长
+    -- reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM）不同场景，
+    -- 专用大 max_tokens 无 OOM 风险。config 可调。
+    if not data.summary_max_tokens then data.summary_max_tokens = 16384 end
     -- HTTP 重试总预算（秒）: 交互式 TUI 场景默认 300s（5 分钟）。原
     -- 3600s（1h）对端点持续故障是"无反馈挂起 1 小时"；300s 折中——
     -- 端点瞬态故障足够，超时返回最后结果让用户看到错误。需要长时间
