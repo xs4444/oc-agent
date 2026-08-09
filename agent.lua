@@ -1727,19 +1727,34 @@ function tui.init(config)
   state.running = true
   state.scrollOffset = 0
   -- 滚动型渲染探测（荒野大师等终端滚动型模拟器）：写入最底行 y=h 会触发
-  -- 整屏上滚（帧缓冲模拟器如 ocvm/OCEmu 无此行为）。探测：写 y=h 标记后
-  -- 读 y=1 是否被波及（滚动会把原第 2 行顶到第 1 行）。scrollSafe = true
-  -- 时布局整体上移一行（最底行 h 永不写入），杜绝滚动触发。
+  -- 整屏上滚（帧缓冲模拟器如 ocvm/OCEmu 无此行为）。探测：先在 y=1 写
+  -- 标记再写 y=h，标记被顶走即滚动型。**旧版先读后写是 bug——启动时
+  -- 屏幕为空（term.clear 后），滚动后 y=1 被原 y=2 空行顶上 c1==c2 恒等，
+  -- 探测永远失败（真机实证：v0.3.39 scrollSafe 未生效，状态栏内容滚进
+  -- 内容区）。**set 单点与 fill 整行两种写入都测（滚动触发条件未知）。
+  -- scrollSafe = true 时布局整体上移一行（最底行 h 永不写入），杜绝滚动。
   state.scrollSafe = false
   local ok_g, gpu0 = pcall(function() return component.gpu end)
-  if ok_g and gpu0 and gpu0.set and gpu0.get then
-    local ok1, c1 = pcall(gpu0.get, 1, 1)
-    local ok2 = pcall(gpu0.set, 1, h, "Z")
-    local ok3, c2 = pcall(gpu0.get, 1, 1)
-    pcall(gpu0.set, 1, h, " ")  -- 清理标记
-    if ok1 and ok2 and ok3 and c1 ~= c2 then
-      state.scrollSafe = true
+  if ok_g and gpu0 and gpu0.set and gpu0.get and gpu0.fill then
+    local function scroll_probe(write_bottom)
+      pcall(gpu0.fill, 1, 1, 3, 3, " ")     -- 清左上角（含 y=1 标记位）
+      pcall(gpu0.set, 1, 1, "M")            -- 写标记
+      local ok1, c1 = pcall(gpu0.get, 1, 1)
+      if not (ok1 and c1 == "M") then return false end
+      pcall(write_bottom)
+      local ok2, c2 = pcall(gpu0.get, 1, 1)
+      return ok2 and c1 ~= c2
     end
+    -- 测 1: 单点 set 写 y=h
+    if scroll_probe(function() pcall(gpu0.set, 1, h, "Z") end) then
+      state.scrollSafe = true
+    else
+      -- 测 2: fill 整行写 y=h（部分模拟器仅整行写入触发滚动）
+      if scroll_probe(function() pcall(gpu0.fill, 1, h, 5, 1, "X") end) then
+        state.scrollSafe = true
+      end
+    end
+    pcall(gpu0.fill, 1, 1, 1, h, " ")  -- 清理探测痕迹（init 末尾 term.clear 再清一次）
   end
   state.history = {}
   state.inputBuffer = ""
