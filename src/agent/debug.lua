@@ -21,14 +21,83 @@ local function mask_token(s)
   return "(已设置 " .. #s .. " 字符)"
 end
 
--- 单条消息 → 紧凑单行（tool 结果截断放宽到 1000 字符）
-local function msg_line(msg)
+-- ── 历史消息脱敏（2026-08-09 安全修复）──
+-- 泄漏背景: GitHub 扫描到 gist 内的完整 PAT（oc-agent-debug note）并撤销。
+-- Config 段一直安全（gist_token 完全遮蔽），泄漏点在 Recent history 段：
+-- msg_line 原样输出消息 content——若历史中某条消息（用户自然语言提交的
+-- token、或工具结果如 read_file config.json 输出）含明文密钥，报告即带出。
+-- 修复: 已知明文值（config 中的 api_key/tavily_key/gist_token）整体替换
+-- + 常见 token 格式模式遮蔽（GitHub PAT/OAuth/OpenAI/Tavily 前缀）。
+
+-- 收集 config 中已知的敏感明文值（去重、跳过空值/过短值）
+local function known_secrets(config)
+  local list = {}
+  local seen = {}
+  local cfg = config or {}
+  for _, k in ipairs({ "api_key", "tavily_key", "gist_token" }) do
+    local v = cfg[k]
+    if type(v) == "string" and #v >= 8 and not seen[v] then
+      seen[v] = true
+      list[#list + 1] = v
+    end
+  end
+  return list
+end
+
+-- 纯文本替换（避免 Lua pattern magic 字符误伤：token 值含 % . - 等时
+-- string.gsub 会把第一个参数当 pattern——已知值必须按字面匹配）
+local function plain_replace(s, find_str, repl)
+  local out = s
+  local pos = 1
+  while true do
+    local a, b = string.find(out, find_str, pos, true)
+    if not a then break end
+    out = out:sub(1, a - 1) .. repl .. out:sub(b + 1)
+    pos = a + #repl
+  end
+  return out
+end
+
+-- token 前缀（格式遮蔽：保留前缀便于人读，值部分一律 ***）。
+-- 长的前缀在前（github_pat_ 先于 ghp_ 检查；sk-ant- 先于 sk-）。
+-- 实现用词元扫描 + 函数替换：一次 gsub 完成，无二次匹配问题
+-- （Lua pattern 的 ? 量词在本环境 5.4.6 上行为异常，且分组+量词
+--   二次匹配污染产物——实测 a(b)?c 匹配 abc 返回 nil，弃用）。
+local TOKEN_PREFIXES = {
+  "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+  "sk-ant-", "sk-", "tvly-",
+}
+
+-- 对文本做脱敏：先替换已知明文值，再按前缀格式遮蔽 token 值。
+-- 顺序很重要：已知值替换优先（更长更精确，避免模式先行后值已变）。
+local function redact(text, config)
+  if not text or text == "" then return text end
+  local out = tostring(text)
+  for _, secret in ipairs(known_secrets(config)) do
+    out = plain_replace(out, secret, "***")
+  end
+  -- 词元扫描: 对每个 [%w_]（含 - 的连续 token 候选）检查前缀，
+  -- 命中则保留前缀、值部分换 ***；函数替换单遍完成，无二次匹配。
+  out = out:gsub("[%w_%-]+", function(tok)
+    for _, prefix in ipairs(TOKEN_PREFIXES) do
+      if tok:sub(1, #prefix) == prefix then
+        return prefix .. "***"
+      end
+    end
+    return tok
+  end)
+  return out
+end
+
+-- 单条消息 → 紧凑单行（tool 结果截断放宽到 1000 字符；
+-- content 先经 redact 脱敏——历史中可能含明文密钥）
+local function msg_line(msg, config)
   if type(msg) ~= "table" then return tostring(msg) end
   local role = msg.role or "?"
   local parts = { "[" .. role .. "]" }
   if msg.tool_call_id then parts[#parts + 1] = "(" .. msg.tool_call_id .. ")" end
   if msg.content and msg.content ~= "" then
-    local c = tostring(msg.content):gsub("\n", " "):gsub("\r", "")
+    local c = redact(msg.content, config):gsub("\n", " "):gsub("\r", "")
     if #c > 1000 then c = c:sub(1, 997) .. "..." end
     parts[#parts + 1] = c
   end
@@ -110,7 +179,7 @@ local function collect(config, history)
   if history and #history > 0 then
     local start = math.max(1, #history - max_msgs + 1)
     for i = start, #history do
-      lines[#lines + 1] = msg_line(history[i])
+      lines[#lines + 1] = msg_line(history[i], config)
     end
   else
     lines[#lines + 1] = "(empty)"
@@ -150,4 +219,5 @@ return {
   collect = collect,
   upload = upload,
   mask = mask,
+  redact = redact,
 }
