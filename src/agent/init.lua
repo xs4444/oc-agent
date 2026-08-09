@@ -644,7 +644,8 @@ local function ensure_context_budget(messages, config, persist, session)
   local function est_msgs(msgs)
     local e = 0
     for _, m in ipairs(msgs) do
-      -- 投影式压缩: folded 折叠段不进请求也不计估算
+      -- folded 分支保留为无害兼容（compact_history 已物理删除折叠段，
+      -- 不再产生 folded 消息）
       if not m.folded then
         e = e + estimate_tokens(m.content or "")
             + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
@@ -660,9 +661,10 @@ local function ensure_context_budget(messages, config, persist, session)
   end
 
   local est = est_msgs(messages)
-  -- 模型驱动压缩（opencode-acp 策略）: 常规压缩由模型调用 compact_history
-  -- 工具主动执行（占用反馈注入运行时尾部块）；此处仅保留 80% 窗口硬保护
-  -- 防 400/超限。should_compact 仅用于 /ctx 建议显示。
+  -- 压缩分层（v0.3.47+）: 常规压缩由 process_exchange 开头的字节阈值
+  -- 自动折叠（mem_prefold_bytes 默认 100KB）与模型 compact_history 工具
+  -- 承担；此处保留 80% 窗口硬保护防 400/超限（最后窗口防线）。
+  -- should_compact 仅用于 /ctx 建议显示。
   if est > window * 0.8 then
     print("上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " tokens 超 80% 窗口，硬保护压缩...")
     local compacted = compact_history(messages, config)
@@ -681,8 +683,9 @@ local function ensure_context_budget(messages, config, persist, session)
   -- token 估算通过不代表 encode 不 OOM：json.encode 峰值 ≈ 2-3x 文本字节
   -- （结果 + parts 数组 + 输入）。真机实证：ctx 43%（55K tokens≈190KB 文本）
   -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
-  -- 独立字节预算（config.byte_budget 可调，默认 150KB），作为 compact 之后
-  -- 的最终兜底：超限直接裁剪早期消息（保留 head 锚点 + 最近 5 条）。
+  -- 独立字节预算（config.byte_budget 可调，默认 150KB），作为自动折叠
+  -- （mem_prefold_bytes 100KB）之后的最终兜底：超限直接裁剪早期消息
+  -- （保留 head 锚点 + 最近 5 条）。
   local byte_est = 0
   for _, m in ipairs(messages) do
     if not m.folded then
@@ -714,10 +717,11 @@ end
 -- 真机 free 内存低谷 278KB（agent 自测）→ encode 必超限 → OOM→error
 -- （chat.lua pcall 捕获后 TUI 只显示不落盘——gist 只见 user 无 assistant，
 -- 第二轮无响应根因）。context_window=128K 是误导: 24.3K tokens 仅占窗口
--- 19%，低于 should_compact 的 60% 阈值——模型永远不会主动 compact_history。
--- 这里按运行时 freeMemory 低谷驱动物理裁剪（process_exchange 开头
--- trim_to_bytes 到 mem_trim_bytes，释放内存——折叠只缩请求体不释放，
--- 真机第二次 OOM 已实证）。
+-- 19%，低于 should_compact 的 60% 阈值——模型永远不会主动 compact_history
+-- （v0.3.47 起由 process_exchange 的字节阈值自动折叠接管，见上）。这里
+-- 按运行时 freeMemory 低谷兜底物理裁剪（process_exchange 中自动折叠之后
+-- trim_to_bytes 到 mem_trim_bytes——自动折叠已物理回收折叠段，此处是
+-- 内存悬崖的最后防线，真机第二次 OOM 已实证）。
 -- computer.freeMemory() 不可用时返回 false（不阻塞任何环境——oc_mock/
 -- ocvm 精简环境无 computer 也安全）。每次调用重新 pcall(require,"computer"):
 -- package.loaded 命中时仅为表查找（无文件 IO 开销），且允许测试临时移除
@@ -743,17 +747,49 @@ local function process_exchange(messages, config, user_input, persist, session)
     else rebuild_history(msgs) end
   end or nil
 
+  -- 传统自动压缩（opencode 模式）: 表字节超阈值系统自动折叠，不等模型
+  -- 调用 compact_history 工具——模型驱动路径需模型"看见" ≥60% 窗口才
+  -- 自觉压缩（真机 24K tokens 只占窗口 19%，自动路径实际是死的）。
+  -- 字节阈值 mem_prefold_bytes（默认 100KB，config 可配）< 字节预算
+  -- byte_budget（150KB）→ 自动折叠先于 ensure_context_budget 的裁剪
+  -- 触发（宽裕期保上下文）；mem_pressure（内存悬崖）仍在其后兜底。
+  -- compact_history 折叠段**物理删除**（见 session.lua）→ 表字节真实
+  -- 下降，请求体不变（折叠段本就跳过），缓存前缀随摘要位置 miss 一次
+  -- （传统自动压缩语义，opencode 同，接受）。
+  local prefold_bytes = tonumber(config.mem_prefold_bytes) or 100000
+  local byte_now = 0
+  for _, m in ipairs(messages) do
+    if not m.folded then
+      byte_now = byte_now + #(m.content or "")
+          + #(m.tool_calls and tostring(m.tool_calls) or "")
+    end
+  end
+  if byte_now > prefold_bytes then
+    print("[compact] 自动压缩（" .. fmt_num(byte_now) .. "B > "
+      .. fmt_num(prefold_bytes) .. "B）...")
+    local compacted = compact_history(messages, config)
+    if compacted then
+      messages = compacted
+      if persist then
+        if session then rebuild_session_history(session, messages)
+        else rebuild_history(messages) end
+      end
+    end
+  end
+
   -- 内存压力强制裁剪（真机第二次 OOM 根因修复，gist 10d45721）:
   -- free 内存低谷（真机 278KB 实测）时 encode 大历史必 OOM→error
   -- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
   -- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
   -- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
-  -- 两条路径分层:
-  --   窗口超限（ensure_context_budget 80% / 模型 compact_history）
-  --     → 折叠（保缓存前缀，折叠段不进请求体）；
-  --   内存紧张（此处 mem_pressure）
-  --     → 物理裁剪（trim_to_bytes 到 mem_trim_bytes 默认 60KB，释放
-  --       内存；缓存前缀 miss 一次——已 OOM 两次，保命优先）。
+  -- 三层防御（宽裕→悬崖）:
+  --   1. 字节阈值自动折叠（上方 auto compact）→ 折叠段物理回收，表字节
+  --      真实下降——宽裕期保上下文（先于下方 mem_pressure 触发）；
+  --   2. 窗口超限（ensure_context_budget 80% 硬保护 / 模型 compact_history
+  --      工具）→ 折叠，防 400/超限；
+  --   3. 内存紧张（此处 mem_pressure）→ 物理裁剪（trim_to_bytes 到
+  --      mem_trim_bytes 默认 60KB，悬崖保命——已 OOM 两次，保命优先）。
+  -- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
   -- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
   if mem_pressure(config) then
     print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")

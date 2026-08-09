@@ -78,7 +78,8 @@ local function trim_history(messages)
     messages = trimmed
   end
   -- Then cap by total bytes; 优先丢折叠段消息（已进摘要，删除无损——
-  -- 投影式压缩的渐进内存回收），其次从头丢；保留 messages[1] 与最近消息
+  -- folded 分支保留为无害兼容，折叠段已由 compact_history 物理删除，
+  -- 此路径实际不触发），其次从头丢；保留 messages[1] 与最近消息
   while #messages > 3 do  -- keep the first message + the last 2 (current exchange)
     local total = 0
     for _, m in ipairs(messages) do
@@ -97,12 +98,13 @@ end
 -- 物理裁剪到字节预算（保内存优先，OC 2MB 内存约束）: 保留 messages[1]
 -- （前缀缓存锚点），从第 2 条起无条件删除（folded 段也删——已进摘要，
 -- 且本函数目的就是释放内存），直到总字节 ≤ budget 或只剩 MEM_MIN_KEEP 条。
--- 与 trim_history 的"投影式优先丢折叠段"语义分层:
---   折叠（compact_history / ensure_context_budget 窗口路径）→ 保缓存
---     前缀但留内存（folded 标记不删除）；
---   物理裁剪（mem_pressure 内存紧张 / load_history 加载上限）→ 释放
---     内存但缓存前缀 miss 一次——真机已 OOM 两次（v0.3.45 折叠不释放
---     内存是第二次根因，gist 10d45721），保命优先。
+-- 与 trim_history 的"优先丢折叠段"语义分层:
+--   折叠（compact_history 字节阈值 / ensure_context_budget 窗口路径 /
+--     模型 compact_history 工具）→ 物理删除折叠段（摘要承载内容），
+--     缓存前缀随摘要位置变化 miss 一次——传统自动压缩语义（opencode 同）；
+--   物理裁剪（mem_pressure 内存紧张 / load_history 加载上限）→ 无条件
+--     释放内存，缓存前缀同样 miss——真机已 OOM 两次（v0.3.45 折叠不
+--     释放内存是第二次根因，gist 10d45721），保命优先。
 -- JSONL 文件不受影响（append-only 保留完整历史，只动内存表）。
 -- 返回裁剪后总字节。
 local MEM_MIN_KEEP = 5  -- 最低保留（锚点 + 最近 4 条，与 force_trim 一致）
@@ -237,11 +239,13 @@ local function expand_keep_markers(summary, transcript_parts)
   end))
 end
 
--- Compact（投影式，reasonix projection 精神）: 折叠段消息**不删除**——
--- 标记 folded=true（请求构造/估算跳过，trim 优先清理），头部插入摘要消息。
--- 历史在 append-only JSONL 中完整保留（可追溯/可回退）；折叠段最终被
--- trim 渐进回收（内存受 MAX_HISTORY_BYTES 约束）。旧摘要消息被新摘要
--- 取代（锚定更新语义不变）。请求构造跳过 folded → 模型只见摘要+保留段。
+-- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——摘要
+-- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
+-- 承载旧消息内容；折叠段不进请求体、对缓存无贡献，留在内存表纯占内存
+-- （真机第二次 OOM 根因: 折叠不释放内存，93.6KB JSONL → 表 ~300KB
+-- 驻留）。删除仅释放内存；JSONL append-only 完整保留可追溯。旧摘要
+-- 消息被新摘要取代（锚定更新语义不变）。请求构造/估算的 folded 分支
+-- 逻辑保留（无害兼容——折叠段已不存在，未来也不会再产生）。
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
   local keep = COMPACT_KEEP
@@ -275,16 +279,11 @@ local function compact_history(messages, config)
   -- KEEP 标记展开（与 summarize 同源 transcript 序号）
   summary = expand_keep_markers(summary, build_transcript(old).parts)
 
-  -- 投影式: 折叠段标记 folded（旧摘要消息被取代，直接移除），头部插摘要
+  -- 折叠段**物理删除**（不标记、不驻留）: 旧摘要消息被新摘要取代直接
+  -- 丢弃；其余折叠段内容已进摘要（KEEP/REF 展开），删除仅释放内存——
+  -- 请求体本就是 [摘要 + 保留段]（folded 分支跳过），折叠段对缓存无
+  -- 贡献，纯占内存。JSONL append-only 完整保留可追溯。
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
-  for i = 1, #messages - keep do
-    local m = messages[i]
-    if not (m.role == "system" and type(m.content) == "string"
-        and m.content:match("^%[对话摘要%]")) then
-      m.folded = true
-      result[#result + 1] = m
-    end
-  end
   for i = #messages - keep + 1, #messages do
     result[#result + 1] = messages[i]
   end

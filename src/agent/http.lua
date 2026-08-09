@@ -35,6 +35,15 @@ local retry_budget = _TEST_MODE and 60 or 300
 -- 等，而重试预算检查（os.clock()）在 once 返回后才执行，预算形同虚设。
 -- 默认 120s；config.response_timeout 可调（chat() 每次请求前同步）
 local MAX_RESPONSE_WAIT = 120
+-- 单次请求响应体累积上限（字节）: 结构性内存护栏——OOM 无法预测（单次
+-- 工具调用/响应峰值不可知），正确解法是给所有已知分配源设硬上限，任何
+-- 单次峰值都落在安全线内。http_post_once 的 chunks 累积此前无上限，
+-- max_tokens 8192 的 reasoning 响应 JSON 可能 100KB+，decode 峰值 2-3x
+-- 单次就爆（真机 2MB 内存）。默认 131072（128KB）——合法响应 ≈60KB
+-- 足够容纳且防爆。超限返回明确 error（不静默截断——截断的 JSON 会解析
+-- 失败，明确 error 让 chat() 走错误路径）。config.response_body_limit
+-- 可调（chat() 每次请求前同步）
+local MAX_RESPONSE_BODY = 131072
 
 -- Single request attempt. Returns code, body, err.
 local function http_post_once(url, headers, body)
@@ -50,6 +59,7 @@ local function http_post_once(url, headers, body)
 
   local chunks = {}
   local timed_out = false
+  local too_large = false
   local iter_ok, iter_err = pcall(function()
     local n = 0
     -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
@@ -57,9 +67,18 @@ local function http_post_once(url, headers, body)
     -- once 返回后才执行）。保持每 chunk os.sleep(0.02) yield——OC 调度器
     -- 看到进展，避免 "too long without yielding" 崩溃。
     local read_deadline = os.clock() + MAX_RESPONSE_WAIT
+    local total = 0
     for chunk in handle do
       if os.clock() >= read_deadline then
         timed_out = true
+        return
+      end
+      -- 响应体累积字节检查（结构性上限）: 任何单次响应峰值不得超过
+      -- MAX_RESPONSE_BODY——超限立即返回明确 error（不静默截断，截断的
+      -- JSON 解析失败只会让错误更难诊断）。与超时 deadline 共存。
+      total = total + #chunk
+      if total > MAX_RESPONSE_BODY then
+        too_large = true
         return
       end
       n = n + 1
@@ -75,6 +94,9 @@ local function http_post_once(url, headers, body)
   end
   if timed_out then
     return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
+  end
+  if too_large then
+    return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
   end
   local response_body = table.concat(chunks)
 
@@ -128,8 +150,13 @@ local function set_response_timeout(t)
   MAX_RESPONSE_WAIT = t
 end
 
+local function set_response_body_limit(b)
+  MAX_RESPONSE_BODY = b
+end
+
 return {
   post = http_post,
   set_budget = set_budget,
   set_response_timeout = set_response_timeout,
+  set_response_body_limit = set_response_body_limit,
 }
