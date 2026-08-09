@@ -736,6 +736,37 @@ local function mem_pressure(config)
   return free < threshold
 end
 
+-- 内存压力强制裁剪（真机第二次/第三次 OOM 根因修复，gist 10d45721/3c0c3914）:
+-- free 内存低谷（真机 278KB→101KB 实测）时 encode 大历史必 OOM→error
+-- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
+-- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
+-- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
+-- 第三次 OOM（gist 3c0c3914，free=101KB）：mem_pressure 原只在 exchange
+-- 开头检查一次，长探索工具循环（多轮 read_file 大结果 append）中途
+-- free 跌破阈值无复查 → 继续 encode 峰值 OOM。修复：本函数在 exchange
+-- 开头与工具循环每轮 chat() 前各调一次，触发即物理裁剪到 mem_trim_bytes。
+-- 三层防御（宽裕→悬崖）:
+--   1. 字节阈值自动折叠（上方 auto compact）→ 折叠段物理回收，表字节
+--      真实下降——宽裕期保上下文（先于下方 mem_pressure 触发）；
+--   2. 窗口超限（ensure_context_budget 80% 硬保护 / 模型 compact_history
+--      工具）→ 折叠，防 400/超限；
+--   3. 内存紧张（此处 mem_pressure）→ 物理裁剪（trim_to_bytes 到
+--      mem_trim_bytes 默认 60KB，悬崖保命——已 OOM 三次，保命优先）。
+-- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
+-- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
+local function enforce_memory(messages, config, persist, session)
+  if not mem_pressure(config) then return end
+  print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
+  local before = #messages
+  local trim_budget = tonumber(config.mem_trim_bytes) or 60000
+  trim_to_bytes(messages, trim_budget)
+  if persist then
+    if session then rebuild_session_history(session, messages)
+    else rebuild_history(messages) end
+  end
+  print("[mem] 裁剪 " .. (before - #messages) .. " 条")
+end
+
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
 
@@ -777,31 +808,10 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
   end
 
-  -- 内存压力强制裁剪（真机第二次 OOM 根因修复，gist 10d45721）:
-  -- free 内存低谷（真机 278KB 实测）时 encode 大历史必 OOM→error
-  -- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
-  -- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
-  -- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
-  -- 三层防御（宽裕→悬崖）:
-  --   1. 字节阈值自动折叠（上方 auto compact）→ 折叠段物理回收，表字节
-  --      真实下降——宽裕期保上下文（先于下方 mem_pressure 触发）；
-  --   2. 窗口超限（ensure_context_budget 80% 硬保护 / 模型 compact_history
-  --      工具）→ 折叠，防 400/超限；
-  --   3. 内存紧张（此处 mem_pressure）→ 物理裁剪（trim_to_bytes 到
-  --      mem_trim_bytes 默认 60KB，悬崖保命——已 OOM 两次，保命优先）。
-  -- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
-  -- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
-  if mem_pressure(config) then
-    print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
-    local before = #messages
-    local trim_budget = tonumber(config.mem_trim_bytes) or 60000
-    trim_to_bytes(messages, trim_budget)
-    if persist then
-      if session then rebuild_session_history(session, messages)
-      else rebuild_history(messages) end
-    end
-    print("[mem] 裁剪 " .. (before - #messages) .. " 条")
-  end
+  -- 内存压力强制裁剪（真机第二/三次 OOM 根因修复，见 enforce_memory）:
+  -- free 低谷时 encode 大历史必 OOM，此处 exchange 开头检查一次，
+  -- 工具循环每轮 chat() 前还会复查（第三次 OOM 修复，见下方循环）。
+  enforce_memory(messages, config, persist, session)
 
   -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
   -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
@@ -854,6 +864,12 @@ local function process_exchange(messages, config, user_input, persist, session)
     -- 已实时显示；io.write 直写终端会与 TUI 屏幕叠加产生多状态行残留。
     if not UI_INPUT then io.write("Thinking...\n") end
     tool_steps = tool_steps + 1
+    -- 工具循环中途内存复查（真机第三次 OOM 根因修复，gist 3c0c3914）:
+    -- 长探索（多轮 read_file 大结果 append）中途 free 会跌破 400KB 阈值，
+    -- 而 exchange 开头只检查一次——encode 峰值（2-3x 文本）仍在低谷爆。
+    -- 每轮 chat() 前复查，触发即物理裁剪（不执行工具、不回滚本轮，
+    -- 与 exchange 开头路径同语义；mem_pressure 未触发时零开销）。
+    enforce_memory(messages, config, persist, session)
     local response = chat(messages, config)
 
     if response.error then
