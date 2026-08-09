@@ -1,11 +1,11 @@
 {
   "files": {
-    "chat.lua": 13122,
-    "config.lua": 3651,
+    "chat.lua": 13310,
+    "config.lua": 3989,
     "debug.lua": 6216,
     "execute.lua": 2769,
     "http.lua": 4417,
-    "init.lua": 62413,
+    "init.lua": 65002,
     "json.lua": 8490,
     "session.lua": 19045,
     "subagent.lua": 4121,
@@ -21,5 +21,5 @@
     "tui.lua": 29577,
     "docs.lua": 14689
   },
-  "version": "2026-08-09T0951"
+  "version": "2026-08-09T1046"
 }

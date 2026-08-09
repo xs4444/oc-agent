@@ -170,6 +170,8 @@ local function chat(messages, config)
 
   -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
   -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
+  -- 内存不足错误现在由 mem_pressure 提前折叠预防（process_exchange 开头
+  -- 按 freeMemory 低谷强制压缩，folded 段不进请求体），此处为最后防线。
   -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
   local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",

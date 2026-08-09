@@ -1357,6 +1357,93 @@ local function llm_content(content, reasoning, finish)
   return {choices = {{message = msg, finish_reason = finish or "stop"}}}
 end
 
+-- ── 内存压力强制压缩（fix-5 根因修复: 真机"第二轮无响应"）──
+-- free 内存低谷（< mem_compact_threshold 默认 400KB）时 process_exchange
+-- 开头强制折叠早期消息（folded 段不进请求体），不等模型 compact_history
+-- （24K tokens 仅占 128K 窗口 19%，永远不触发）。测试1 覆盖 process_exchange
+-- 集成路径（mem_pressure → compact_history → summarize LLM 调用 + 主循环）。
+do
+  -- 测试1: 内存低谷 → 折叠发生 + 请求仍完成
+  local saved_free = computer.freeMemory
+  computer.freeMemory = function() return 100000 end  -- 100KB < 400KB 阈值
+  local mp_msgs = {}
+  for i = 1, 10 do
+    mp_msgs[#mp_msgs + 1] = {role = "user", content = "old message " .. i}
+  end
+  next_llm = {
+    llm_content("汇总摘要", nil, "stop"),  -- compact_history 的 summarize 调用
+    llm_content("最终回答", nil, "stop"),  -- 主循环单轮成功
+  }
+  llm_idx = 0
+  local mp_res = agent_test.process_exchange(mp_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "new question", false)
+  computer.freeMemory = saved_free
+  next_llm = nil
+  local mp_summary = mp_msgs[1] ~= nil
+    and tostring(mp_msgs[1].content):find("对话摘要", 1, true) ~= nil
+  local mp_folded = false
+  for _, m in ipairs(mp_msgs) do if m.folded then mp_folded = true break end end
+  test("mem pressure: compact triggers fold on low memory",
+    mp_summary and mp_folded,
+    "summary=" .. tostring(mp_summary) .. " folded=" .. tostring(mp_folded))
+  test("mem pressure: exchange completes after fold",
+    mp_res and mp_res.text == "最终回答",
+    tostring(mp_res and (mp_res.text or mp_res.error)))
+
+  -- 测试2: 内存充足 → 不折叠（messages 原样 + 末尾 user 追加）
+  local saved_free2 = computer.freeMemory
+  computer.freeMemory = function() return 2000000 end  -- 2MB > 400KB 阈值
+  local mp2 = {}
+  for i = 1, 10 do
+    mp2[#mp2 + 1] = {role = "user", content = "old message " .. i}
+  end
+  next_llm = {
+    llm_content("正常回答", nil, "stop"),
+  }
+  llm_idx = 0
+  local mp2_res = agent_test.process_exchange(mp2,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "new question", false)
+  computer.freeMemory = saved_free2
+  next_llm = nil
+  local mp2_folded = false
+  for _, m in ipairs(mp2) do if m.folded then mp2_folded = true break end end
+  test("mem pressure: no fold when memory ok",
+    not mp2_folded and mp2[1].role == "user",
+    "folded=" .. tostring(mp2_folded))
+  test("mem pressure: ok-memory exchange completes",
+    mp2_res and mp2_res.text == "正常回答",
+    tostring(mp2_res and (mp2_res.text or mp2_res.error)))
+end
+
+-- 测试3: computer 缺失/异常环境安全（不崩、不折叠——OC 兼容）
+do
+  local saved_comp = package.loaded["computer"]
+  local saved_comp_global = _G.computer
+  package.loaded["computer"] = nil
+  _G.computer = nil
+  local ok_mp, mp_val = pcall(agent_test.mem_pressure, {})
+  package.loaded["computer"] = saved_comp
+  _G.computer = saved_comp_global
+  test("mem pressure: safe without computer (returns false)",
+    ok_mp and mp_val == false,
+    "ok=" .. tostring(ok_mp) .. " val=" .. tostring(mp_val))
+
+  -- freeMemory 缺失 / 抛错 / 非数字 → 一律 false（不阻塞任何环境）
+  local saved_free3 = computer.freeMemory
+  computer.freeMemory = nil
+  test("mem pressure: false when freeMemory missing",
+    agent_test.mem_pressure({}) == false)
+  computer.freeMemory = function() error("boom") end
+  test("mem pressure: false when freeMemory throws",
+    agent_test.mem_pressure({}) == false)
+  computer.freeMemory = function() return "abc" end
+  test("mem pressure: false when freeMemory non-number",
+    agent_test.mem_pressure({}) == false)
+  computer.freeMemory = saved_free3
+end
+
 -- 任务1: 工具轮次上限——超过 max_tool_steps 后注入提示，再做一次请求
 do
   next_llm = {
