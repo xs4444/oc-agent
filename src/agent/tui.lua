@@ -453,7 +453,12 @@ function tui.readInput()
     io.flush()
     local ok, line = pcall(io.read, "*l")
     if not ok then return nil end
-    return (line or ""):gsub("\r?\n", "")
+    line = (line or ""):gsub("\r?\n", "")
+    -- 与事件驱动分支一致：提交内容进内容区（主循环不回显，统一由
+    -- readInput 打印——v0.3.40 键盘检测修复后事件驱动激活，双重回显
+    -- 曾导致同一消息两行）
+    if line ~= "" then tui.print("> " .. line, tui.colors.user) end
+    return line
   end
 
   state.inputBuffer = ""
