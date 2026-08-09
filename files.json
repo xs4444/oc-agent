@@ -16,10 +16,10 @@
     "tools/file.lua": 18603,
     "tools/question.lua": 2059,
     "tools/search.lua": 4566,
-    "tools/shell.lua": 5335,
+    "tools/shell.lua": 6988,
     "tools/subagent.lua": 5015,
     "tui.lua": 29577,
     "docs.lua": 14689
   },
-  "version": "2026-08-09T1918"
+  "version": "2026-08-09T1959"
 }
