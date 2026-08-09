@@ -327,8 +327,18 @@ local function compact_history(messages, config)
   -- 丢弃；其余折叠段内容已进摘要（KEEP/REF 展开），删除仅释放内存——
   -- 请求体本就是 [摘要 + 保留段]（folded 分支跳过），折叠段对缓存无
   -- 贡献，纯占内存。JSONL append-only 完整保留可追溯。
+  -- 保留段首条不能是 role=tool（孤立 tool 消息缺陷，真机 gist 783a0f7
+  -- 实证）: 若折叠边界恰落在 assistant(tool_calls) 与其 tool 结果之间，
+  -- 保留段以孤立 tool 开头——OpenAI 规范要求 tool 消息必须对应前置
+  -- assistant.tool_calls（部分端点直接 400，opencode.ai/zen 实测宽容
+  -- 但这是请求合法性缺陷）。修复：首条是 tool 则向前多保留一条（其
+  -- 前置 assistant），保证保留段以 user/assistant/system 开头。
+  local first_keep = #messages - keep + 1
+  while first_keep > 1 and messages[first_keep].role == "tool" do
+    first_keep = first_keep - 1
+  end
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
-  for i = #messages - keep + 1, #messages do
+  for i = first_keep, #messages do
     result[#result + 1] = messages[i]
   end
   -- 就地替换（调用方持有同一表引用）
