@@ -1425,41 +1425,46 @@ local function llm_content(content, reasoning, finish)
   return {choices = {{message = msg, finish_reason = finish or "stop"}}}
 end
 
--- ── 内存压力强制压缩（fix-5 根因修复: 真机"第二轮无响应"）──
+-- ── 内存压力物理裁剪（fix-5 根因修复: 真机两次 OOM）──
 -- free 内存低谷（< mem_compact_threshold 默认 400KB）时 process_exchange
--- 开头强制折叠早期消息（folded 段不进请求体），不等模型 compact_history
--- （24K tokens 仅占 128K 窗口 19%，永远不触发）。测试1 覆盖 process_exchange
--- 集成路径（mem_pressure → compact_history → summarize LLM 调用 + 主循环）。
+-- 开头**物理裁剪**历史（trim_to_bytes 到 mem_trim_bytes 默认 60KB，释放
+-- 内存）——v0.3.45 的投影式折叠（folded 不删除）只缩小请求体不释放内存，
+-- 93.6KB JSONL 解析后表 ~300KB 驻留，free 低谷 encode 仍爆（第二次 OOM）。
+-- 语义分层: 窗口超限（ensure_context_budget 80% / 模型 compact_history）
+-- → 折叠（保缓存）；内存紧张（mem_pressure）→ 物理裁剪（保命）。
 do
-  -- 测试1: 内存低谷 → 折叠发生 + 请求仍完成
+  -- 测试1: 内存低谷 → 物理裁剪（#减少 + 字节 ≤ 阈值 + 锚点/最近保留）
   local saved_free = computer.freeMemory
   computer.freeMemory = function() return 100000 end  -- 100KB < 400KB 阈值
   local mp_msgs = {}
-  for i = 1, 10 do
-    mp_msgs[#mp_msgs + 1] = {role = "user", content = "old message " .. i}
+  for i = 1, 60 do
+    mp_msgs[#mp_msgs + 1] = {role = "user", content = string.rep("m", 10000) .. i}
   end
+  local mp_first = mp_msgs[1]
   next_llm = {
-    llm_content("汇总摘要", nil, "stop"),  -- compact_history 的 summarize 调用
-    llm_content("最终回答", nil, "stop"),  -- 主循环单轮成功
+    llm_content("最终回答", nil, "stop"),  -- 物理裁剪不调 summarize，主循环单轮
   }
   llm_idx = 0
   local mp_res = agent_test.process_exchange(mp_msgs,
     {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
-     context_window = 128000}, "new question", false)
+     context_window = 128000, mem_trim_bytes = 60000}, "new question", false)
   computer.freeMemory = saved_free
   next_llm = nil
-  local mp_summary = mp_msgs[1] ~= nil
-    and tostring(mp_msgs[1].content):find("对话摘要", 1, true) ~= nil
-  local mp_folded = false
-  for _, m in ipairs(mp_msgs) do if m.folded then mp_folded = true break end end
-  test("mem pressure: compact triggers fold on low memory",
-    mp_summary and mp_folded,
-    "summary=" .. tostring(mp_summary) .. " folded=" .. tostring(mp_folded))
-  test("mem pressure: exchange completes after fold",
+  local mp_bytes = 0
+  for _, m in ipairs(mp_msgs) do mp_bytes = mp_bytes + #(m.content or "") end
+  test("mem pressure: trims physically on low memory",
+    #mp_msgs < 10 and mp_bytes <= 60000,
+    "#=" .. tostring(#mp_msgs) .. " bytes=" .. tostring(mp_bytes))
+  test("mem pressure: anchor message kept",
+    mp_msgs[1] == mp_first, "anchor replaced")
+  test("mem pressure: keeps recent user message",
+    mp_msgs[#mp_msgs - 1] and mp_msgs[#mp_msgs - 1].content == "new question",
+    tostring(mp_msgs[#mp_msgs - 1] and mp_msgs[#mp_msgs - 1].content))
+  test("mem pressure: exchange completes after trim",
     mp_res and mp_res.text == "最终回答",
     tostring(mp_res and (mp_res.text or mp_res.error)))
 
-  -- 测试2: 内存充足 → 不折叠（messages 原样 + 末尾 user 追加）
+  -- 测试2: 内存充足 → 不裁剪（messages 原样 + 末尾 user 追加）
   local saved_free2 = computer.freeMemory
   computer.freeMemory = function() return 2000000 end  -- 2MB > 400KB 阈值
   local mp2 = {}
@@ -1477,15 +1482,15 @@ do
   next_llm = nil
   local mp2_folded = false
   for _, m in ipairs(mp2) do if m.folded then mp2_folded = true break end end
-  test("mem pressure: no fold when memory ok",
-    not mp2_folded and mp2[1].role == "user",
-    "folded=" .. tostring(mp2_folded))
+  test("mem pressure: no trim when memory ok",
+    #mp2 == 12 and not mp2_folded and mp2[1].role == "user",
+    "#=" .. tostring(#mp2) .. " folded=" .. tostring(mp2_folded))
   test("mem pressure: ok-memory exchange completes",
     mp2_res and mp2_res.text == "正常回答",
     tostring(mp2_res and (mp2_res.text or mp2_res.error)))
 end
 
--- 测试3: computer 缺失/异常环境安全（不崩、不折叠——OC 兼容）
+-- 测试3: computer 缺失/异常环境安全（不崩、不裁剪——OC 兼容）
 do
   local saved_comp = package.loaded["computer"]
   local saved_comp_global = _G.computer
@@ -1510,6 +1515,34 @@ do
   test("mem pressure: false when freeMemory non-number",
     agent_test.mem_pressure({}) == false)
   computer.freeMemory = saved_free3
+end
+
+-- 测试4: load_history 内存上限（93.6KB JSONL 全量加载 → 表 ~300KB 根因）
+-- 解析期条数上限（保留最近 120 条）+ 字节上限（mem_load_budget 默认
+-- 100KB）——JSONL 文件 append-only 完整保留，只限内存表。
+do
+  local lh_path = "test_load_budget.txt"
+  local lf = io.open(lh_path, "w")
+  for i = 1, 150 do
+    lf:write(json.encode({role = "user", content = string.rep("L", 2000) .. i}), "\n")
+  end
+  lf:close()
+  local saved_path = agent_test.current_session_path()
+  agent_test.set_history_path(lh_path)
+  local lh = agent_test.load_history()
+  agent_test.set_history_path(saved_path)
+  os.remove(lh_path)
+  local lh_bytes = 0
+  for _, m in ipairs(lh) do lh_bytes = lh_bytes + #(m.content or "") end
+  test("load history bounded (≤120, bytes ≤100KB)",
+    #lh <= 120 and #lh < 100 and lh_bytes <= 100000,
+    "#=" .. tostring(#lh) .. " bytes=" .. tostring(lh_bytes))
+  test("load history keeps recent",
+    lh[#lh] and lh[#lh].content == string.rep("L", 2000) .. "150",
+    tostring(lh[#lh] and lh[#lh].content and lh[#lh].content:sub(-10)))
+  test("load history keeps head anchor",
+    lh[1] and type(lh[1].content) == "string",
+    tostring(lh[1] and lh[1].content and lh[1].content:sub(1, 20)))
 end
 
 -- 任务1: 工具轮次上限——超过 max_tool_steps 后注入提示，再做一次请求

@@ -57,6 +57,14 @@ local function load()
     -- （真机 OOM→error 根因修复；默认 400KB——OC 1.4MB 内存下 encode
     -- 峰值 137-230KB，真机低谷 278KB 时 encode 必超限）
     if not data.mem_compact_threshold then data.mem_compact_threshold = 400000 end
+    -- 内存压力物理裁剪阈值（字节）: mem_pressure 触发时历史表裁剪到该值
+    -- 以下（真机第二次 OOM 修复——折叠只缩请求体不释放内存；默认 60KB，
+    -- 裁剪后 encode 峰值大幅下降，缓存前缀 miss 一次保命）
+    if not data.mem_trim_bytes then data.mem_trim_bytes = 60000 end
+    -- 历史加载内存上限（字节）: load_history 解析后表裁剪到该值以下
+    -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 100KB 内存表，
+    -- JSONL 文件 append-only 完整保留，只限内存表）
+    if not data.mem_load_budget then data.mem_load_budget = 100000 end
     -- HTTP 重试总预算（秒）: 交互式 TUI 场景默认 300s（5 分钟）。原
     -- 3600s（1h）对端点持续故障是"无反馈挂起 1 小时"；300s 折中——
     -- 端点瞬态故障足够，超时返回最后结果让用户看到错误。需要长时间

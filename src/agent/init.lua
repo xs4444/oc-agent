@@ -84,6 +84,8 @@ local trim_history, compact_history, should_compact, summarize_history =
   session_mod.trim_history, session_mod.compact_history, session_mod.should_compact, session_mod.summarize_history
 local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
+-- 物理字节裁剪（session.lua 导出）: mem_pressure 内存紧张时释放内存用
+local trim_to_bytes = session_mod.trim_to_bytes
 local estimate_tokens = session_mod.estimate_tokens
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
 local TOOL_RESULT_KEEP = session_mod.TOOL_RESULT_KEEP
@@ -713,7 +715,9 @@ end
 -- （chat.lua pcall 捕获后 TUI 只显示不落盘——gist 只见 user 无 assistant，
 -- 第二轮无响应根因）。context_window=128K 是误导: 24.3K tokens 仅占窗口
 -- 19%，低于 should_compact 的 60% 阈值——模型永远不会主动 compact_history。
--- 这里按运行时 freeMemory 低谷直接折叠早期消息（folded 段不进请求体）。
+-- 这里按运行时 freeMemory 低谷驱动物理裁剪（process_exchange 开头
+-- trim_to_bytes 到 mem_trim_bytes，释放内存——折叠只缩请求体不释放，
+-- 真机第二次 OOM 已实证）。
 -- computer.freeMemory() 不可用时返回 false（不阻塞任何环境——oc_mock/
 -- ocvm 精简环境无 computer 也安全）。每次调用重新 pcall(require,"computer"):
 -- package.loaded 命中时仅为表查找（无文件 IO 开销），且允许测试临时移除
@@ -739,24 +743,28 @@ local function process_exchange(messages, config, user_input, persist, session)
     else rebuild_history(msgs) end
   end or nil
 
-  -- 内存压力强制压缩: free 内存低谷（真机 278KB 实测）时 encode 大历史
-  -- 必 OOM→error（chat.lua:171 pcall 捕获，TUI 只显示不落盘——第二轮
-  -- 无响应根因）。不等模型 compact_history（24K tokens 仅占 128K 窗口
-  -- 19%，永远不触发），内存紧张直接折叠早期消息（folded 段不进请求体）。
-  -- 与 ensure_context_budget 字节预算互补: 字节预算兜底请求体大小
-  -- （150KB），此处兜底运行时内存低谷——encode 峰值 2-3x 文本，低谷时
-  -- 即使字节未超预算 encode 也可能 OOM。compact_history 在消息 ≤5 条时
-  -- 直接返回 nil（不发 LLM 摘要），小会话零开销。
+  -- 内存压力强制裁剪（真机第二次 OOM 根因修复，gist 10d45721）:
+  -- free 内存低谷（真机 278KB 实测）时 encode 大历史必 OOM→error
+  -- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
+  -- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
+  -- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
+  -- 两条路径分层:
+  --   窗口超限（ensure_context_budget 80% / 模型 compact_history）
+  --     → 折叠（保缓存前缀，折叠段不进请求体）；
+  --   内存紧张（此处 mem_pressure）
+  --     → 物理裁剪（trim_to_bytes 到 mem_trim_bytes 默认 60KB，释放
+  --       内存；缓存前缀 miss 一次——已 OOM 两次，保命优先）。
+  -- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
   if mem_pressure(config) then
-    print("[mem] 空闲内存紧张，强制压缩历史...")
-    local compacted = compact_history(messages, config)
-    if compacted then
-      messages = compacted
-      if persist then
-        if session then rebuild_session_history(session, messages)
-        else rebuild_history(messages) end
-      end
+    print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
+    local before = #messages
+    local trim_budget = tonumber(config.mem_trim_bytes) or 60000
+    trim_to_bytes(messages, trim_budget)
+    if persist then
+      if session then rebuild_session_history(session, messages)
+      else rebuild_history(messages) end
     end
+    print("[mem] 裁剪 " .. (before - #messages) .. " 条")
   end
 
   -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。

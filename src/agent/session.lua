@@ -94,6 +94,36 @@ local function trim_history(messages)
   return messages
 end
 
+-- 物理裁剪到字节预算（保内存优先，OC 2MB 内存约束）: 保留 messages[1]
+-- （前缀缓存锚点），从第 2 条起无条件删除（folded 段也删——已进摘要，
+-- 且本函数目的就是释放内存），直到总字节 ≤ budget 或只剩 MEM_MIN_KEEP 条。
+-- 与 trim_history 的"投影式优先丢折叠段"语义分层:
+--   折叠（compact_history / ensure_context_budget 窗口路径）→ 保缓存
+--     前缀但留内存（folded 标记不删除）；
+--   物理裁剪（mem_pressure 内存紧张 / load_history 加载上限）→ 释放
+--     内存但缓存前缀 miss 一次——真机已 OOM 两次（v0.3.45 折叠不释放
+--     内存是第二次根因，gist 10d45721），保命优先。
+-- JSONL 文件不受影响（append-only 保留完整历史，只动内存表）。
+-- 返回裁剪后总字节。
+local MEM_MIN_KEEP = 5  -- 最低保留（锚点 + 最近 4 条，与 force_trim 一致）
+local function trim_to_bytes(messages, budget)
+  local total = 0
+  for _, m in ipairs(messages) do total = total + msg_bytes(m) end
+  local guard = 0
+  while #messages > MEM_MIN_KEEP and total > budget and guard < 10000 do
+    guard = guard + 1
+    total = total - msg_bytes(messages[2])
+    table.remove(messages, 2)
+  end
+  -- 只剩 MEM_MIN_KEEP 条仍超预算（个别超大消息）: 保锚点 + 最近消息兜底
+  while #messages > 3 and total > budget and guard < 10000 do
+    guard = guard + 1
+    total = total - msg_bytes(messages[2])
+    table.remove(messages, 2)
+  end
+  return total
+end
+
 -- 构建发送给摘要模型的 transcript，返回 {text, parts}——parts[i] 是 text
 -- 第 i 行对应的原始消息（KEEP 展开时按行号找回原文）。纯函数:
 -- compact_history 与 summarize_history 对同一批消息调用结果一致。
@@ -336,12 +366,24 @@ local function load_history()
 
   -- JSON-line format: one message per line, skip corrupt lines.
   local messages = {}
+  -- 条数上限（内存表有界）: 超过 MAX_LOAD_HISTORY 条丢更早的——真机
+  -- 93.6KB JSONL 全量解析后表 ~300KB（OOM 根因之一）。文件本身
+  -- append-only 完整保留（可追溯），只限内存表。
+  local MAX_LOAD_HISTORY = 120
   for line in content:gmatch("[^\r\n]+") do
     local ok2, msg = pcall(json.decode, line)
     if ok2 and type(msg) == "table" and msg.role then
+      if #messages == MAX_LOAD_HISTORY then
+        table.remove(messages, 1)
+      end
       messages[#messages + 1] = msg
     end
   end
+  -- 字节上限: 解析后表裁剪到 mem_load_budget（可配，默认 100KB）。
+  -- 配置经 pcall 读取（真机/测试均安全，缺失/损坏回退默认值）。
+  local ok_cfg, cfg = pcall(config_mod.load)
+  local load_budget = tonumber(ok_cfg and cfg and cfg.mem_load_budget) or 100000
+  trim_to_bytes(messages, load_budget)
   return trim_history(messages)
 end
 
@@ -397,6 +439,8 @@ return {
   append_history = append_history,
   rebuild_history = rebuild_history,
   trim_history = trim_history,
+  -- 物理字节裁剪（mem_pressure / load_history 上限共用，init.lua 引用）
+  trim_to_bytes = trim_to_bytes,
   compact_history = compact_history,
   should_compact = should_compact,
   summarize_history = summarize_history,
