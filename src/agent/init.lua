@@ -1291,9 +1291,10 @@ local function main(config, ...)
         table.remove(term_history, 1)  -- keep terminal history bounded
       end
 
-      -- 回显 user 输入到内容区（readInput 提交后无终端回显，不打印则
-      -- 内容区只有 assistant 回复，用户看不到自己发了什么——真机已现）
-      ui.printRole("user", input)
+      -- 用户输入回显统一由 readInput 内部完成（事件驱动分支 tui.print
+      -- "> " 前缀 + io.read 回退分支同样打印）——v0.3.24 曾在主循环重复
+      -- 回显，v0.3.40 键盘检测修复后事件驱动激活 → 同一消息显示两行
+      -- （真机反馈）。此处不再回显。
       ui.setStatus("Thinking...")
       local result = process_exchange(messages, config, input, true)
       if result and result.error then
