@@ -1295,6 +1295,111 @@ test("compact tool rejects short history",
   type(short_result) == "string" and short_result:find("too short", 1, true) ~= nil,
   tostring(short_result):sub(1, 160))
 
+-- ── 摘要请求专用路径（瘦身 + 专用 max_tokens + 空摘要重试）──
+-- v0.3.48+ 摘要请求走 chat() opts: skip_system/skip_runtime/skip_tools +
+-- max_tokens=summary_max_tokens（默认 16384）——opencode 裸摘要请求同款
+-- （tools 省略、无主 system prompt、无 runtime 尾块），reasonix 防递归。
+do
+  -- 测试1: 截获 chat HTTP 请求体 → 断言瘦身（无 tools/主 system/runtime）
+  -- + 默认摘要预算 16384 + 摘要指令仍在
+  local function make_summary_handle(body)
+    local started = false
+    local h = {}
+    setmetatable(h, {
+      __call = function()
+        if started then return nil end
+        started = true
+        return body
+      end,
+      __index = { response = function() return 200 end },
+    })
+    return h
+  end
+  local slim_body = nil
+  local slim_saved_req = internet.request
+  internet.request = function(url, data, headers, method)
+    if url:match("chat/completions") then
+      slim_body = data
+      return make_summary_handle('{"choices":[{"message":{"role":"assistant","content":"SLIM SUM"}}]}')
+    end
+    return slim_saved_req(url, data, headers, method)
+  end
+  local slim_msgs = {}
+  for i = 1, 12 do
+    slim_msgs[#slim_msgs + 1] = {role = "user", content = "slim " .. i}
+  end
+  local slim_compacted = agent_test.compact_history(slim_msgs, {model = "m", api_key = ""})
+  internet.request = slim_saved_req
+  test("summary request slim (no tools/system/runtime)",
+    slim_compacted ~= nil and slim_body ~= nil
+    and slim_body:find('"tools"', 1, true) == nil
+    and slim_body:find("AI assistant running inside OpenComputers", 1, true) == nil
+    and slim_body:find("[runtime status", 1, true) == nil
+    and slim_body:find("Summarize this conversation", 1, true) ~= nil
+    and slim_body:find('"max_tokens":16384', 1, true) ~= nil,
+    "body=" .. tostring(slim_body and slim_body:sub(1, 300)))
+
+  -- 测试2: config.summary_max_tokens 覆盖 → 摘要请求 max_tokens=2048
+  local max_body = nil
+  internet.request = function(url, data, headers, method)
+    if url:match("chat/completions") then
+      max_body = data
+      return make_summary_handle('{"choices":[{"message":{"role":"assistant","content":"M"}}]}')
+    end
+    return slim_saved_req(url, data, headers, method)
+  end
+  local max_msgs = {}
+  for i = 1, 12 do
+    max_msgs[#max_msgs + 1] = {role = "user", content = "mx " .. i}
+  end
+  agent_test.compact_history(max_msgs, {model = "m", api_key = "", summary_max_tokens = 2048})
+  internet.request = slim_saved_req
+  test("summary max_tokens config (summary_max_tokens)",
+    max_body ~= nil and max_body:find('"max_tokens":2048', 1, true) ~= nil,
+    "body=" .. tostring(max_body and max_body:sub(1, 300)))
+end
+
+-- 空摘要兜底: thinking 模型 reasoning 挤占输出预算 → content 空 →
+-- 注入"直接输出摘要"提示重试一次；仍空 → compact_history 返回 nil
+-- （调用方走 trim 兜底，不阻断压缩流程）
+do
+  local retry_msgs = {}
+  for i = 1, 12 do
+    retry_msgs[#retry_msgs + 1] = {role = "user", content = "retry " .. i}
+  end
+  -- 测试3: 第一次空（仅 reasoning）→ 第二次给摘要 → compact 成功
+  local attempts = 0
+  local function empty_then_ok(msgs, cfg, opts)
+    attempts = attempts + 1
+    if attempts == 1 then
+      return {content = nil, reasoning_content = "thinking...", finish_reason = "stop"}
+    end
+    return {content = "retried summary text"}
+  end
+  agent_test.set_chat(empty_then_ok)
+  local retried = agent_test.compact_history(retry_msgs, {model = "m", api_key = ""})
+  agent_test.set_chat(agent_test.chat)
+  test("summary empty content retries once",
+    attempts == 2 and retried ~= nil
+    and retried[1].content:find("retried summary text", 1, true) ~= nil,
+    "attempts=" .. tostring(attempts)
+      .. " compacted=" .. tostring(retried and retried[1] and retried[1].content):sub(1, 120))
+
+  -- 测试4: 两次都空 → compact_history 返回 nil（trim 兜底路径）
+  local attempts2 = 0
+  local function always_empty(msgs, cfg, opts)
+    attempts2 = attempts2 + 1
+    return {content = nil, reasoning_content = "thinking...", finish_reason = "stop"}
+  end
+  agent_test.set_chat(always_empty)
+  local nil_compacted = agent_test.compact_history(retry_msgs, {model = "m", api_key = ""})
+  agent_test.set_chat(agent_test.chat)
+  test("summary empty twice falls back to nil (trim path)",
+    attempts2 == 2 and nil_compacted == nil,
+    "attempts=" .. tostring(attempts2)
+      .. " compacted=" .. tostring(nil_compacted ~= nil))
+end
+
 -- 上下文占用注入尾部块（模型决策依据: 看见占用 → 决定压缩）
 agent_test.set_runtime_extra(function()
   return "Context usage: 70% of model window (est. 1000/128000 tokens). If >=60% or the history is long, call compact_history."

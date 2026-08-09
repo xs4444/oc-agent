@@ -502,6 +502,14 @@ local function load()
     -- mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节
     -- 真实下降（默认 100KB < byte_budget 150KB → 自动折叠先于裁剪）。
     if not data.mem_prefold_bytes then data.mem_prefold_bytes = 100000 end
+    -- 摘要请求专用输出预算（summary_max_tokens）: deepseek 强思考模型下
+    -- opencode 的 4096 不够——reasoning 先吃大部分输出预算，可见摘要
+    -- content 被挤掉 → 摘要残缺 → 上下文没压住 → 重复压缩。默认 16384。
+    -- 摘要响应**不持久化**（只提取 content 写入摘要消息），128KB 响应体
+    -- 上限（response_body_limit）已保护——与主请求 max_tokens 8192（长
+    -- reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM）不同场景，
+    -- 专用大 max_tokens 无 OOM 风险。config 可调。
+    if not data.summary_max_tokens then data.summary_max_tokens = 16384 end
     -- HTTP 重试总预算（秒）: 交互式 TUI 场景默认 300s（5 分钟）。原
     -- 3600s（1h）对端点持续故障是"无反馈挂起 1 小时"；300s 折中——
     -- 端点瞬态故障足够，超时返回最后结果让用户看到错误。需要长时间
@@ -721,8 +729,10 @@ local function build_transcript(messages)
 end
 
 -- Ask the LLM to summarize older messages. Independent minimal request
--- (no tools, no system prompt) so it can't recurse into compaction.
--- Returns summary string or nil on any failure.
+-- (no tools, no runtime block, no main system prompt — only the summary
+-- instruction + transcript, via chat() opts) so it can't recurse into
+-- compaction. Returns summary string or nil on failure (empty summary
+-- after one retry, or transport error).
 local function summarize_history(messages, config, previous_summary)
   local transcript = build_transcript(messages).text
 
@@ -742,15 +752,57 @@ local function summarize_history(messages, config, previous_summary)
 
   -- Route through the injected chat() (set via set_chat) so session.lua does
   -- not need its own HTTP stack; chat is nil until agent.lua finishes Section 5.
+  -- 摘要请求专用瘦身路径（opencode 裸摘要请求同款 + reasonix 'independent
+  -- minimal request ... so it can't recurse into compaction' 防递归）:
+  --   主请求带 ~5KB system + ~1KB runtime 尾块 + ~10KB tools 声明，摘要
+  --   请求全部跳过 → 请求体只剩 [摘要指令 system + transcript user] ≈1KB；
+  --   max_tokens 用摘要专用预算（config.summary_max_tokens 默认 16384）——
+  --   deepseek 强思考模型下 opencode 的 4096 不够（reasoning 先吃大部分
+  --   输出预算，可见摘要 content 被挤掉 → 摘要残缺 → 重复压缩）。
+  -- 摘要响应**不持久化**（只提取 content 写摘要消息），128KB 响应体上限
+  -- （response_body_limit）已保护——与主请求 8192（长 reasoning 进历史 →
+  -- encode OOM）不同场景，专用大 max_tokens 无 OOM 风险。
   local chat = injected_chat
   if type(chat) ~= "function" then return nil end
-  local response = chat({
-    {role = "system", content = sys_prompt},
-    {role = "user", content = user_prompt}
-  }, config)
-  if type(response) ~= "table" then return nil end
-  local summary = response.content
-  if not summary or summary == "" then return nil end
+  local summary_opts = {
+    skip_system = true,
+    skip_runtime = true,
+    skip_tools = true,
+    max_tokens = tonumber(config.summary_max_tokens) or 16384,
+  }
+  -- 请求一次摘要: 返回 (summary, fatal)。fatal=true = 传输/HTTP 失败
+  -- （不重试）；fatal=nil + summary=nil = content 空/空白（thinking 模型
+  -- reasoning 挤占输出预算的典型表现，可重试）。
+  local function request_summary(hint)
+    local prompt = user_prompt
+    if hint then prompt = prompt .. "\n\n" .. hint end
+    local response = chat({
+      {role = "system", content = sys_prompt},
+      {role = "user", content = prompt}
+    }, config, summary_opts)
+    if type(response) ~= "table" then return nil, true end
+    if response.error then return nil, true end
+    local s = response.content
+    if not s or s:gsub("%s", "") == "" then return nil end
+    return s
+  end
+
+  local summary, fatal = request_summary(nil)
+  if not summary then
+    if fatal then return nil end  -- 传输失败: 不重试（与空摘要区分）
+    -- 空摘要兜底（v0.3.33 空回答重试网简化版，摘要专用一次重试）:
+    -- thinking 模型 reasoning 挤占输出预算时 content 空/空白——注入
+    -- "直接输出摘要"提示再调一次；仍空返回 nil → compact_history 走
+    -- trim 兜底（force_trim/字节裁剪），不阻断压缩流程。
+    print("[compact] 摘要为空（可能被 reasoning 挤占），重试一次...")
+    summary, fatal = request_summary(
+      "Please output the summary directly as plain text now. Do not output reasoning/thinking content.")
+    if not summary then
+      print("[compact] 摘要重试仍" .. (fatal and "失败" or "为空")
+        .. "，放弃压缩（调用方走 trim 兜底）")
+      return nil
+    end
+  end
   return summary
 end
 
@@ -1404,7 +1456,8 @@ local function build_headers(config)
   return headers
 end
 
-local function chat(messages, config)
+local function chat(messages, config, opts)
+  opts = opts or {}
   -- 每次请求前同步 HTTP 策略（config 热更新生效）:
   --   retry_budget   : 交互式 TUI 场景默认 300s——3600s 预算对端点持续
   --                    故障是"无反馈挂起 1 小时"；300s 折中（瞬态故障
@@ -1415,10 +1468,19 @@ local function chat(messages, config)
   http_mod.set_budget(tonumber(config.retry_budget) or 300)
   http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
   http_mod.set_response_body_limit(tonumber(config.response_body_limit) or 131072)
-  local system_prompt = build_system_prompt()
 
+  -- 请求选项 opts（摘要专用瘦身，opencode 裸摘要请求同款 + reasonix
+  -- 'independent minimal request ... so it can't recurse into compaction'
+  -- 防递归）:
+  --   skip_system  : 不注入主 system prompt（~5KB）——调用方自带指令
+  --   skip_runtime : 不追加 runtime 尾块（~1KB，机器状态/上下文占用）
+  --   skip_tools   : 省略 tools 声明（~10KB）——摘要请求模型不调工具
+  --   max_tokens   : 覆盖输出预算（摘要专用 summary_max_tokens）
+  -- 默认（无 opts / 全 false）= 现状主请求路径，行为不变。
   local api_messages = {}
-  api_messages[#api_messages + 1] = {role = "system", content = system_prompt}
+  if not opts.skip_system then
+    api_messages[#api_messages + 1] = {role = "system", content = build_system_prompt()}
+  end
   for _, msg in ipairs(messages) do
     -- 投影式压缩（reasonix projection 精神）: folded 折叠段不进请求
     if not msg.folded then
@@ -1428,23 +1490,31 @@ local function chat(messages, config)
   -- 缓存计费: 动态运行时信息放请求尾部（独立消息，不入历史），system prompt
   -- 字节稳定 → 前缀缓存命中。尾部用 user 角色 + 显式标记，任何 OpenAI 兼容
   -- 端点都接受，且不影响工具调用循环。
-  api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
+  if not opts.skip_runtime then
+    api_messages[#api_messages + 1] = {role = "user", content = build_runtime_block()}
+  end
 
   -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
   -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
   -- 内存不足错误现在由 mem_pressure 提前折叠预防（process_exchange 开头
   -- 按 freeMemory 低谷强制压缩，folded 段不进请求体），此处为最后防线。
   -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
+  -- skip_tools: 省略字段（json encode 跳过 nil 键）——摘要请求体不含
+  -- tools 声明（opencode 裸摘要请求同款 tools:[] 语义）。注意不能用
+  -- `opts.skip_tools and nil or list()` 三元——nil 分支被 `or` 吞掉。
+  local req_tools = nil
+  if not opts.skip_tools then req_tools = tools_mod.list() end
   local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
-    tools = tools_mod.list(),
+    tools = req_tools,
     -- 输出预算: dsv4 等 thinking 模型思考强度高（reasoning 可占大量输出
     -- token），2048 曾导致"长思考挤掉可见回答 → content 空"（真机 gist
     -- 实证；参考 reasonix 128K / opencode ≤32K）。默认 8192——16384 曾致
     -- 长 reasoning 进历史 → 下次请求 encode 体积暴涨 → OOM 崩溃
-    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖。
-    max_tokens = tonumber(config.max_tokens) or 8192,
+    -- （OC 内存 1.4MB 约束）；config.max_tokens 可覆盖，摘要请求由
+    -- opts.max_tokens 覆盖（config.summary_max_tokens，见 session.lua）。
+    max_tokens = opts.max_tokens or tonumber(config.max_tokens) or 8192,
     temperature = 0.7
   })
   if not ok_enc then
