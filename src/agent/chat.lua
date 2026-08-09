@@ -13,7 +13,8 @@
 -- agent.tools (live tool list for the tools[] field).
 -- ═══════════════════════════════════════════════════════════════
 
-local http_post = require("agent.http").post
+local http_mod = require("agent.http")
+local http_post = http_mod.post
 local json = require("agent.json")
 local tools_mod = require("agent.tools")
 
@@ -153,6 +154,13 @@ local function build_headers(config)
 end
 
 local function chat(messages, config)
+  -- 每次请求前同步 HTTP 策略（config 热更新生效）:
+  --   retry_budget   : 交互式 TUI 场景默认 300s——3600s 预算对端点持续
+  --                    故障是"无反馈挂起 1 小时"；300s 折中（瞬态故障
+  --                    足够，超时返回最后结果让用户看到错误）
+  --   response_timeout: 单次请求响应读超时（挂起保护，见 agent.http）
+  http_mod.set_budget(tonumber(config.retry_budget) or 300)
+  http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
   local system_prompt = build_system_prompt()
 
   local api_messages = {}

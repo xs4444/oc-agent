@@ -413,6 +413,74 @@ local code, resp, err = http_post("https://mock/chat/completions",
 test("http_post mock 200", code == 200 and type(resp) == "string" and not err,
   "code=" .. tostring(code) .. " err=" .. tostring(err))
 
+-- ── HTTP 挂起修复: 响应读超时 + 重试预算可配 ──
+-- 真机"第二轮始终 Thinking..."根因: 荒野大师 internet 迭代器连接建立后
+-- 流不结束 → 响应迭代无限等（预算检查在 once 返回后才执行，形同虚设）。
+do
+  local http_mod = require("agent.http")
+  -- 构造 handle 工厂: 返回固定 code 的响应（一次迭代后结束）
+  local function make_code_handle(code, body)
+    local started = false
+    local h = {}
+    setmetatable(h, {
+      __call = function()
+        if started then return nil end
+        started = true
+        return body or "server response"
+      end,
+      __index = { response = function() return code end },
+    })
+    return h
+  end
+  local real_request = internet.request
+
+  -- 1) response read timeout: 永不结束的迭代器 → deadline 触发（不无限等）
+  local hang_handle = {}
+  setmetatable(hang_handle, {
+    __call = function() return "x" end,  -- 永远返回块，流永不结束
+    __index = { response = function() return 200 end },
+  })
+  internet.request = function() return hang_handle end
+  http_mod.set_response_timeout(0.5)
+  http_mod.set_budget(1)  -- 预算也缩短，超时错误经重试路径快速返回
+  local t0 = os.clock()
+  local h_code, h_resp, h_err = http_post("https://mock/hang", {}, "{}")
+  local h_elapsed = os.clock() - t0
+  test("http read timeout returns error", type(h_err) == "string"
+    and h_err:find("read timeout", 1, true) ~= nil, tostring(h_err))
+  test("http read timeout returns fast (<2s)", h_elapsed < 2,
+    string.format("%.2fs", h_elapsed))
+
+  -- 2) retry budget configurable: set_budget(1) + 持续 500 → ~1s 返回（非 60s）
+  internet.request = function() return make_code_handle(500) end
+  http_mod.set_budget(1)
+  local t1 = os.clock()
+  local b_code, b_resp, b_err = http_post("https://mock/500", {}, "{}")
+  local b_elapsed = os.clock() - t1
+  internet.request = real_request
+  test("retry budget configurable (~1s not 60s)", b_elapsed < 10,
+    string.format("%.2fs code=%s", b_elapsed, tostring(b_code)))
+
+  -- 3) budget reset per chat call: chat() 每次请求前用 config.retry_budget 覆盖
+  http_mod.set_budget(60)  -- 先设回大值（_TEST_MODE 默认），确认 chat 覆盖
+  internet.request = function() return make_code_handle(500) end
+  local t2 = os.clock()
+  local c_res = agent_test.chat({{role = "user", content = "hi"}},
+    {api_key = "test", model = "mock", api_url = "https://example.test/chat/completions",
+     retry_budget = 1})
+  local c_elapsed = os.clock() - t2
+  internet.request = real_request
+  test("budget reset per chat call (config overrides)",
+    type(c_res) == "table" and c_res.error
+    and c_res.error:find("HTTP 500", 1, true) ~= nil and c_elapsed < 10,
+    "err=" .. tostring(c_res and c_res.error)
+      .. string.format(" %.2fs", c_elapsed))
+
+  -- 恢复默认（_TEST_MODE: budget 60 / response timeout 120）
+  http_mod.set_budget(60)
+  http_mod.set_response_timeout(120)
+end
+
 -- summarize_history via mock
 local msgs = {
   {role = "user", content = "how much memory?"},
