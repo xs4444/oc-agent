@@ -53,6 +53,10 @@ local function load()
     if not data.context_window then data.context_window = 128000 end
     -- 运行时自动显示上下文（每次响应后一行 [ctx]），可设 false 关闭
     if data.ctx_auto == nil then data.ctx_auto = true end
+    -- 内存压力压缩阈值（字节）: freeMemory() 低于此值即强制折叠早期消息
+    -- （真机 OOM→error 根因修复；默认 400KB——OC 1.4MB 内存下 encode
+    -- 峰值 137-230KB，真机低谷 278KB 时 encode 必超限）
+    if not data.mem_compact_threshold then data.mem_compact_threshold = 400000 end
     return data
   end
   return nil

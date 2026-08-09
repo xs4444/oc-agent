@@ -707,6 +707,27 @@ local function ensure_context_budget(messages, config, persist, session)
   return messages, est_msgs(messages)
 end
 
+-- ── 内存压力检测（真机 OOM→error 根因修复）──
+-- fix-5 实证: 60 条真实历史 → 请求体 114KB，encode 峰值 ~137-230KB；
+-- 真机 free 内存低谷 278KB（agent 自测）→ encode 必超限 → OOM→error
+-- （chat.lua pcall 捕获后 TUI 只显示不落盘——gist 只见 user 无 assistant，
+-- 第二轮无响应根因）。context_window=128K 是误导: 24.3K tokens 仅占窗口
+-- 19%，低于 should_compact 的 60% 阈值——模型永远不会主动 compact_history。
+-- 这里按运行时 freeMemory 低谷直接折叠早期消息（folded 段不进请求体）。
+-- computer.freeMemory() 不可用时返回 false（不阻塞任何环境——oc_mock/
+-- ocvm 精简环境无 computer 也安全）。每次调用重新 pcall(require,"computer"):
+-- package.loaded 命中时仅为表查找（无文件 IO 开销），且允许测试临时移除
+-- computer 验证缺失路径。阈值可配: config.mem_compact_threshold（字节），
+-- 默认 400000（400KB——OC 1.4MB 内存下 encode 峰值 2-3x 文本，低谷必超限）。
+local function mem_pressure(config)
+  local ok_c, computer = pcall(require, "computer")
+  if not ok_c or not computer or not computer.freeMemory then return false end
+  local ok_f, free = pcall(computer.freeMemory)
+  if not ok_f or type(free) ~= "number" then return false end
+  local threshold = tonumber(config.mem_compact_threshold) or 400000  -- 默认 400KB
+  return free < threshold
+end
+
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
 
@@ -717,6 +738,27 @@ local function process_exchange(messages, config, user_input, persist, session)
     if session then rebuild_session_history(session, msgs)
     else rebuild_history(msgs) end
   end or nil
+
+  -- 内存压力强制压缩: free 内存低谷（真机 278KB 实测）时 encode 大历史
+  -- 必 OOM→error（chat.lua:171 pcall 捕获，TUI 只显示不落盘——第二轮
+  -- 无响应根因）。不等模型 compact_history（24K tokens 仅占 128K 窗口
+  -- 19%，永远不触发），内存紧张直接折叠早期消息（folded 段不进请求体）。
+  -- 与 ensure_context_budget 字节预算互补: 字节预算兜底请求体大小
+  -- （150KB），此处兜底运行时内存低谷——encode 峰值 2-3x 文本，低谷时
+  -- 即使字节未超预算 encode 也可能 OOM。compact_history 在消息 ≤5 条时
+  -- 直接返回 nil（不发 LLM 摘要），小会话零开销。
+  if mem_pressure(config) then
+    print("[mem] 空闲内存紧张，强制压缩历史...")
+    local compacted = compact_history(messages, config)
+    if compacted then
+      messages = compacted
+      if persist then
+        if session then rebuild_session_history(session, messages)
+        else rebuild_history(messages) end
+      end
+    end
+  end
+
   -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
   -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
   local window_now = tonumber(config.context_window) or 128000
@@ -1394,6 +1436,7 @@ if _TEST_MODE then
     collect_multiline = collect_multiline,
     ensure_context_budget = ensure_context_budget,
     force_trim = force_trim,
+    mem_pressure = mem_pressure,
     TOOLS = TOOLS,
   }
 end
