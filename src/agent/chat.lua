@@ -159,8 +159,11 @@ local function chat(messages, config)
   --                    故障是"无反馈挂起 1 小时"；300s 折中（瞬态故障
   --                    足够，超时返回最后结果让用户看到错误）
   --   response_timeout: 单次请求响应读超时（挂起保护，见 agent.http）
+  --   response_body_limit: 单次请求响应体累积上限（结构性内存护栏——
+  --     OOM 无法预测，硬上限保证任何单次峰值都在安全线内，见 agent.http）
   http_mod.set_budget(tonumber(config.retry_budget) or 300)
   http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
+  http_mod.set_response_body_limit(tonumber(config.response_body_limit) or 131072)
   local system_prompt = build_system_prompt()
 
   local api_messages = {}

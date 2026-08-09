@@ -65,6 +65,12 @@ local function load()
     -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 100KB 内存表，
     -- JSONL 文件 append-only 完整保留，只限内存表）
     if not data.mem_load_budget then data.mem_load_budget = 100000 end
+    -- 传统自动压缩字节阈值（mem_prefold_bytes）: 表字节超此值即系统自动
+    -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
+    -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 100KB，先于
+    -- mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节
+    -- 真实下降（默认 100KB < byte_budget 150KB → 自动折叠先于裁剪）。
+    if not data.mem_prefold_bytes then data.mem_prefold_bytes = 100000 end
     -- HTTP 重试总预算（秒）: 交互式 TUI 场景默认 300s（5 分钟）。原
     -- 3600s（1h）对端点持续故障是"无反馈挂起 1 小时"；300s 折中——
     -- 端点瞬态故障足够，超时返回最后结果让用户看到错误。需要长时间
@@ -74,6 +80,12 @@ local function load()
     -- 建立后流不结束（JVM 实现无 OS 超时），响应迭代无超时则无限等。
     -- 默认 120s。
     if not data.response_timeout then data.response_timeout = 120 end
+    -- 单次请求响应体累积上限（字节）: 结构性内存护栏——OOM 无法预测
+    -- （单次响应峰值不可知），硬上限保证任何单次峰值都落在安全线内。
+    -- max_tokens 8192 的 reasoning 响应 JSON 可能 100KB+，decode 峰值
+    -- 2-3x 单次就爆（真机 2MB 内存）；默认 131072（128KB）——合法响应
+    -- ≈60KB 足够容纳且防爆。超限返回明确 error（不静默截断）。
+    if not data.response_body_limit then data.response_body_limit = 131072 end
     return data
   end
   return nil

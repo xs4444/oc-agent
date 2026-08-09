@@ -435,9 +435,14 @@ do
   local real_request = internet.request
 
   -- 1) response read timeout: 永不结束的迭代器 → deadline 触发（不无限等）
+  -- 注意: 迭代器吐空串（0 字节）——挂起语义是"连接建立后流不结束但不来
+  -- 数据"。若吐非空块，测试环境 os.sleep 是 no-op（run_tests.lua:7），
+  -- 纯 CPU 循环 ~1M 次/秒，131072 字节上限会在 0.5s deadline 前先触发
+  -- "too large"，测不到 timeout 路径（真机 os.sleep(0.02) 实际挂起，
+  -- 120s deadline 恒先于字节上限触发——挂起语义对应空串）。
   local hang_handle = {}
   setmetatable(hang_handle, {
-    __call = function() return "x" end,  -- 永远返回块，流永不结束
+    __call = function() return "" end,  -- 流永不结束但不产生字节
     __index = { response = function() return 200 end },
   })
   internet.request = function() return hang_handle end
@@ -476,9 +481,50 @@ do
     "err=" .. tostring(c_res and c_res.error)
       .. string.format(" %.2fs", c_elapsed))
 
-  -- 恢复默认（_TEST_MODE: budget 60 / response timeout 120）
+  -- ── 响应体累积上限（结构性内存护栏）──
+  -- OOM 无法预测（单次响应峰值不可知）→ 正确解法 = 结构性上限: 所有已知
+  -- 分配源设硬上限。http_post_once 的 chunks 累积此前无上限——max_tokens
+  -- 8192 的 reasoning 响应 JSON 可能 100KB+，decode 峰值 2-3x 单次就爆
+  -- （真机 2MB 内存）。超限返回明确 error（不静默截断——截断的 JSON
+  -- 解析失败，明确 error 让 chat() 走错误路径）。
+  -- 4) response body limit: 永不结束迭代器持续吐 1KB 块 → 超限即明确 error
+  local big_handle = {}
+  setmetatable(big_handle, {
+    __call = function() return string.rep("x", 1024) end,  -- 每块 1KB，流永不结束
+    __index = { response = function() return 200 end },
+  })
+  internet.request = function() return big_handle end
+  http_mod.set_response_body_limit(4096)  -- 4KB 上限 → 第 5 块（>4KB）超限
+  http_mod.set_budget(1)  -- 超限错误经重试路径快速返回（预算封顶）
+  local t3 = os.clock()
+  local l_code, l_resp, l_err = http_post("https://mock/big", {}, "{}")
+  local l_elapsed = os.clock() - t3
+  internet.request = real_request
+  test("response body limit returns error", type(l_err) == "string"
+    and l_err:find("response too large", 1, true) ~= nil, tostring(l_err))
+  test("response body limit returns fast (<2s)", l_elapsed < 2,
+    string.format("%.2fs", l_elapsed))
+
+  -- 5) body limit respects config: chat() 每次请求前用 config.response_body_limit 覆盖
+  http_mod.set_response_body_limit(131072)  -- 先设回大值，确认 chat 覆盖
+  internet.request = function() return big_handle end
+  local t4 = os.clock()
+  local d_res = agent_test.chat({{role = "user", content = "hi"}},
+    {api_key = "test", model = "mock", api_url = "https://example.test/chat/completions",
+     retry_budget = 1, response_body_limit = 4096})
+  local d_elapsed = os.clock() - t4
+  internet.request = real_request
+  test("body limit respects config (chat override)",
+    type(d_res) == "table" and d_res.error
+    and d_res.error:find("response too large", 1, true) ~= nil
+    and d_elapsed < 2,
+    "err=" .. tostring(d_res and d_res.error)
+      .. string.format(" %.2fs", d_elapsed))
+
+  -- 恢复默认（_TEST_MODE: budget 60 / response timeout 120 / body limit 128KB）
   http_mod.set_budget(60)
   http_mod.set_response_timeout(120)
+  http_mod.set_response_body_limit(131072)
 end
 
 -- summarize_history via mock
@@ -496,7 +542,6 @@ local big = {}
 for i = 1, 30 do
   big[#big + 1] = {role = "user", content = "message number " .. i}
 end
-local big_n = #big  -- 投影式就地修改，快照压缩前长度
 local compacted = compact_history(big, {model = "m", api_key = ""})
 test("compact_history succeeds", compacted ~= nil, "compacted=nil")
 if compacted then
@@ -504,16 +549,43 @@ if compacted then
     and tostring(compacted[1].content):find("对话摘要") ~= nil)
   test("compact keeps last messages", compacted[#compacted].content == "message number 30"
     and compacted[#compacted - 1].content == "message number 29")
-  -- 投影式压缩（reasonix projection 精神）: 折叠段不删除——folded 标记，
-  -- 头部插摘要。30 条小消息 → keep 8 → 折叠 22
+  -- 传统自动压缩（opencode 模式）: 折叠段**物理删除**——摘要承载旧消息
+  -- 内容（KEEP/REF 静态展开），折叠段留在内存表纯占内存。30 条小消息
+  -- → keep 8 → 折叠 22 条删除，表 = 摘要 + 8 条 = 9 条。
   local folded_count = 0
   for _, m in ipairs(compacted) do
     if m.folded then folded_count = folded_count + 1 end
   end
-  test("compact projects fold (no deletion)", #compacted == big_n + 1
-    and folded_count == big_n - 8,
+  test("compact deletes folded segments (memory release)", #compacted == 9
+    and folded_count == 0,
     "#=" .. tostring(#compacted) .. " folded=" .. tostring(folded_count))
   test("compact token floor keeps more small messages", #compacted >= 5, "#=" .. tostring(#compacted))
+end
+
+-- 折叠段物理回收（内存释放）: 折叠后表条数/字节显著减少——折叠段删除，
+-- 不再驻留内存（v0.3.47 前投影式折叠只标记不删除，93.6KB JSONL → 表
+-- ~300KB 驻留是第二次 OOM 根因）
+do
+  local rel = {}
+  for i = 1, 20 do
+    rel[#rel + 1] = {role = "user", content = string.rep("r", 5000) .. i}
+  end
+  local rel_n = #rel
+  local rel_bytes_before = 0
+  for _, m in ipairs(rel) do rel_bytes_before = rel_bytes_before + #(m.content or "") end
+  local rel_compacted = compact_history(rel, {model = "m", api_key = ""})
+  local rel_bytes_after = 0
+  local rel_folded = 0
+  for _, m in ipairs(rel_compacted) do
+    rel_bytes_after = rel_bytes_after + #(m.content or "")
+    if m.folded then rel_folded = rel_folded + 1 end
+  end
+  test("compact releases memory (folded segments deleted)",
+    rel_compacted ~= nil and #rel_compacted < rel_n
+    and rel_bytes_after < rel_bytes_before / 2 and rel_folded == 0,
+    "#=" .. tostring(rel_compacted and #rel_compacted or 0) .. "/" .. tostring(rel_n)
+      .. " bytes " .. tostring(rel_bytes_after) .. "/" .. tostring(rel_bytes_before)
+      .. " folded=" .. tostring(rel_folded))
 end
 
 -- should_compact trigger thresholds（窗口比例 0.6 驱动 + 条数 48 兜底）
@@ -696,22 +768,23 @@ local small = {{role = "user", content = "hi"}, {role = "assistant", content = "
 local m2, e2 = agent_test.ensure_context_budget(small, cfg_small, false)
 test("ensure no-op on small session", #m2 == #small, "#=" .. tostring(#m2))
 
--- ensure 大会话: 投影式压缩（mock 下 compact 成功）——折叠段标记 + est 下降
+-- ensure 大会话: 自动压缩（mock 下 compact 成功）——折叠段物理删除 + est 下降
 local m3 = {}
 for i = 1, 20 do
   m3[#m3 + 1] = {role = "user", content = big_content}
   m3[#m3 + 1] = {role = "assistant", content = big_content}
 end
-local m3_n = #m3  -- 投影式就地修改，快照压缩前长度
 local m3_before = 0
 for _, m in ipairs(m3) do
   m3_before = m3_before + agent_test.estimate_tokens(m.content or "")
 end
 local m3r, e3 = agent_test.ensure_context_budget(m3,
   {context_window = cfg_small.context_window, byte_budget = 99999999}, false)
-test("ensure projects fold on big session",
+-- 20 条 × 81KB: est 超 80% 窗口 → 压缩；keep 4（est 已 ≥1500 不增长）
+-- → 折叠 16 条物理删除，表 = 摘要 + 4 = 5 条（不再是投影式的 m3_n+1）
+test("ensure compacts big session (folded deleted)",
   m3r[1].role == "system" and tostring(m3r[1].content):find("对话摘要") ~= nil
-  and e3 < m3_before and #m3r == m3_n + 1,
+  and e3 < m3_before and #m3r == 5,
   "#=" .. tostring(#m3r) .. " est " .. tostring(e3) .. " from " .. tostring(m3_before))
 
 -- ensure 字节硬预算: token 未超但字节超 150KB → 裁剪早期消息（P0 修复:
@@ -1097,10 +1170,20 @@ test("KEEP truncates long embed", keep_long
   tostring(keep_long and keep_long[1].content or nil):sub(1, 300))
 
 -- 任务4: REF 双标记（opencode-acp keep-markers）——[[REF:N|desc]] 展开为
--- "[消息 N] desc" 引用指针（不嵌原文）
+-- "[消息 N] desc" 引用指针（不嵌原文）。注意: compact_history 就地变异
+-- 传入表（折叠段物理删除），每个用例用全新消息列表——投影式时代的
+-- "复用已折叠表"在此语义下 parts 已空（折叠段不存在），测不到展开。
+local function fresh_keep_msgs()
+  local t = {}
+  for i = 1, 12 do
+    t[#t + 1] = {role = "user", content = "msg " .. i}
+  end
+  t[2].content = "critical secret value: abc123"
+  return t
+end
 agent_test.set_chat(keep_mock_chat)
 keep_mock_summary = "summary [[REF:2|关键事实]] [[REF:1|次要]]"
-local ref_compacted = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+local ref_compacted = agent_test.compact_history(fresh_keep_msgs(), {model = "m", api_key = ""})
 agent_test.set_chat(agent_test.chat)
 test("REF expands to pointer [消息 N] desc", ref_compacted
   and ref_compacted[1].content:find("[消息 2] 关键事实", 1, true) ~= nil
@@ -1113,11 +1196,32 @@ test("REF does not embed original text", ref_compacted
 -- REF 越界引用: 保留原标记 + 不崩溃
 agent_test.set_chat(keep_mock_chat)
 keep_mock_summary = "s [[REF:99|越界描述]]"
-local ref_oob = agent_test.compact_history(keep_msgs, {model = "m", api_key = ""})
+local ref_oob = agent_test.compact_history(fresh_keep_msgs(), {model = "m", api_key = ""})
 agent_test.set_chat(agent_test.chat)
 test("REF out-of-range marker survives", ref_oob
   and ref_oob[1].content:find("[[REF:99|越界描述]]", 1, true) ~= nil,
   tostring(ref_oob and ref_oob[1].content or nil):sub(1, 200))
+
+-- KEEP 展开在折叠段物理删除后仍然完整: expand_keep_markers 在 compact
+-- 时**静态**展开（摘要 content 已含原文），折叠段随后删除不影响展开
+-- 结果——KEEP 测试（展开/越界/截断）在此语义下必须保持全绿。
+do
+  local keep2_msgs = {}
+  for i = 1, 12 do
+    keep2_msgs[#keep2_msgs + 1] = {role = "user", content = "km " .. i}
+  end
+  keep2_msgs[2].content = "verbatim secret: xyz789"
+  agent_test.set_chat(keep_mock_chat)
+  keep_mock_summary = "s [[KEEP:2]]"
+  local keep2 = agent_test.compact_history(keep2_msgs, {model = "m", api_key = ""})
+  agent_test.set_chat(agent_test.chat)
+  local keep2_folded = 0
+  for _, m in ipairs(keep2) do if m.folded then keep2_folded = keep2_folded + 1 end end
+  test("KEEP expansion survives fold deletion",
+    keep2 and keep2[1].content:find("xyz789") ~= nil and keep2_folded == 0,
+    "found=" .. tostring(keep2 and keep2[1].content:find("xyz789") ~= nil)
+      .. " folded=" .. tostring(keep2_folded))
+end
 
 -- 任务4/5: 摘要指令含 REF 说明 + 七节骨架（reasonix compact 借鉴）
 local section_captured = nil
@@ -1152,7 +1256,7 @@ local e_after, e_est = agent_test.ensure_context_budget(e_msgs,
 test("ensure no auto-compact at 60-80% (model-driven)",
   #e_after == 10, "#=" .. tostring(#e_after) .. " est=" .. tostring(e_est))
 
--- compact_history 工具: 模型驱动压缩（KEEP 标记 + 投影式就地 + 持久化）
+-- compact_history 工具: 模型主动压缩（KEEP 标记 + 物理删除就地 + 持久化）
 local tool_ctx = {}
 for i = 1, 15 do
   tool_ctx[#tool_ctx + 1] = {role = "user", content = "tool ctx " .. i}
@@ -1170,9 +1274,12 @@ local tool_folded = 0
 for _, m in ipairs(tool_ctx) do
   if m.folded then tool_folded = tool_folded + 1 end
 end
-test("compact tool projects fold in place",
+-- 15 条 + 摘要 → 折叠 7 条物理删除，表 = 摘要 + 8 = 9 条（不再是投影式
+-- 的 16 条）；KEEP:1 已静态展开进摘要（"tool ctx 1" 原文）
+test("compact tool deletes folded segments in place",
   tool_ctx[1].content:find("tool summary", 1, true) ~= nil
-  and #tool_ctx == 16 and tool_folded == 7,  -- 15 条 + 摘要；折叠 15-8=7
+  and tool_ctx[1].content:find("tool ctx 1", 1, true) ~= nil
+  and #tool_ctx == 9 and tool_folded == 0,
   "n=" .. tostring(#tool_ctx) .. " folded=" .. tostring(tool_folded)
   .. " result=" .. tostring(compact_result):sub(1, 120))
 test("compact tool rebuilds history file", rebuilt ~= nil and #rebuilt == #tool_ctx)
@@ -1447,7 +1554,8 @@ do
   llm_idx = 0
   local mp_res = agent_test.process_exchange(mp_msgs,
     {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
-     context_window = 128000, mem_trim_bytes = 60000}, "new question", false)
+     context_window = 128000, mem_trim_bytes = 60000,
+     mem_prefold_bytes = 999999999}, "new question", false)  -- 关自动折叠，隔离 mem_pressure 路径
   computer.freeMemory = saved_free
   next_llm = nil
   local mp_bytes = 0
@@ -1543,6 +1651,58 @@ do
   test("load history keeps head anchor",
     lh[1] and type(lh[1].content) == "string",
     tostring(lh[1] and lh[1].content and lh[1].content:sub(1, 20)))
+end
+
+-- ── 传统自动压缩（opencode 模式，字节阈值驱动）──
+-- 表字节 > mem_prefold_bytes（默认 100KB）→ process_exchange 请求前
+-- 系统自动折叠（compact_history），不等模型调 compact_history 工具
+-- （模型需 ≥60% 窗口才自觉，OC 内存下永远到不了——真机 24K tokens
+-- 只占窗口 19%）。折叠段物理回收后表字节真实下降；mem_pressure 内存
+-- 阈值兜底仍在其后（本组测试内存充足不触发）。mock 需 2 个 LLM 响应:
+-- 第一个被 summarize 消耗，第二个是主循环。
+do
+  -- 测试1: 40 条 × 3KB ≈ 120KB > 100KB → 自动折叠 + 摘要消息出现
+  local ab_msgs = {}
+  for i = 1, 40 do
+    ab_msgs[#ab_msgs + 1] = {role = "user", content = string.rep("a", 3000) .. i}
+  end
+  next_llm = {
+    llm_content("自动压缩摘要", nil, "stop"),  -- summarize 消耗
+    llm_content("最终回答", nil, "stop"),      -- 主循环
+  }
+  llm_idx = 0
+  local ab_res = agent_test.process_exchange(ab_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "new question", false)
+  next_llm = nil
+  local ab_has_summary = ab_msgs[1] and ab_msgs[1].role == "system"
+    and tostring(ab_msgs[1].content):find("对话摘要") ~= nil
+  test("auto compact triggers by bytes (fold on >100KB)",
+    ab_has_summary and #ab_msgs <= 9 and ab_res and ab_res.text == "最终回答",
+    "summary=" .. tostring(ab_has_summary) .. " #=" .. tostring(#ab_msgs)
+      .. " res=" .. tostring(ab_res and (ab_res.text or ab_res.error)))
+
+  -- 测试2: mem_prefold_bytes=50000 → 25×2.5KB≈62.5KB 即触发（默认 100KB
+  -- 下不触发）——config 可配验证
+  local ac_msgs = {}
+  for i = 1, 25 do
+    ac_msgs[#ac_msgs + 1] = {role = "user", content = string.rep("c", 2500) .. i}
+  end
+  next_llm = {
+    llm_content("自动压缩摘要", nil, "stop"),
+    llm_content("回答", nil, "stop"),
+  }
+  llm_idx = 0
+  local ac_res = agent_test.process_exchange(ac_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000, mem_prefold_bytes = 50000}, "q", false)
+  next_llm = nil
+  local ac_has_summary = ac_msgs[1] and ac_msgs[1].role == "system"
+    and tostring(ac_msgs[1].content):find("对话摘要") ~= nil
+  test("auto compact respects config (mem_prefold_bytes)",
+    ac_has_summary and ac_res and ac_res.text == "回答",
+    "summary=" .. tostring(ac_has_summary)
+      .. " res=" .. tostring(ac_res and (ac_res.text or ac_res.error)))
 end
 
 -- 任务1: 工具轮次上限——超过 max_tool_steps 后注入提示，再做一次请求
