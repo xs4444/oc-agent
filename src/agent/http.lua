@@ -15,17 +15,26 @@ local json = require("agent.json")
 -- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
 -- 2000ms 基数 ×2，瞬态失败无限重试直到成功或不可重试错误）:
 --   - 瞬态 = 网络错误 / HTTP 429 / 5xx；4xx 永久失败不重试
---   - 总重试预算 MAX_RETRY_BUDGET 秒（默认 1 小时）——预算耗尽返回
---     最后一次结果。opencode 无总预算（单请求可挂 24 天），但 OC
---     单线程场景必须有界（用户指定上限 1 小时）
+--   - 总重试预算 retry_budget 秒（生产默认 300s，config.retry_budget
+--     可调——chat() 每次请求前同步，热更新生效；测试环境 _TEST_MODE
+--     默认 60s）。预算耗尽返回最后一次结果。opencode 无总预算（单请求
+--     可挂 24 天），但 OC 单线程场景必须有界：3600s（1h）对交互式
+--     TUI 是"无反馈挂起 1 小时"；300s（5 分钟）折中——端点瞬态故障
+--     足够，超时返回最后结果让用户看到错误
 --   - 单次等待封顶 RETRY_DELAY_CAP（300s），避免极端退避
 -- 讯飞星辰等免费端点频繁 429/慢响应，需要更长的重试窗口。
 -- ═══════════════════════════════════════════════════════════════
 local RETRY_BASE_DELAY = 2         -- 指数退避基数（秒）
 local RETRY_DELAY_CAP = 300        -- 单次等待封顶（秒）
--- 总重试预算: 生产 1 小时；测试环境（_TEST_MODE）缩短为 60s，
--- 避免 e2e/回归在端点持续故障时长时间挂起
-local MAX_RETRY_BUDGET = _TEST_MODE and 60 or 3600
+-- 总重试预算: 生产默认 300s；测试环境（_TEST_MODE）缩短为 60s，
+-- 避免 e2e/回归在端点持续故障时长时间挂起。chat() 每次请求前用
+-- config.retry_budget 覆盖（热更新）
+local retry_budget = _TEST_MODE and 60 or 300
+-- 单次请求响应读超时（秒）: 真机荒野大师 internet 迭代器可能在连接
+-- 建立后流不结束（JVM 实现可能无 OS 超时）——响应迭代若无超时则无限
+-- 等，而重试预算检查（os.clock()）在 once 返回后才执行，预算形同虚设。
+-- 默认 120s；config.response_timeout 可调（chat() 每次请求前同步）
+local MAX_RESPONSE_WAIT = 120
 
 -- Single request attempt. Returns code, body, err.
 local function http_post_once(url, headers, body)
@@ -40,9 +49,19 @@ local function http_post_once(url, headers, body)
   end
 
   local chunks = {}
+  local timed_out = false
   local iter_ok, iter_err = pcall(function()
     local n = 0
+    -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
+    -- 建立后流可能永不结束，无超时则无限等（重试预算检查不到——预算在
+    -- once 返回后才执行）。保持每 chunk os.sleep(0.02) yield——OC 调度器
+    -- 看到进展，避免 "too long without yielding" 崩溃。
+    local read_deadline = os.clock() + MAX_RESPONSE_WAIT
     for chunk in handle do
+      if os.clock() >= read_deadline then
+        timed_out = true
+        return
+      end
       n = n + 1
       chunks[#chunks + 1] = chunk
       -- Yield on EVERY chunk: OC's scheduler sees progress even while the
@@ -53,6 +72,9 @@ local function http_post_once(url, headers, body)
   end)
   if not iter_ok then
     return nil, nil, "http read failed: " .. tostring(iter_err)
+  end
+  if timed_out then
+    return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
   end
   local response_body = table.concat(chunks)
 
@@ -76,7 +98,7 @@ end
 -- POST with automatic retry（指数退避 + 总预算上限）
 local function http_post(url, headers, body)
   local attempt = 0
-  local deadline = os.clock() + MAX_RETRY_BUDGET
+  local deadline = os.clock() + retry_budget
   while true do
     attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
@@ -97,4 +119,17 @@ local function http_post(url, headers, body)
   end
 end
 
-return { post = http_post }
+-- 运行时策略调整（config 热更新: chat() 每次请求前调用）
+local function set_budget(b)
+  retry_budget = b
+end
+
+local function set_response_timeout(t)
+  MAX_RESPONSE_WAIT = t
+end
+
+return {
+  post = http_post,
+  set_budget = set_budget,
+  set_response_timeout = set_response_timeout,
+}

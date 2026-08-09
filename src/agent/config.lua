@@ -57,6 +57,15 @@ local function load()
     -- （真机 OOM→error 根因修复；默认 400KB——OC 1.4MB 内存下 encode
     -- 峰值 137-230KB，真机低谷 278KB 时 encode 必超限）
     if not data.mem_compact_threshold then data.mem_compact_threshold = 400000 end
+    -- HTTP 重试总预算（秒）: 交互式 TUI 场景默认 300s（5 分钟）。原
+    -- 3600s（1h）对端点持续故障是"无反馈挂起 1 小时"；300s 折中——
+    -- 端点瞬态故障足够，超时返回最后结果让用户看到错误。需要长时间
+    -- 容忍免费端点限流的用户可调大（上限不强制）。
+    if not data.retry_budget then data.retry_budget = 300 end
+    -- 单次请求响应读超时（秒）: 真机荒野大师 internet 迭代器可能连接
+    -- 建立后流不结束（JVM 实现无 OS 超时），响应迭代无超时则无限等。
+    -- 默认 120s。
+    if not data.response_timeout then data.response_timeout = 120 end
     return data
   end
   return nil
