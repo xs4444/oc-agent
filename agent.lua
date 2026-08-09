@@ -4361,7 +4361,13 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
 
     if response.reasoning_content then
-      print(response.reasoning_content)
+      -- TUI 模式（UI_INPUT ~= nil）: 思考/推理内容不显示——内容区清理策略：
+      -- reasoning 是内容区无界增长的最大源（长思考占单轮文本大头），且状态栏
+      -- 已有 "Thinking..." 提示；用户输入与 LLM 输出（printRole）完整保留。
+      -- 模型侧 messages 仍完整回传 reasoning_content（400 防护不受影响）。
+      if not UI_INPUT then
+        print(response.reasoning_content)
+      end
     end
 
     if response.content then

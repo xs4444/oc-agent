@@ -1575,6 +1575,25 @@ do
   next_llm = nil
 end
 
+-- TUI 内容区清理 reasoning: REPL 模式（UI_INPUT=nil）必须保留打印
+-- （防过度修复——TUI 跳过路径靠真机验证，本地 UI_INPUT 为模块级 local 不可注入）
+do
+  next_llm = {
+    llm_content("可见回答", "思考内容XYZ防过度修复", "stop"),
+  }
+  llm_idx = 0
+  local ok_cap, cap_text = capture_print(function()
+    local msgs_rs = {}
+    agent_test.process_exchange(msgs_rs,
+      {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+       context_window = 128000}, "测试", false)
+  end)
+  test("repl mode keeps reasoning print", ok_cap and
+    cap_text:find("思考内容XYZ防过度修复", 1, true) ~= nil,
+    cap_text:sub(1, 200))
+  next_llm = nil
+end
+
 -- 任务2 情形 B: 纯空回答 → 注入重试消息一次，第二次正常返回
 do
   next_llm = {
