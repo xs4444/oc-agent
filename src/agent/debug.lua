@@ -194,10 +194,33 @@ local function collect(config, history)
   --     若 free_after 未回升说明 GC 未释放堆（裁剪无效）
   --   - last chat: 最后一次请求耗时与错误——elapsed 接近 retry_budget
   --     （默认 300s）说明端点慢/挂起；error 有值说明编码/请求失败
+  -- v0.3.66 快照恢复（gist 535cfe 现场丢失教训）: 卡死时重启 agent
+  -- 再 /debug，进程内 DIAG 已清空（历史是旧会话加载的，诊断全空）。
+  -- 修复: init.lua 每次 chat/裁剪后写 <WRITABLE_BASE>/agent_diag.json，
+  -- 此处进程内数据缺失时读文件恢复现场，并标注"（重启前快照）"。
   local diag = type(_G._AGENT_DIAG) == "table" and _G._AGENT_DIAG or nil
+  local snapshot = false
+  if not diag or (not diag.last_chat and not diag.last_trim) then
+    local ok_cfg, cfg_mod = pcall(require, "agent.config")
+    if ok_cfg and cfg_mod and cfg_mod.writable_base then
+      local ok_f, f = pcall(io.open, cfg_mod.writable_base .. "/agent_diag.json", "r")
+      if ok_f and f then
+        local content = f:read("*a")
+        f:close()
+        local ok_j, snap = pcall(json.decode, content)
+        if ok_j and type(snap) == "table" and (snap.last_chat or snap.last_trim) then
+          diag = snap
+          snapshot = true
+        end
+      end
+    end
+  end
   if diag then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "--- Diagnostics ---"
+    if snapshot then
+      lines[#lines + 1] = "来源: agent_diag.json 重启前快照（本次进程无诊断数据）"
+    end
     if diag.mem_curve and #diag.mem_curve > 0 then
       local pts = {}
       for _, p in ipairs(diag.mem_curve) do

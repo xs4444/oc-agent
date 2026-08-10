@@ -2130,10 +2130,33 @@ local function collect(config, history)
   --     若 free_after 未回升说明 GC 未释放堆（裁剪无效）
   --   - last chat: 最后一次请求耗时与错误——elapsed 接近 retry_budget
   --     （默认 300s）说明端点慢/挂起；error 有值说明编码/请求失败
+  -- v0.3.66 快照恢复（gist 535cfe 现场丢失教训）: 卡死时重启 agent
+  -- 再 /debug，进程内 DIAG 已清空（历史是旧会话加载的，诊断全空）。
+  -- 修复: init.lua 每次 chat/裁剪后写 <WRITABLE_BASE>/agent_diag.json，
+  -- 此处进程内数据缺失时读文件恢复现场，并标注"（重启前快照）"。
   local diag = type(_G._AGENT_DIAG) == "table" and _G._AGENT_DIAG or nil
+  local snapshot = false
+  if not diag or (not diag.last_chat and not diag.last_trim) then
+    local ok_cfg, cfg_mod = pcall(require, "agent.config")
+    if ok_cfg and cfg_mod and cfg_mod.writable_base then
+      local ok_f, f = pcall(io.open, cfg_mod.writable_base .. "/agent_diag.json", "r")
+      if ok_f and f then
+        local content = f:read("*a")
+        f:close()
+        local ok_j, snap = pcall(json.decode, content)
+        if ok_j and type(snap) == "table" and (snap.last_chat or snap.last_trim) then
+          diag = snap
+          snapshot = true
+        end
+      end
+    end
+  end
   if diag then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "--- Diagnostics ---"
+    if snapshot then
+      lines[#lines + 1] = "来源: agent_diag.json 重启前快照（本次进程无诊断数据）"
+    end
     if diag.mem_curve and #diag.mem_curve > 0 then
       local pts = {}
       for _, p in ipairs(diag.mem_curve) do
@@ -5091,6 +5114,21 @@ end
 local DIAG = { mem_curve = {}, last_trim = nil, last_chat = nil }
 rawset(_G, "_AGENT_DIAG", DIAG)
 
+-- DIAG 快照持久化（2026-08-10 debug 优化: gist 535cfe 现场丢失教训——
+-- 用户卡死时重启 agent 再 /debug，Diagnostics 全空（进程内 DIAG 清空，
+-- 历史是旧会话加载的）。修复: 每次 chat/裁剪更新后写盘
+-- <WRITABLE_BASE>/agent_diag.json；重启后 debug.lua 读文件恢复现场，
+-- 标注"重启前快照"。写盘频率=每轮 chat 一次（~1KB，可接受——
+-- 与 history append 同量级）；_TEST_MODE 跳过防测试污染。）
+local DIAG_FILE = WRITABLE_BASE .. "/agent_diag.json"
+local function persist_diag()
+  if _TEST_MODE then return end
+  local f = io.open(DIAG_FILE, "w")
+  if not f then return end
+  f:write(json.encode(DIAG))
+  f:close()
+end
+
 local function now_uptime()
   local ok_c, computer = pcall(require, "computer")
   if ok_c and computer and computer.uptime then
@@ -5157,6 +5195,7 @@ local function enforce_memory(messages, config, persist, session)
     removed = removed,
     free_after = f_after,
   }
+  persist_diag()
   print("[mem] 裁剪 " .. removed .. " 条（free " .. fmt_num(f_now)
     .. " → " .. fmt_num(f_after) .. "）")
 end
@@ -5275,6 +5314,7 @@ local function process_exchange(messages, config, user_input, persist, session)
       elapsed = now_uptime() - t_start,
       error = response and response.error,
     }
+    persist_diag()
 
     if response.error then
       if not retried_400 and tostring(response.error):find("400") then
