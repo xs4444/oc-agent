@@ -913,6 +913,21 @@ end
 local DIAG = { mem_curve = {}, last_trim = nil, last_chat = nil }
 rawset(_G, "_AGENT_DIAG", DIAG)
 
+-- DIAG 快照持久化（2026-08-10 debug 优化: gist 535cfe 现场丢失教训——
+-- 用户卡死时重启 agent 再 /debug，Diagnostics 全空（进程内 DIAG 清空，
+-- 历史是旧会话加载的）。修复: 每次 chat/裁剪更新后写盘
+-- <WRITABLE_BASE>/agent_diag.json；重启后 debug.lua 读文件恢复现场，
+-- 标注"重启前快照"。写盘频率=每轮 chat 一次（~1KB，可接受——
+-- 与 history append 同量级）；_TEST_MODE 跳过防测试污染。）
+local DIAG_FILE = WRITABLE_BASE .. "/agent_diag.json"
+local function persist_diag()
+  if _TEST_MODE then return end
+  local f = io.open(DIAG_FILE, "w")
+  if not f then return end
+  f:write(json.encode(DIAG))
+  f:close()
+end
+
 local function now_uptime()
   local ok_c, computer = pcall(require, "computer")
   if ok_c and computer and computer.uptime then
@@ -979,6 +994,7 @@ local function enforce_memory(messages, config, persist, session)
     removed = removed,
     free_after = f_after,
   }
+  persist_diag()
   print("[mem] 裁剪 " .. removed .. " 条（free " .. fmt_num(f_now)
     .. " → " .. fmt_num(f_after) .. "）")
 end
@@ -1097,6 +1113,7 @@ local function process_exchange(messages, config, user_input, persist, session)
       elapsed = now_uptime() - t_start,
       error = response and response.error,
     }
+    persist_diag()
 
     if response.error then
       if not retried_400 and tostring(response.error):find("400") then

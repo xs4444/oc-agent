@@ -490,23 +490,32 @@ if manifest then
       uf:write("chunk(...)\n")
       uf:close()
       -- 下载 update.lua 本体到 AGENT_DIR 父目录（与 agent/ 同盘，供
-      -- 启动器引用；用与 install 自身相同的双源 fallback）
+      -- 启动器引用；复用 install 自身的 fetch() 双源 fallback——
+      -- 2026-08-10 用户实测: 裸 internet 全局是 nil（install 的
+      -- fetch 内部才 require），且 pcall 解包逻辑错误，498 行崩）
       if not fs.exists(up_script) then
         local f_up = io.open(up_script, "w")
         if f_up then
+          local got = false
           for _, base in ipairs(SOURCES) do
-            local handle = pcall(internet.request, base .. "/update.lua")
-            local ok_h, h = handle
-            if ok_h and h then
-              local ok_w = true
-              for chunk_data in h do
-                if not f_up:write(chunk_data) then ok_w = false break end
-              end
-              h:close()
-              if ok_w then break end
+            local body, err = fetch(base .. "/update.lua")
+            if body then
+              f_up:write(body)
+              got = true
+              break
+            else
+              print("[update] 下载失败（" .. tostring(err) .. "），尝试备用源")
             end
           end
           f_up:close()
+          if not got then
+            os.remove(up_script)
+            print("[update] update.lua 下载失败——请网络可用后重跑 install，或手动 wget")
+          else
+            print("[update] update.lua 已安装: " .. up_script)
+          end
+        else
+          print("[update] 无法写入 " .. up_script)
         end
       end
     end
