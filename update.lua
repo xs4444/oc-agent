@@ -1,10 +1,14 @@
 -- update.lua — 一键更新 agent
--- 用法: lua update.lua
+-- 用法: lua update.lua [ref]
+--   ref 可选: 指定版本（如 v0.3.69）——**推荐**（jsDelivr data API 索引
+--   滞后 + GitHub 不可达时自动检测拿不到最新，手动指定最可靠）
 -- 行为:
---   1. 查询 jsDelivr data API 获取最新发布 tag（不可变 URL，避免 @master 缓存过期）
---   2. 显示当前版本 vs 最新版本
---   3. 用 @<tag> 下载最新 install.lua
---   4. 以 <tag> 为 REF、**实际安装目录**为 DEST_DIR 执行 install.lua
+--   1. 有 ref 参数 → 直接用（跳过网络检测）
+--   2. 无参数 → 查询 jsDelivr data API 获取最新 tag（GitHub tags API
+--      作为回退，但 GitHub 不可达时该路失败）
+--   3. 显示当前版本 vs 目标版本
+--   4. 用 @<tag> 下载最新 install.lua（不可变 URL，避免 @master 缓存过期）
+--   5. 以 <tag> 为 REF、**实际安装目录**为 DEST_DIR 执行 install.lua
 --      （其内部所有下载都用 @<tag> 不可变 URL）
 -- 四盘场景（v0.3.63）: 不再假设 /home/agent——扫描各挂载盘的
 -- agent/version.txt 定位实际安装目录（agent 盘可能在任何挂载上）。
@@ -94,46 +98,34 @@ local function current_version()
   return install_info and install_info.version or "(未知)"
 end
 
--- 确定目标 ref: jsDelivr data API 优先（2026-08-10 修复: 原实现先请求
--- api.github.com，用户网络 GitHub 不可达时 fetch 无超时保护 → 卡死
--- 无输出；且"检查最新版本"打印在请求之后，卡住时用户什么都看不到。
--- 现顺序: 先打印进度 → jsDelivr 优先（国内可达）→ 仅当 jsDelivr
--- 失败时回退 GitHub tags API。jsDelivr data API 索引滞后是已知问题，
--- 但下载 install.lua/清单本体仍是 jsDelivr CDN（BASE），滞后窗口内
--- 可能更新到次新 tag——可接受（再跑一次即追平）。
-local function pick_newer(a, b)
-  if not a then return b end
-  if not b then return a end
-  -- 版本号比较: 数字段逐段比（v0.3.29 > v0.3.28）
-  local function parts(v)
-    local t = {}
-    for x in tostring(v):gmatch("%d+") do t[#t + 1] = tonumber(x) end
-    return t
-  end
-  local pa, pb = parts(a), parts(b)
-  for i = 1, math.max(#pa, #pb) do
-    local x, y = pa[i] or 0, pb[i] or 0
-    if x ~= y then return x > y and a or b end
-  end
-  return a
-end
-
+-- 确定目标 ref: 手动参数优先（2026-08-10: data API 索引滞后到 0.3.66、
+-- GitHub 不可达时自动检测拿不到 v0.3.69——用户实测 update 装不到最新；
+-- `update v0.3.69` 直接锁定目标，最可靠）。无参数时 jsDelivr data API
+-- 优先（国内可达），仅当 jsDelivr 失败时回退 GitHub tags API。
 print("检查最新版本...")
-local tag_js = latest_tag()
-print("  jsDelivr 源: " .. tostring(tag_js or "?"))
-local tag = tag_js
-if not tag_js then
-  print("  (jsDelivr 无结果，尝试 GitHub 源...)")
-  local tag_gh = github_tag()
-  print("  GitHub 源: " .. tostring(tag_gh or "?"))
-  tag = tag_gh
+local ref_arg = select(1, ...)
+local ref
+if ref_arg and ref_arg ~= "" then
+  ref = ref_arg
+  print("  手动指定: " .. ref)
+else
+  local tag_js = latest_tag()
+  print("  jsDelivr 源: " .. tostring(tag_js or "?"))
+  local tag = tag_js
+  if not tag_js then
+    print("  (jsDelivr 无结果，尝试 GitHub 源...)")
+    local tag_gh = github_tag()
+    print("  GitHub 源: " .. tostring(tag_gh or "?"))
+    tag = tag_gh
+  end
+  if not tag then
+    print("  ⚠️  无法自动获取最新版本（网络受限）。")
+    print("  用法: lua update.lua <ref>   例如: lua update.lua v0.3.69")
+    return
+  end
+  ref = tag
 end
-local ref = tag or "master"
-
-print("检查最新版本...")
-print("  GitHub 源:  " .. tostring(tag_gh or "?"))
-print("  jsDelivr 源: " .. tostring(tag_js or "?"))
-print("  ref: " .. (tag and ("@" .. tag .. " (tag)") or "@master (回退)"))
+print("  ref: " .. ref)
 
 local latest
 do
