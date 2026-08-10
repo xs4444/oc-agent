@@ -702,7 +702,8 @@ local function handle_command(cmd, config, messages)
       end
       local token = config.gist_token
       if token and token ~= "" then
-        print("Uploading to GitHub gist...")
+        print("Uploading to GitHub gist (timeout 30s)...")
+        print("  (报告已保存本地: " .. out_path .. "——上传失败/超时不影响内容)")
         local url, err = debug_mod.upload(report, token)
         if url then
           print("Gist uploaded: " .. url)
