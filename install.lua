@@ -405,36 +405,64 @@ if manifest then
   -- 1) swap 盘选择: 折叠归档/history/sessions 数据盘。写入 agent_config.txt
   --    的 data_dir 字段——agent 启动时 probe_data_dir 探测到该字段即把
   --    数据路径切到 swap 盘（等价于部署后手动 /relocate，安装期一步完成）。
+  --    v0.3.74: 已有 data_dir 引导（上次安装/迁移设置过）→ 自动沿用，
+  --    不再询问（用户反馈: 每次更新都被问）。
   do
-    local swap = choose_disk("选择 swap 盘（agent 数据盘: 历史/折叠归档/会话；回车跳过）",
-      mounts, DEST_DIR)
-    if swap then
-      local ser = require("serialization")
-      local cfg_path = DEST_DIR .. "/agent_config.txt"
-      local cfg = {}
-      local cf = io.open(cfg_path, "r")
-      if cf then
-        local ok_c, parsed = pcall(ser.unserialize, cf:read("*a"))
-        cf:close()
-        if ok_c and type(parsed) == "table" then cfg = parsed end
+    local ser = require("serialization")
+    local cfg_path = DEST_DIR .. "/agent_config.txt"
+    local cfg = {}
+    local cf = io.open(cfg_path, "r")
+    if cf then
+      local ok_c, parsed = pcall(ser.unserialize, cf:read("*a"))
+      cf:close()
+      if ok_c and type(parsed) == "table" then cfg = parsed end
+    end
+    -- v0.3.74 补充: 安装盘 config 无 data_dir 时，查各可写盘上的
+    -- agent_config.txt（swap 盘迁移后 config 随 data_dir 切走，安装盘
+    -- 可能只留引导——两处都有才算真正配置过）
+    local existing = cfg.data_dir
+    if not existing or existing == "" then
+      for _, m in ipairs(mounts) do
+        if m.path ~= DEST_DIR then
+          local f2 = io.open(m.path .. "/agent_config.txt", "r")
+          if f2 then
+            local ok2, parsed2 = pcall(ser.unserialize, f2:read("*a"))
+            f2:close()
+            if ok2 and type(parsed2) == "table" and parsed2.data_dir
+                and parsed2.data_dir ~= "" then
+              existing = parsed2.data_dir
+              cfg_path = m.path .. "/agent_config.txt"
+              cfg = parsed2
+              break
+            end
+          end
+        end
       end
-      cfg.data_dir = swap
-      -- 无 config 时补默认模型配置（首次运行直接可用）
-      if not cfg.api_key then cfg.api_key = "" end
-      if not cfg.model then cfg.model = "deepseek-v4-flash-free" end
-      if not cfg.api_url then
-        cfg.api_url = "https://opencode.ai/zen/v1/chat/completions"
-      end
-      local f = io.open(cfg_path, "w")
-      if f then
-        f:write(ser.serialize(cfg))
-        f:close()
-        print("swap 盘已配置: " .. swap .. "（data_dir 引导写入 " .. cfg_path .. "）")
-      else
-        print("无法写入配置文件: " .. cfg_path)
-      end
+    end
+    if existing and existing ~= "" then
+      print("swap 盘沿用已有配置: " .. existing .. "（config.data_dir，如需变更用 /relocate）")
     else
-      print("未选择 swap 盘（数据将落在安装盘）。部署后可用 /relocate 迁移。")
+      local swap = choose_disk("选择 swap 盘（agent 数据盘: 历史/折叠归档/会话；回车跳过）",
+        mounts, DEST_DIR)
+      if swap then
+        cfg.data_dir = swap
+        -- 无 config 时补默认模型配置（首次运行直接可用）
+        if not cfg.api_key then cfg.api_key = "" end
+        if not cfg.model then cfg.model = "deepseek-v4-flash-free" end
+        if not cfg.api_url then
+          cfg.api_url = "https://opencode.ai/zen/v1/chat/completions"
+        end
+        local f = io.open(cfg_path, "w")
+        if f then
+          f:write(ser.serialize(cfg))
+          f:close()
+          print("swap 盘已配置: " .. swap .. "（data_dir 引导写入 " .. cfg_path .. "）")
+        else
+          print("无法写入配置文件: " .. cfg_path)
+        end
+      else
+        print("未选择 swap 盘（数据将落在安装盘）。部署后可用 /relocate 迁移。")
+      end
     end
   end
 
