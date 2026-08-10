@@ -38,6 +38,12 @@ end
 -- 且该目录可写（/relocate 迁移后写入的引导项），则所有数据路径
 -- （config/history/sessions）切换到目标盘。目标盘不可写（盘被拔/只读）
 -- 时回退原盘——自动容错。
+-- 验证（2026-08-10 ocvm）: ①m01467 首次启动 + config 含 data_dir →
+--   /relocate 显示"当前数据目录: /tmp"切换生效；②独立探针复刻
+--   find_writable_base+probe_data_dir 全部步骤通过（base 探测 → config
+--   读取 → unserialize → 目标可写）。此前"重启后未切换"均为测试驱动
+--   假象（tmux capture-pane 含屏幕历史，"Goodbye!/home #"是旧残留，
+--   lua agent.lua 被旧 TUI 当聊天消息——进程从未真正重启）。
 local function probe_data_dir(base)
   local fs = require("filesystem")
   local f = io.open(base .. "/agent_config.txt", "r")
