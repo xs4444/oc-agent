@@ -28,13 +28,17 @@ local history_path = config_mod.history_path
 --   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
 -- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
 -- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
--- 内存自适应缩放（2026-08-10 真机 4MB 升级）: 硬常量按
--- config_mod.mem_scale（= totalMemory/2MB）缩放。2MB 机器 scale=1
--- 行为不变；4MB 机器 scale=2: 更多历史进内存表（更多上下文给模型）。
--- 显式 config（mem_load_budget 等）仍优先——此处仅模块级硬常量。
+-- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 200K 上下文目标）:
+-- 硬常量按 config_mod.mem_scale（= totalMemory/2MB）的**平方**缩放——
+-- 内存翻倍 → 可承载请求体 4 倍（4MB 机器 MAX_HISTORY=480 条/1.2MB
+-- 历史表，配合用户 context_window=200000 达成 200K 上下文；2MB 机器
+-- scale=1 时 120 条/300KB——比旧 60 条/200KB 大，字节预算与编码峰值
+-- 实测安全）。显式 config（mem_load_budget 等）仍优先——此处仅模块级
+-- 硬常量。
 local MEM_SCALE = config_mod.mem_scale or 1
-local MAX_HISTORY = math.floor(60 * MEM_SCALE)
-local MAX_HISTORY_BYTES = math.floor(200000 * MEM_SCALE)  -- ~200KB×scale budget; large tool results trimmed away
+local MEM_SCALE2 = MEM_SCALE * MEM_SCALE
+local MAX_HISTORY = math.floor(120 * MEM_SCALE2)
+local MAX_HISTORY_BYTES = math.floor(300000 * MEM_SCALE2)  -- ~300KB×scale²; 4MB=1.2MB 历史表（200K 上下文装载）
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 -- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
 -- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。
@@ -477,7 +481,7 @@ local function load_history()
   -- 条数上限（内存表有界）: 超过 MAX_LOAD_HISTORY 条丢更早的——真机
   -- 93.6KB JSONL 全量解析后表 ~300KB（OOM 根因之一）。文件本身
   -- append-only 完整保留（可追溯），只限内存表。
-  local MAX_LOAD_HISTORY = math.floor(120 * MEM_SCALE)
+  local MAX_LOAD_HISTORY = math.floor(120 * MEM_SCALE2)
   local function ingest(line)
     local ok2, msg = pcall(json.decode, line)
     if ok2 and type(msg) == "table" and msg.role then
@@ -513,7 +517,8 @@ local function load_history()
     history_size = hf:seek("end") or 0
     hf:close()
   end
-  local max_file = tonumber(ok_cfg and cfg and cfg.mem_history_max_bytes) or 256000
+  local max_file = tonumber(ok_cfg and cfg and cfg.mem_history_max_bytes)
+    or math.floor(256000 * MEM_SCALE2)
   if history_size > max_file then
     print("[disk] history 文件 " .. history_size .. "B 超过上限 " .. max_file
       .. "B，自动截断到当前内存表（" .. #messages .. " 条）...")

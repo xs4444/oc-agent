@@ -838,9 +838,12 @@ local function ensure_context_budget(messages, config, persist, session)
   -- token 估算通过不代表 encode 不 OOM：json.encode 峰值 ≈ 2-3x 文本字节
   -- （结果 + parts 数组 + 输入）。真机实证：ctx 43%（55K tokens≈190KB 文本）
   -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
-  -- 独立字节预算（config.byte_budget 可调，默认 150KB×scale——4MB 机器
-  -- 300KB），作为自动折叠（mem_prefold_bytes）之后的最终兜底：超限直接
-  -- 裁剪早期消息（保留 head 锚点 + 最近 5 条）。
+  -- 独立字节预算（config.byte_budget 可调，默认 200KB×scale²——4MB 机器
+  -- 800KB：可承载 200K tokens 中文文本（≈700KB），用户配
+  -- context_window=200000 即达成 200K 上下文目标；2MB 机器 scale=1 时
+  -- 200KB，真机 encode 峰值实测 137-230KB 安全），作为自动折叠
+  -- （mem_prefold_bytes）之后的最终兜底：超限直接裁剪早期消息
+  -- （保留 head 锚点 + 最近 5 条）。
   local byte_est = 0
   for _, m in ipairs(messages) do
     if not m.folded then
@@ -849,7 +852,8 @@ local function ensure_context_budget(messages, config, persist, session)
     end
   end
   local MEM_SCALE_I = (require("agent.config")).mem_scale or 1
-  local BYTE_BUDGET = tonumber(config.byte_budget) or math.floor(150000 * MEM_SCALE_I)
+  local BYTE_BUDGET = tonumber(config.byte_budget)
+    or math.floor(200000 * MEM_SCALE_I * MEM_SCALE_I)
   if byte_est > BYTE_BUDGET then
     print("上下文 " .. fmt_num(byte_est) .. " 字节超内存预算 " .. fmt_num(BYTE_BUDGET) .. "，裁剪早期消息...")
     local guard = 0

@@ -100,6 +100,11 @@ local function load()
   local ok, data = pcall(ser.unserialize, content)
   if ok and type(data) == "table" then
     -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
+    -- 模型上下文窗口（token）: /ctx 显示、60% 压缩引导、80% 硬保护、
+    -- 请求估算的基准。**窗口是模型属性，与硬件无关，不随内存自动缩放**
+    -- ——在 4MB 机器跑 200K 上下文需显式配置 context_window=200000
+    --（字节类阈值已按内存 scale² 放大：4MB 下 byte_budget/prefold/
+    -- load_budget=800KB，足以承载 200K tokens ≈700KB 中文历史）。
     if not data.context_window then data.context_window = 128000 end
     -- 运行时自动显示上下文（每次响应后一行 [ctx]），可设 false 关闭
     if data.ctx_auto == nil then data.ctx_auto = true end
@@ -117,18 +122,22 @@ local function load()
       data.mem_trim_bytes = math.floor(60000 * MEM_SCALE)
     end
     -- 历史加载内存上限（字节）: load_history 解析后表裁剪到该值以下
-    -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 100KB×scale 内存表，
+    -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 200KB×scale²——4MB
+    -- 机器 800KB：足以装载 200K tokens 中文历史（≈700KB）进内存表；
     -- JSONL 文件 append-only 完整保留，只限内存表）
     if not data.mem_load_budget then
-      data.mem_load_budget = math.floor(100000 * MEM_SCALE)
+      data.mem_load_budget = math.floor(200000 * MEM_SCALE * MEM_SCALE)
     end
     -- 传统自动压缩字节阈值（mem_prefold_bytes）: 表字节超此值即系统自动
     -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
-    -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 100KB×scale，
-    -- 先于 mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表
-    -- 字节真实下降（默认 < byte_budget 150KB×scale → 自动折叠先于裁剪）。
+    -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 200KB×scale²
+    --（2026-08-10: 内存翻倍 → 可承载请求体 4 倍——4MB 机器 800KB 才
+    -- 折叠，配合用户配置 context_window=200000 可跑 200K 上下文；
+    -- 2MB 机器 scale=1 时 200KB 略高于旧 100KB——2MB 下编码峰值
+    -- 137-230KB 实测仍安全，且 byte_budget 兜底裁剪），先于 mem_pressure
+    -- 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节真实下降。
     if not data.mem_prefold_bytes then
-      data.mem_prefold_bytes = math.floor(100000 * MEM_SCALE)
+      data.mem_prefold_bytes = math.floor(200000 * MEM_SCALE * MEM_SCALE)
     end
     -- 摘要请求专用输出预算（summary_max_tokens）: deepseek 强思考模型下
     -- opencode 的 4096 不够——reasoning 先吃大部分输出预算，可见摘要

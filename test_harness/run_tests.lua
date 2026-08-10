@@ -1042,14 +1042,14 @@ end
 local trimmed = trim_history(anchor_msgs)
 test("trim_history keeps first message", trimmed[1].content == "msg 1",
   "first=" .. tostring(trimmed[1] and trimmed[1].content))
-test("trim_history caps count", #trimmed <= 60, "#=" .. tostring(#trimmed))
+test("trim_history caps count", #trimmed <= 120, "#=" .. tostring(#trimmed))
 local anchor2 = {}
 for i = 1, 6 do
   anchor2[#anchor2 + 1] = {role = "user", content = string.rep("x", 40000) .. " m" .. i}
 end
 local trimmed2 = trim_history(anchor2)
 test("trim_history byte cap keeps head + recent",
-  trimmed2[1].content:find("m1") ~= nil and #trimmed2 == 4,
+  trimmed2[1].content:find("m1") ~= nil and #trimmed2 == 6,
   "#=" .. tostring(#trimmed2))
 
 -- /ctx + 运行时行: cache hit/miss 显示（usage 字段透传）
@@ -1441,10 +1441,10 @@ test("chat skips folded messages in request",
 local trim_proj = {
   {role = "user", content = "head anchor"},
   {role = "system", content = "[对话摘要] s"},
-  {role = "user", content = string.rep("x", 55000), folded = true},
-  {role = "user", content = string.rep("y", 55000), folded = true},
-  {role = "user", content = string.rep("z", 55000), folded = true},
-  {role = "user", content = string.rep("w", 55000), folded = true},
+  {role = "user", content = string.rep("x", 90000), folded = true},
+  {role = "user", content = string.rep("y", 90000), folded = true},
+  {role = "user", content = string.rep("z", 90000), folded = true},
+  {role = "user", content = string.rep("w", 90000), folded = true},
   {role = "user", content = "recent 1"},
   {role = "user", content = "recent 2"},
 }
@@ -1452,7 +1452,7 @@ local trim_proj_out = agent_test.trim_history(trim_proj)
 test("trim reclaims folded segments first",
   trim_proj_out[1].content == "head anchor"
   and trim_proj_out[#trim_proj_out].content == "recent 2"
-  and #trim_proj_out == 7,  -- 220K 超预算 → 删 1 条折叠（55000）→ 165K 内
+  and #trim_proj_out == 7,  -- 360K 超 300K 预算 → 删 1 条折叠（90000）→ 270K 内
   "#=" .. tostring(#trim_proj_out))
 
 print("")
@@ -1758,8 +1758,8 @@ do
   os.remove(lh_path)
   local lh_bytes = 0
   for _, m in ipairs(lh) do lh_bytes = lh_bytes + #(m.content or "") end
-  test("load history bounded (≤120, bytes ≤100KB)",
-    #lh <= 120 and #lh < 100 and lh_bytes <= 100000,
+  test("load history bounded (≤120, bytes ≤200KB)",
+    #lh <= 120 and lh_bytes <= 200000,
     "#=" .. tostring(#lh) .. " bytes=" .. tostring(lh_bytes))
   test("load history keeps recent",
     lh[#lh] and lh[#lh].content == string.rep("L", 2000) .. "150",
