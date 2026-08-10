@@ -1,6 +1,6 @@
 {
   "files": {
-    "chat.lua": 15285,
+    "chat.lua": 16332,
     "config.lua": 8695,
     "debug.lua": 11254,
     "execute.lua": 2769,
@@ -21,5 +21,5 @@
     "tui.lua": 29577,
     "docs.lua": 14689
   },
-  "version": "2026-08-10T1228"
+  "version": "2026-08-10T1358"
 }

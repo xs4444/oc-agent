@@ -1638,12 +1638,32 @@ local function chat(messages, config, opts)
 
   -- encode 包 pcall：OC 内存 1.4MB 下大上下文 encode 可能 OOM——
   -- 真机实证 json.lua:70 "not enough memory" 直接崩进程（回到 shell）。
-  -- 内存不足错误现在由 mem_pressure 提前折叠预防（process_exchange 开头
-  -- 按 freeMemory 低谷强制压缩，folded 段不进请求体），此处为最后防线。
   -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
-  -- skip_tools: 省略字段（json encode 跳过 nil 键）——摘要请求体不含
-  -- tools 声明（opencode 裸摘要请求同款 tools:[] 语义）。注意不能用
-  -- `opts.skip_tools and nil or list()` 三元——nil 分支被 `or` 吞掉。
+  -- 第 8 次 OOM（gist 852193，v0.3.55 现场，encode 再次爆）加固:
+  --   1. 无条件 collectgarbage——enforce_memory 只在 free < 400KB 时
+  --      才 GC，free 450KB 而 encode 峰值（table.concat ≈2-3x 请求体）
+  --      瞬间击穿 2MB 时不触发。encode 前 GC 让 Lua 堆回最低点，
+  --      成本毫秒级（2MB 堆增量 GC），无副作用。
+  --   2. 体积估算 vs 剩余内存——超标返回明确错误（引导压缩），
+  --      而非等到 pcall 捕获 OOM（后者报错信息与现场脱节）。
+  -- 注: 摘要请求（opts.skip_tools）同样受益，无需特判。
+  pcall(collectgarbage, "collect")
+  do
+    local ok_c2, computer2 = pcall(require, "computer")
+    if ok_c2 and type(computer2) == "table" and computer2.freeMemory then
+      local ok_f2, free2 = pcall(computer2.freeMemory)
+      local est = 2048  -- 基础（model/tools 声明/尾部 runtime 等）
+      for _, m in ipairs(api_messages) do
+        if type(m.content) == "string" then est = est + #m.content end
+        if type(m.tool_calls) == "table" then est = est + 256 * #m.tool_calls end
+      end
+      if ok_f2 and type(free2) == "number" and est * 3 > free2 * 0.85 then
+        return { error = "请求编码失败 (内存不足): 请求体估算 " .. est
+          .. "B（encode 峰值 ≈3x）超出可用 " .. free2
+          .. "B。请先压缩历史（compact_history 工具或 /compact）释放内存后重试" }
+      end
+    end
+  end
   local req_tools = nil
   if not opts.skip_tools then req_tools = tools_mod.list() end
   local ok_enc, body = pcall(json.encode, {
