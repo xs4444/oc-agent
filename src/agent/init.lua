@@ -1111,6 +1111,8 @@ local function process_exchange(messages, config, user_input, persist, session)
   local tool_steps = 0
   local tool_cap_reached = false
   local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
+  local stall_count = 0        -- 停滞检测: 连续无产出轮数（reasonix todoStallPause 借鉴）
+  local stall_nudged = false   -- nudge 已注入（限一次，防刷屏）
   -- 重复调用检测（doom-loop 护栏，opencode 借鉴）: 记录最近工具调用签名
   -- （name + arguments 摘要，最多 8 条）；最近 4 条内同签名 ≥3 次 → 循环。
   -- 与 cap_trigger 是两套独立机制；重复检测优先于工具执行。
@@ -1460,6 +1462,31 @@ local function process_exchange(messages, config, user_input, persist, session)
           end
         end
       end
+    end
+
+    -- ── todo 停滞检测 + nudge（reasonix todoStallPause 借鉴）──
+    -- 模型连续多轮只产出工具调用、无任何可见回答（final_text 空）时，
+    -- 注入一次引导消息让其收尾/换策略——而不是默默烧完 MAX_TOOL_STEPS
+    -- 轮后由 cap_trigger 硬提示（更早介入，省 token 省时间）。
+    -- nudge 限一次（stall_nudged），防模型无视后无限刷提示；
+    -- 有可见内容产出即重置计数。
+    if #final_text == 0 then
+      stall_count = stall_count + 1
+      local nudge_rounds = tonumber(config.stall_nudge_rounds) or 5
+      if stall_count >= nudge_rounds and not stall_nudged then
+        stall_nudged = true
+        print("[stall] 连续 " .. stall_count .. " 轮无可见回答，注入 nudge")
+        local nudge_msg = {role = "user",
+          content = "你已连续 " .. stall_count
+            .. " 轮只调用工具但没有产出可见回答。请基于已有信息总结进展并给出最终回答；如果确实还需要信息，请明确说明下一步要做什么、需要什么。"}
+        messages[#messages + 1] = nudge_msg
+        if persist then
+          if session then append_session_history(session, nudge_msg)
+          else append_history(nudge_msg) end
+        end
+      end
+    else
+      stall_count = 0
     end
   end
 
