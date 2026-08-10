@@ -1,6 +1,6 @@
 # 三方对比：agent.lua vs oc-ai vs pi
 
-本项目（agent.lua）与两个同领域开源项目的横向对比。oc-ai 与 pi 均为 git 克隆的参考源码（`oc-ai/`、`pi/`），不入版本控制。
+本项目（agent.lua）与两个同领域开源项目的横向对比。oc-ai 与 pi 均为 git 克隆的参考源码（`repos/oc-ai/`、`repos/pi/`，2026-08-10 起统一位于 repos/ 下），不入版本控制。
 
 ## 概览
 
