@@ -370,6 +370,10 @@ end
 
 -- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示;
 -- scrollSafe 时上移一行, 最底行 h 永不写入——杜绝终端滚动型模拟器触发整屏上滚）
+-- v0.3.72 拖选高亮: state.sel = {a=字符索引, b=字符索引}（输入缓冲内），
+-- a==b 时无选中。选中段用反色背景绘制（先画文本→再画选中段覆盖）。
+-- GTNH 组件无 setClipboard API——复制目标为 state.clipboard（进程内
+-- 剪贴板，Ctrl+V 粘贴优先使用），跨游戏剪贴板不可行。
 function tui.drawInput()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
@@ -394,6 +398,30 @@ function tui.drawInput()
     displayText = usub(displayText, start, start + maxWidth - 1)
   end
   g.set(inputStart, y, displayText)
+  -- 选中段高亮（先画文本后覆盖：反色背景 + 反色前景；光标在下）
+  local sel = state.sel
+  if sel and sel.a ~= sel.b then
+    local sa, sb = math.min(sel.a, sel.b), math.max(sel.a, sel.b)
+    -- 相对最后一行（仅选中当前显示行内的部分）
+    local lo, hi = math.max(sa - line_start, 1), math.min(sb - line_start, ulen(displayText))
+    if lo <= hi then
+      local x0 = inputStart + ulen(usub(displayText, 1, lo - 1))
+      local x1 = inputStart + ulen(usub(displayText, 1, hi))
+      if x1 > state.width - 1 then x1 = state.width - 1 end
+      local w = x1 - x0
+      if w > 0 then
+        g.setBackground(tui.colors.foreground)
+        g.setForeground(tui.colors.background)
+        g.set(x0, y, usub(displayText, lo, hi))
+        -- 填充剩余宽度（选中到行尾）
+        if x0 + w < state.width - 1 then
+          g.fill(x0 + w, y, state.width - 1 - x0 - w, 1, " ")
+        end
+        g.setBackground(tui.colors.background)
+        g.setForeground(tui.colors.foreground)
+      end
+    end
+  end
   -- 反色块光标
   if cursorX <= state.width - 1 then
     local ch = usub(displayText, cursorInLine + 1, cursorInLine + 1)
@@ -496,7 +524,21 @@ function tui.readInput()
     end
 
     if ev == "interrupted" then
-      return nil
+      -- Ctrl+C 双语义（v0.3.72）: 游戏端 Ctrl+C 发 interrupted 事件。
+      -- 输入行有选中文本 → 复制到进程内剪贴板 + 清除选中 + 继续输入
+      -- （不中断——用户意图是复制，不是中断）；
+      -- 无选中 → 原有中断行为（return nil 退出输入循环）。
+      if state.sel and state.sel.a ~= state.sel.b then
+        local sa, sb = math.min(state.sel.a, state.sel.b),
+          math.max(state.sel.a, state.sel.b)
+        state.clipboard = usub(state.inputBuffer, sa + 1, sb)
+        tui.setStatus("Copied " .. ulen(state.clipboard) .. " chars (Ctrl+V to paste)")
+        state.sel = nil
+        state.sel_active = nil
+        pcall(tui.drawInput)
+      else
+        return nil
+      end
     elseif ev == "key_down" then
       local ch = char or 0
       local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
@@ -623,11 +665,27 @@ function tui.readInput()
           tui.setStatus("Tab: no match")
         end
       elseif ch >= 32 and ch < 127 then -- 可打印 ASCII
-        state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
-          .. string.char(ch)
-          .. usub(state.inputBuffer, state.inputCursor + 1)
-        state.inputCursor = state.inputCursor + 1
-        state.completionCycle = nil
+        -- Ctrl+C 复制选中（v0.3.72）: Ctrl+C 时 ch==3（ETX）。
+        -- 有选中 → 复制到进程内剪贴板 + 清除选中；无选中 → 落到
+        -- 下方原 Ctrl+C 中断处理（读事件循环 break）。
+        if ch == 3 and state.sel and state.sel.a ~= state.sel.b then
+          local sa, sb = math.min(state.sel.a, state.sel.b),
+            math.max(state.sel.a, state.sel.b)
+          state.clipboard = usub(state.inputBuffer, sa + 1, sb)
+          tui.setStatus("Copied " .. ulen(state.clipboard) .. " chars (Ctrl+V to paste)")
+          state.sel = nil
+          state.sel_active = nil
+          pcall(tui.drawInput)
+        else
+          -- 有输入时清除选中（高亮区间基于旧文本，输入后错位）
+          state.sel = nil
+          state.sel_active = nil
+          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+            .. string.char(ch)
+            .. usub(state.inputBuffer, state.inputCursor + 1)
+          state.inputCursor = state.inputCursor + 1
+          state.completionCycle = nil
+        end
       else
         -- 诊断（v0.3.29 临时）: 未匹配任何分支的 key_down——用于定位荒野大师
         -- 真机 Tab 无反应：若 Tab 事件到达但 char/code 值不同，会落入此分支
@@ -637,20 +695,28 @@ function tui.readInput()
       pcall(tui.drawInput)
     elseif ev == "clipboard" then
       if char then
+        -- v0.3.72: 优先粘贴进程内剪贴板（Ctrl+C 复制的选中文本）——
+        -- 有内部剪贴板时用它（避免游戏剪贴板覆盖刚复制的文本）；
+        -- 否则用游戏剪贴板内容（原有 Ctrl+V 行为）。
+        local paste = state.clipboard and #state.clipboard > 0
+          and state.clipboard or char
         state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
-          .. char
+          .. paste
           .. usub(state.inputBuffer, state.inputCursor + 1)
-        state.inputCursor = state.inputCursor + ulen(char)
+        state.inputCursor = state.inputCursor + ulen(paste)
         state.completionCycle = nil
+        state.sel = nil
+        state.sel_active = nil
         pcall(tui.drawInput)
       end
     elseif ev == "touch" or ev == "drag" then
-      -- 指针定位（v0.3.68 新增，OpenOS 终端同款——真机 4 盘场景用户
-      -- 需求"捕获指针操作复制粘贴"）: screen 组件发 touch/drag
-      -- (x, y, button, player)。点击输入行 → 把输入光标定位到点击列
-      -- （按显示宽度换算：中文占 2 列）；点击消息区/状态栏 → 不打断
-      -- 编辑（拖选复制是客户端功能，机器侧静默——此前 touch 事件落入
-      -- 循环底部未匹配分支被丢弃，点击完全无反应）。
+      -- 指针定位 + 拖选（v0.3.68 点击定位；v0.3.72 拖选高亮+Ctrl+C
+      -- 复制）: screen 组件发 touch/drag (x, y, button, player)。
+      -- 输入行内:
+      --   touch 按下 → 起点 + 定位光标（清除旧选中）
+      --   drag 拖动 → 更新终点（起点保持）→ 高亮实时重绘
+      -- GTNH 无 setClipboard API → 复制目标为 state.clipboard（进程内
+      -- 剪贴板，Ctrl+V 粘贴优先），跨游戏剪贴板不可行。
       local tx, ty = char, code
       if type(tx) == "number" and type(ty) == "number" then
         local inputY = state.height - (state.scrollSafe and 1 or 0)
@@ -673,8 +739,23 @@ function tui.readInput()
             w = w + cw
             idx = idx + 1
           end
-          state.inputCursor = line_start + idx
+          local charIdx = line_start + idx
+          if ev == "touch" then
+            -- 按下: 起点 = 终点 = 点击位（清除旧选中）
+            state.sel = {a = charIdx, b = charIdx}
+            state.sel_active = true
+          elseif state.sel and state.sel_active then
+            -- 拖动: 更新终点（起点保持）——不移动光标
+            state.sel.b = charIdx
+          end
+          state.inputCursor = charIdx
           state.completionCycle = nil
+          pcall(tui.drawInput)
+        elseif ev == "drag" and state.sel and state.sel_active then
+          -- 拖出输入行: 终点 = 行首/行尾（向拖动方向延伸）
+          local line_start = lastLineStart(state.inputBuffer)
+          local len = ulen(state.inputBuffer)
+          state.sel.b = ty < inputY and line_start or len
           pcall(tui.drawInput)
         end
       end
