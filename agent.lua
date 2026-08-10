@@ -465,7 +465,33 @@ local function find_writable_base()
 end
 
 -- Top-level side effect (module load time): probe the writable base once.
-local writable_base = find_writable_base()
+-- data_dir 引导（2026-08-10 磁盘迁移功能）: 原盘 config 里若有 data_dir
+-- 且该目录可写（/relocate 迁移后写入的引导项），则所有数据路径
+-- （config/history/sessions）切换到目标盘。目标盘不可写（盘被拔/只读）
+-- 时回退原盘——自动容错。
+local function probe_data_dir(base)
+  local fs = require("filesystem")
+  local f = io.open(base .. "/agent_config.txt", "r")
+  if not f then return base end
+  local content = f:read("*a")
+  f:close()
+  local ser = require("serialization")
+  local ok, d = pcall(ser.unserialize, content)
+  if not ok or type(d) ~= "table" or type(d.data_dir) ~= "string" or d.data_dir == "" then
+    return base
+  end
+  local target = d.data_dir
+  if target == base then return base end
+  local probe = io.open(target .. "/wprobe.txt", "w")
+  if probe then
+    probe:close()
+    os.remove(target .. "/wprobe.txt")
+    print("[relocate] 数据目录由 " .. base .. " 切换到 " .. target .. "（config.data_dir）")
+    return target
+  end
+  return base
+end
+local writable_base = probe_data_dir(find_writable_base())
 local config_path = writable_base .. "/agent_config.txt"
 local history_path = writable_base .. "/agent_history.txt"
 local sessions_dir = writable_base .. "/sessions"
@@ -1103,6 +1129,51 @@ local function list_sessions(dir)
   return out
 end
 
+-- 运行时切换 sessions 目录（/relocate 迁移后立即生效；重启后由
+-- config 的 data_dir 引导自动落到新盘）。
+local function set_sessions_dir(p)
+  sessions_dir = p
+end
+
+-- 当前 sessions 目录（disk 工具 list_storage 统计占用用）
+local function get_sessions_dir()
+  return sessions_dir
+end
+
+-- 磁盘清理（2026-08-10 新增，配合 /cleanup）: 删除非当前会话的旧
+-- 会话文件（保留最近 keep 个，keep=0 仅保留当前）。当前会话按路径
+-- 精确匹配（/session 切换后当前文件在 sessions 目录内）。返回
+-- (删除数, 释放字节)。归档 .txt（/new 产物）不动——清理只针对
+-- *.jsonl 会话文件；history 文件本体由 init.lua /cleanup 按
+-- mem_history_max_bytes 截断。
+local function cleanup_sessions(keep)
+  local sessions = list_sessions()
+  local current = current_path()
+  local deleted, freed = 0, 0
+  for i, s in ipairs(sessions) do
+    if i > (keep or 0) then
+      local path = sessions_dir .. "/" .. s.name .. ".jsonl"
+      if path ~= current then
+        local size = 0
+        local f = io.open(path, "r")
+        if f then
+          size = f:seek("end") or 0
+          f:close()
+        end
+        local ok_rm, res = pcall(os.remove, path)
+        -- os.remove 成功返回 true（非 nil）；失败返回 nil + 错误信息。
+        -- 曾误写 err==nil（成功时 err=true 恒不成立 → 永远删不掉，
+        -- 2026-08-10 smoke 测试捕获）。
+        if ok_rm and res == true then
+          deleted = deleted + 1
+          freed = freed + size
+        end
+      end
+    end
+  end
+  return deleted, freed
+end
+
 -- Inject the chat client (agent.lua calls this after Section 5 defines
 -- chat). Needed by summarize_history's LLM call.
 local function set_chat(fn)
@@ -1120,6 +1191,9 @@ return {
   should_compact = should_compact,
   summarize_history = summarize_history,
   set_paths = set_paths,
+  set_sessions_dir = set_sessions_dir,
+  get_sessions_dir = get_sessions_dir,
+  cleanup_sessions = cleanup_sessions,
   set_chat = set_chat,
   current_path = current_path,
   list_sessions = list_sessions,
@@ -1173,6 +1247,7 @@ local BUILTIN = {
   "agent.tools.subagent",
   "agent.tools.question",
   "agent.tools.compact",
+  "agent.tools.disk",
 }
 
 -- Names already loaded by the BUILTIN loop (below). scan_dir skips these
@@ -4061,6 +4136,7 @@ local DEPS = {
   json = json,
   http_post = http_post,
   load_config = load_config,
+  save_config = save_config,
   wait_modem_message = subagent_mod.wait_modem_message,
   subagent_listen_port = SUBAGENT_LISTEN_PORT,
   subagent_reply_port = SUBAGENT_REPLY_PORT,
@@ -4070,6 +4146,10 @@ local DEPS = {
   compact_history = session_mod.compact_history,
   get_context = nil,
   rebuild_current = nil,
+  -- 磁盘管理与数据迁移工具（agent.tools.disk）: session/config 引用。
+  -- rebuild_current 在 process_exchange 里按需刷新（与压缩工具同机制）。
+  session = session_mod,
+  get_writable_base = function() return WRITABLE_BASE end,
 }
 
 -- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
@@ -4308,6 +4388,24 @@ local function collect_multiline()
   return table.concat(lines, "\n")
 end
 
+-- 分块复制文件（/relocate 用）。避免整文件读入内存（2MB 约束下大
+-- history 全量 read("*a") 会 OOM——与 load_history 流式化同一原则）。
+-- src 不存在 → 返回 nil（调用方按需处理）；目标不可写 → false。
+local function copy_file_chunked(src, dst)
+  local fi = io.open(src, "rb")
+  if not fi then return nil end
+  local fo = io.open(dst, "wb")
+  if not fo then fi:close() return false end
+  while true do
+    local chunk = fi:read(4096)
+    if not chunk then break end
+    fo:write(chunk)
+  end
+  fi:close()
+  fo:close()
+  return true
+end
+
 local function handle_command(cmd, config, messages)
   local parts = {}
   for w in cmd:gmatch("%S+") do parts[#parts + 1] = w end
@@ -4456,6 +4554,106 @@ local function handle_command(cmd, config, messages)
     local p = session_mod.current_path()
     local name = p:match("([^/\\]+)%.jsonl$") or "default"
     print(name .. ": " .. #messages .. " messages")
+  elseif command == "/cleanup" then
+    -- 磁盘清理（2026-08-10）: 删旧会话 + 截断超限 history。
+    -- 用法: /cleanup           保留最近 5 个会话（含当前）
+    --       /cleanup 0         只保留当前会话，其余全删
+    --       /cleanup 10        保留最近 10 个会话
+    local keep = 5
+    if parts[2] then
+      local n = tonumber(parts[2])
+      if n and n >= 0 then keep = n
+      else print("Usage: /cleanup [keep N]  (N = 保留最近 N 个会话，默认 5)") return end
+    end
+    -- 1) 清理旧会话文件
+    local deleted, freed = session_mod.cleanup_sessions(keep)
+    print("[cleanup] 删除 " .. deleted .. " 个旧会话，释放 " .. freed .. "B")
+    -- 2) 截断超限 history（文件 > mem_history_max_bytes 时缩到内存表规模；
+    --    与 load_history 启动时同一防护，运行中手动触发）
+    local hp = session_mod.current_path()
+    local hf = io.open(hp, "r")
+    if hf then
+      local hsz = hf:seek("end") or 0
+      hf:close()
+      local ok_c2, cfg2 = pcall(load_config)
+      local max_file2 = tonumber(ok_c2 and cfg2 and cfg2.mem_history_max_bytes) or 256000
+      if hsz > max_file2 then
+        print("[cleanup] history " .. hsz .. "B 超限 " .. max_file2 .. "B，截断到内存表（"
+          .. #messages .. " 条）...")
+        rebuild_history(messages)
+      else
+        print("[cleanup] history " .. hsz .. "B（未超限 " .. max_file2 .. "B）")
+      end
+    end
+  elseif command == "/relocate" then
+    -- 迁移数据目录到另一盘（2026-08-10）: /relocate <可写路径>
+    -- 把 config/history/sessions 复制到目标盘，原盘 config 写
+    -- data_dir 引导——重启后自动落到新盘；本进程内立即切换
+    -- session 路径。用法: /relocate /mnt/<短盘符>
+    if not parts[2] then
+      print("Usage: /relocate <path>  (目标盘需可写，如 /mnt/xxxx)")
+      print("  迁移 config/history/sessions 到目标盘并写 data_dir 引导")
+    else
+      local target = parts[2]
+      local fs_r = require("filesystem")
+      -- 校验目标可写（/home 只读环境落到挂载盘）
+      local probe = io.open(target .. "/wprobe.txt", "w")
+      if not probe then
+        print("[relocate] 目标不可写: " .. target)
+      else
+        probe:close()
+        os.remove(target .. "/wprobe.txt")
+        local moved = 0
+        local failed = {}
+        -- 1) config（含 data_dir 引导本身——目标盘也写一份，防原盘 config
+        --    丢失后新盘无引导；data_dir 字段由下方统一写入）
+        local cfg_ok, cfg_cur = pcall(load_config)
+        local cfg_data = cfg_ok and cfg_cur or {}
+        -- 复制当前数据文件（存在才复制）
+        local src_cfg = WRITABLE_BASE .. "/agent_config.txt"
+        local r1 = copy_file_chunked(src_cfg, target .. "/agent_config.txt")
+        if r1 == false then failed[#failed + 1] = "config" end
+        if r1 ~= nil then moved = moved + 1 end
+        local src_hist = session_mod.current_path()
+        if src_hist ~= WRITABLE_BASE .. "/agent_history.txt" then
+          -- /session 切换中: 也复制默认 history（引导加载用）
+          local r0 = copy_file_chunked(WRITABLE_BASE .. "/agent_history.txt",
+            target .. "/agent_history.txt")
+          if r0 == false then failed[#failed + 1] = "default history" end
+          if r0 ~= nil then moved = moved + 1 end
+        end
+        local r2 = copy_file_chunked(src_hist, target .. "/agent_history.txt")
+        if r2 == false then failed[#failed + 1] = "history" end
+        if r2 ~= nil then moved = moved + 1 end
+        -- 3) sessions 目录（复制 *.jsonl；归档 .txt 保留原盘）
+        local ok_dir, d_iter = pcall(fs_r.list, SESSIONS_DIR)
+        if ok_dir and type(d_iter) == "function" then
+          for name in d_iter do
+            if name:sub(-6) == ".jsonl" then
+              local r3 = copy_file_chunked(SESSIONS_DIR .. "/" .. name, target .. "/sessions/" .. name)
+              if r3 == false then failed[#failed + 1] = "session " .. name end
+              if r3 ~= nil then moved = moved + 1 end
+            end
+          end
+        end
+        -- 4) 原盘 config 写 data_dir 引导
+        cfg_data.data_dir = target
+        local ok_save_dir, err_save = pcall(save_config, cfg_data)
+        if not ok_save_dir then
+          failed[#failed + 1] = "data_dir 引导写入: " .. tostring(err_save)
+        end
+        -- 5) 本进程内立即切换 session 路径（重启后由 data_dir 引导自动生效）
+        session_mod.set_paths(target .. "/agent_history.txt")
+        session_mod.set_sessions_dir(target .. "/sessions")
+        print("[relocate] 已迁移 " .. moved .. " 个文件到 " .. target
+          .. "（data_dir 引导已写入原盘 config）")
+        if #failed > 0 then
+          print("[relocate] 部分失败: " .. table.concat(failed, ", "))
+        end
+        print("[relocate] 本会话已切换；重启 agent 后 data_dir 引导使全部路径落到新盘")
+        -- 迁移后内存表仍在（历史已复制到新盘文件），无需重载
+      end
+    end
   elseif command == "/version" then
     -- 读取安装时写入的 version.txt（install.lua 生成）
     local vf = io.open(AGENT_DIR .. "/version.txt", "r")

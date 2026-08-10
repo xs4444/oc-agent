@@ -533,6 +533,51 @@ local function list_sessions(dir)
   return out
 end
 
+-- 运行时切换 sessions 目录（/relocate 迁移后立即生效；重启后由
+-- config 的 data_dir 引导自动落到新盘）。
+local function set_sessions_dir(p)
+  sessions_dir = p
+end
+
+-- 当前 sessions 目录（disk 工具 list_storage 统计占用用）
+local function get_sessions_dir()
+  return sessions_dir
+end
+
+-- 磁盘清理（2026-08-10 新增，配合 /cleanup）: 删除非当前会话的旧
+-- 会话文件（保留最近 keep 个，keep=0 仅保留当前）。当前会话按路径
+-- 精确匹配（/session 切换后当前文件在 sessions 目录内）。返回
+-- (删除数, 释放字节)。归档 .txt（/new 产物）不动——清理只针对
+-- *.jsonl 会话文件；history 文件本体由 init.lua /cleanup 按
+-- mem_history_max_bytes 截断。
+local function cleanup_sessions(keep)
+  local sessions = list_sessions()
+  local current = current_path()
+  local deleted, freed = 0, 0
+  for i, s in ipairs(sessions) do
+    if i > (keep or 0) then
+      local path = sessions_dir .. "/" .. s.name .. ".jsonl"
+      if path ~= current then
+        local size = 0
+        local f = io.open(path, "r")
+        if f then
+          size = f:seek("end") or 0
+          f:close()
+        end
+        local ok_rm, res = pcall(os.remove, path)
+        -- os.remove 成功返回 true（非 nil）；失败返回 nil + 错误信息。
+        -- 曾误写 err==nil（成功时 err=true 恒不成立 → 永远删不掉，
+        -- 2026-08-10 smoke 测试捕获）。
+        if ok_rm and res == true then
+          deleted = deleted + 1
+          freed = freed + size
+        end
+      end
+    end
+  end
+  return deleted, freed
+end
+
 -- Inject the chat client (agent.lua calls this after Section 5 defines
 -- chat). Needed by summarize_history's LLM call.
 local function set_chat(fn)
@@ -550,6 +595,9 @@ return {
   should_compact = should_compact,
   summarize_history = summarize_history,
   set_paths = set_paths,
+  set_sessions_dir = set_sessions_dir,
+  get_sessions_dir = get_sessions_dir,
+  cleanup_sessions = cleanup_sessions,
   set_chat = set_chat,
   current_path = current_path,
   list_sessions = list_sessions,
