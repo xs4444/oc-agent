@@ -255,6 +255,14 @@ local function collect(config, history)
 end
 
 -- 上传到 GitHub Gist。返回 (url, err)。
+-- v0.3.73 超时保护（真机多次卡死根因，gist 852193/用户反复反馈）:
+-- OC internet.request 连接阶段**无超时**（http.lua 的 120s/300s 保护只
+-- 覆盖响应迭代与重试预算——连接挂起时 once 不返回，预算检查不到）。
+-- 用户网络 api.github.com 不可达时 TCP connect 永久挂起 → /debug 卡在
+-- "Uploading..."。修复: 上传跑在 thread 里，外部 waitForAll 带超时
+-- （默认 30s，config.debug_upload_timeout 可调）；超时放弃线程返回
+-- 提示（报告已写本地）。thread 库不可用（测试/精简环境）时回退同步
+-- 调用（行为同旧版）。
 local function upload(report, token)
   if not token or token == "" then
     return nil, "no gist token configured (use /gist-token <token>)"
@@ -271,13 +279,45 @@ local function upload(report, token)
     ["Accept"] = "application/vnd.github+json",
     ["User-Agent"] = "oc-agent",
   }
-  local code, resp, err = http.post("https://api.github.com/gists", headers, body)
-  if err then return nil, "network: " .. tostring(err) end
-  if code ~= 201 then
-    return nil, "HTTP " .. tostring(code) .. ": " .. tostring(resp):sub(1, 200)
+  local thread_ok, thread = pcall(require, "thread")
+  if not thread_ok or not thread or not thread.create or not thread.waitForAll then
+    -- 无 thread（测试/精简环境）: 同步调用（行为同旧版）
+    local code, resp, err = http.post("https://api.github.com/gists", headers, body)
+    if err then return nil, "network: " .. tostring(err) end
+    if code ~= 201 then
+      return nil, "HTTP " .. tostring(code) .. ": " .. tostring(resp):sub(1, 200)
+    end
+    local url = resp and resp:match('"html_url"%s*:%s*"([^"]+)"')
+    if not url then url = resp and resp:match('"url"%s*:%s*"([^"]+)"') end
+    return url or "(gist created, no url parsed)"
   end
-  local url = resp and resp:match('"html_url"%s*:%s*"([^"]+)"')
-  if not url then url = resp and resp:match('"url"%s*:%s*"([^"]+)"') end
+
+  -- 线程化 + 超时: 连接挂起不再阻塞主循环
+  local result = {}
+  local t = thread.create(function()
+    local code, resp, err = http.post("https://api.github.com/gists", headers, body)
+    result.code, result.resp, result.err = code, resp, err
+  end)
+  local timeout = 30
+  local ok_cfg, cfg = pcall(require, "agent.config")
+  if ok_cfg and cfg and cfg.load then
+    local ok_c, c = pcall(cfg.load)
+    if ok_c and c and c.debug_upload_timeout then
+      timeout = tonumber(c.debug_upload_timeout) or 30
+    end
+  end
+  local ok_w, werr = pcall(thread.waitForAll, {t}, timeout)
+  if not ok_w or not werr then
+    -- 超时或 waitForAll 失败: 放弃（线程后台继续，连接最终由
+    -- http.lua 响应超时兜底；不再阻塞用户）
+    return nil, "upload timeout after " .. timeout .. "s (network unreachable?) — report saved locally"
+  end
+  if result.err then return nil, "network: " .. tostring(result.err) end
+  if result.code ~= 201 then
+    return nil, "HTTP " .. tostring(result.code) .. ": " .. tostring(result.resp):sub(1, 200)
+  end
+  local url = result.resp and result.resp:match('"html_url"%s*:%s*"([^"]+)"')
+  if not url then url = result.resp and result.resp:match('"url"%s*:%s*"([^"]+)"') end
   return url or "(gist created, no url parsed)"
 end
 
