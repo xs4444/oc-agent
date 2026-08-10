@@ -107,7 +107,8 @@ local function choose_disk(prompt, mounts, skip_path)
   end
   io.write("输入编号（回车取消）: ")
   local answer = io.read() or ""
-  local n = tonumber(answer:gsub("%s", ""))
+  -- gsub 双返回值（同上方 agent 安装盘选择处）——包括号取首个
+  local n = tonumber((answer:gsub("%s", "")))
   if not n or n < 1 or n > #shown then
     return nil
   end
@@ -177,7 +178,10 @@ if not DEST_DIR or DEST_DIR == "" then
     end
     io.write("输入编号（回车 = /home）: ")
     local answer = io.read() or ""
-    local n = tonumber(answer:gsub("%s", ""))
+    -- gsub 返回两个值（字符串+替换次数）——不包括号会把次数当
+    -- tonumber 的 base 参数（空输入次数=0 → "base out of range"，
+    -- ocvm 实测踩中）。包一层括号取第一个返回值。
+    local n = tonumber((answer:gsub("%s", "")))
     if n and n >= 1 and n <= #shown then
       DEST_DIR = shown[n]
     elseif home_shown then
