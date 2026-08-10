@@ -2010,6 +2010,49 @@ local function collect(config, history)
     lines[#lines + 1] = "(empty)"
   end
 
+  -- 运行时诊断段（v0.3.56）: 内存曲线 / 最后一次内存裁剪 / 最后一次
+  -- chat 请求。数据源 init.lua 的 DIAG 表（_G._AGENT_DIAG 全局挂载，
+  -- 与 json 全局同先例）。用途: 对话卡死无反馈时（真机第 7 次现场，
+  -- gist 5ff1d4——[mem] 裁剪后对话中断）报告可见:
+  --   - mem curve: 内存下降路径（哪轮开始跌破阈值）
+  --   - last mem trim: 裁剪事件（触发时间/前后 free/裁剪条数）——
+  --     若 free_after 未回升说明 GC 未释放堆（裁剪无效）
+  --   - last chat: 最后一次请求耗时与错误——elapsed 接近 retry_budget
+  --     （默认 300s）说明端点慢/挂起；error 有值说明编码/请求失败
+  local diag = type(_G._AGENT_DIAG) == "table" and _G._AGENT_DIAG or nil
+  if diag then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "--- Diagnostics ---"
+    if diag.mem_curve and #diag.mem_curve > 0 then
+      local pts = {}
+      for _, p in ipairs(diag.mem_curve) do
+        pts[#pts + 1] = string.format("%.1fs→%d", p.uptime or 0, p.free or 0)
+      end
+      lines[#lines + 1] = "mem curve (uptime→free): " .. table.concat(pts, ", ")
+    else
+      lines[#lines + 1] = "mem curve: (no samples)"
+    end
+    if diag.last_trim then
+      local t = diag.last_trim
+      lines[#lines + 1] = "last mem trim: uptime=" .. string.format("%.1fs", t.uptime or 0)
+        .. " free_before=" .. tostring(t.free_before)
+        .. " removed=" .. tostring(t.removed)
+        .. " free_after=" .. tostring(t.free_after)
+        .. (t.free_after and t.free_before and t.free_after < t.free_before
+          and "  <-- GC 未释放堆（裁剪无效）" or "")
+    else
+      lines[#lines + 1] = "last mem trim: (never)"
+    end
+    if diag.last_chat then
+      local c = diag.last_chat
+      lines[#lines + 1] = "last chat: uptime=" .. string.format("%.1fs", c.uptime or 0)
+        .. " elapsed=" .. string.format("%.1fs", c.elapsed or 0)
+        .. " error=" .. tostring(c.error or "nil")
+    else
+      lines[#lines + 1] = "last chat: (never)"
+    end
+  end
+
   return table.concat(lines, "\n")
 end
 
@@ -4915,6 +4958,25 @@ local function mem_pressure(config)
   return free < threshold
 end
 
+-- 运行时诊断表（v0.3.56，debug 报告 Diagnostics 段数据源）:
+-- 真机第 7 次现场（gist 5ff1d4）: [mem] 裁剪触发后对话卡死无反馈，
+-- debug 报告只有历史、没有裁剪事件/请求状态——信息不足无法定位。
+-- 本表记录: 内存曲线（每轮 exchange/工具循环采样）、最后一次内存裁剪
+-- （触发时间/前后 free/裁剪条数）、最后一次 chat 请求（耗时/错误）。
+-- 经 _G._AGENT_DIAG 全局挂载（与 json 全局同先例），debug.lua collect
+-- 读取；TUI/REPL 卡死时用户 /debug 即可见最后状态。
+local DIAG = { mem_curve = {}, last_trim = nil, last_chat = nil }
+rawset(_G, "_AGENT_DIAG", DIAG)
+
+local function now_uptime()
+  local ok_c, computer = pcall(require, "computer")
+  if ok_c and computer and computer.uptime then
+    local ok_u, u = pcall(computer.uptime)
+    if ok_u and u then return u end
+  end
+  return 0
+end
+
 -- 内存压力强制裁剪（真机第二次/第三次 OOM 根因修复，gist 10d45721/3c0c3914）:
 -- free 内存低谷（真机 278KB→101KB 实测）时 encode 大历史必 OOM→error
 -- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
@@ -4934,16 +4996,46 @@ end
 -- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
 -- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
 local function enforce_memory(messages, config, persist, session)
+  -- 内存曲线采样（每轮调用一次，限 20 点防膨胀；debug 报告可见下降路径）
+  local u_now = now_uptime()
+  local ok_c, computer = pcall(require, "computer")
+  local f_now = 0
+  if ok_c and computer and computer.freeMemory then
+    local ok_f, f = pcall(computer.freeMemory)
+    if ok_f and f then f_now = f end
+  end
+  DIAG.mem_curve[#DIAG.mem_curve + 1] = { uptime = u_now, free = f_now }
+  if #DIAG.mem_curve > 20 then table.remove(DIAG.mem_curve, 1) end
+
   if not mem_pressure(config) then return end
   print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
   local before = #messages
   local trim_budget = tonumber(config.mem_trim_bytes) or 60000
   trim_to_bytes(messages, trim_budget)
+  -- 强制 GC（真机第 7 次现场修复，gist 5ff1d4）: 物理删除表条目后 Lua
+  -- 堆不立即归还系统（增量 GC）——v0.3.45 折叠不释放内存的教训重演:
+  -- 裁剪后 free 不回升，继续 encode 仍可能 OOM。主动 collect 让
+  -- computer.freeMemory() 真实回升。OpenOS 有 collectgarbage；
+  -- pcall 兼容精简/测试环境（collectgarbage 可能为 nil）。
+  pcall(collectgarbage, "collect")
   if persist then
     if session then rebuild_session_history(session, messages)
     else rebuild_history(messages) end
   end
-  print("[mem] 裁剪 " .. (before - #messages) .. " 条")
+  local removed = before - #messages
+  local f_after = 0
+  if ok_c and computer and computer.freeMemory then
+    local ok_f2, f2 = pcall(computer.freeMemory)
+    if ok_f2 and f2 then f_after = f2 end
+  end
+  DIAG.last_trim = {
+    uptime = u_now,
+    free_before = f_now,
+    removed = removed,
+    free_after = f_after,
+  }
+  print("[mem] 裁剪 " .. removed .. " 条（free " .. fmt_num(f_now)
+    .. " → " .. fmt_num(f_after) .. "）")
 end
 
 local function process_exchange(messages, config, user_input, persist, session)
@@ -5049,7 +5141,17 @@ local function process_exchange(messages, config, user_input, persist, session)
     -- 每轮 chat() 前复查，触发即物理裁剪（不执行工具、不回滚本轮，
     -- 与 exchange 开头路径同语义；mem_pressure 未触发时零开销）。
     enforce_memory(messages, config, persist, session)
+    -- chat 请求状态记录（v0.3.56 诊断）: 卡死无反馈时（真机第 7 次现场，
+    -- gist 5ff1d4——[mem] 裁剪后对话中断）debug 报告可见最后一次请求的
+    -- 耗时与错误，区分"端点慢/挂起（elapsed 接近 retry_budget）"与
+    -- "编码失败（error 有值）"。chat 内部 pcall 捕获不抛异常。
+    local t_start = now_uptime()
     local response = chat(messages, config)
+    DIAG.last_chat = {
+      uptime = t_start,
+      elapsed = now_uptime() - t_start,
+      error = response and response.error,
+    }
 
     if response.error then
       if not retried_400 and tostring(response.error):find("400") then
