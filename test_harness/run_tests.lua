@@ -1646,8 +1646,19 @@ end
 -- → 折叠（保缓存）；内存紧张（mem_pressure）→ 物理裁剪（保命）。
 do
   -- 测试1: 内存低谷 → 物理裁剪（#减少 + 字节 ≤ 阈值 + 锚点/最近保留）
+  -- mock 序列模拟真实环境（v0.3.56+）: 前两次调用（enforce_memory 采样
+  -- + mem_pressure 检查）返回低谷 100KB → 触发裁剪；裁剪后
+  -- collectgarbage 强制 GC 归还 Lua 堆，freeMemory 回升（第三次起
+  -- 返回 2MB）——chat() 的 encode 前估算检查（est*3 > free*0.85）
+  -- 在真实回升后通过。恒定 100KB 的旧 mock 制造了"裁剪后仍低谷"
+  -- 的虚假场景，会误伤 encode 防护（gist 852193 第 8 次 OOM 加固）。
   local saved_free = computer.freeMemory
-  computer.freeMemory = function() return 100000 end  -- 100KB < 400KB 阈值
+  local free_calls = 0
+  computer.freeMemory = function()
+    free_calls = free_calls + 1
+    if free_calls <= 2 then return 100000 end  -- 低谷（触发裁剪）
+    return 2000000                            -- GC 后回升
+  end
   local mp_msgs = {}
   for i = 1, 60 do
     mp_msgs[#mp_msgs + 1] = {role = "user", content = string.rep("m", 10000) .. i}
