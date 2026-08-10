@@ -897,8 +897,18 @@ local function compact_history(messages, config)
   -- 丢弃；其余折叠段内容已进摘要（KEEP/REF 展开），删除仅释放内存——
   -- 请求体本就是 [摘要 + 保留段]（folded 分支跳过），折叠段对缓存无
   -- 贡献，纯占内存。JSONL append-only 完整保留可追溯。
+  -- 保留段首条不能是 role=tool（孤立 tool 消息缺陷，真机 gist 783a0f7
+  -- 实证）: 若折叠边界恰落在 assistant(tool_calls) 与其 tool 结果之间，
+  -- 保留段以孤立 tool 开头——OpenAI 规范要求 tool 消息必须对应前置
+  -- assistant.tool_calls（部分端点直接 400，opencode.ai/zen 实测宽容
+  -- 但这是请求合法性缺陷）。修复：首条是 tool 则向前多保留一条（其
+  -- 前置 assistant），保证保留段以 user/assistant/system 开头。
+  local first_keep = #messages - keep + 1
+  while first_keep > 1 and messages[first_keep].role == "tool" do
+    first_keep = first_keep - 1
+  end
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
-  for i = #messages - keep + 1, #messages do
+  for i = first_keep, #messages do
     result[#result + 1] = messages[i]
   end
   -- 就地替换（调用方持有同一表引用）
@@ -1704,14 +1714,83 @@ local function mask_token(s)
   return "(已设置 " .. #s .. " 字符)"
 end
 
--- 单条消息 → 紧凑单行（tool 结果截断放宽到 1000 字符）
-local function msg_line(msg)
+-- ── 历史消息脱敏（2026-08-09 安全修复）──
+-- 泄漏背景: GitHub 扫描到 gist 内的完整 PAT（oc-agent-debug note）并撤销。
+-- Config 段一直安全（gist_token 完全遮蔽），泄漏点在 Recent history 段：
+-- msg_line 原样输出消息 content——若历史中某条消息（用户自然语言提交的
+-- token、或工具结果如 read_file config.json 输出）含明文密钥，报告即带出。
+-- 修复: 已知明文值（config 中的 api_key/tavily_key/gist_token）整体替换
+-- + 常见 token 格式模式遮蔽（GitHub PAT/OAuth/OpenAI/Tavily 前缀）。
+
+-- 收集 config 中已知的敏感明文值（去重、跳过空值/过短值）
+local function known_secrets(config)
+  local list = {}
+  local seen = {}
+  local cfg = config or {}
+  for _, k in ipairs({ "api_key", "tavily_key", "gist_token" }) do
+    local v = cfg[k]
+    if type(v) == "string" and #v >= 8 and not seen[v] then
+      seen[v] = true
+      list[#list + 1] = v
+    end
+  end
+  return list
+end
+
+-- 纯文本替换（避免 Lua pattern magic 字符误伤：token 值含 % . - 等时
+-- string.gsub 会把第一个参数当 pattern——已知值必须按字面匹配）
+local function plain_replace(s, find_str, repl)
+  local out = s
+  local pos = 1
+  while true do
+    local a, b = string.find(out, find_str, pos, true)
+    if not a then break end
+    out = out:sub(1, a - 1) .. repl .. out:sub(b + 1)
+    pos = a + #repl
+  end
+  return out
+end
+
+-- token 前缀（格式遮蔽：保留前缀便于人读，值部分一律 ***）。
+-- 长的前缀在前（github_pat_ 先于 ghp_ 检查；sk-ant- 先于 sk-）。
+-- 实现用词元扫描 + 函数替换：一次 gsub 完成，无二次匹配问题
+-- （Lua pattern 的 ? 量词在本环境 5.4.6 上行为异常，且分组+量词
+--   二次匹配污染产物——实测 a(b)?c 匹配 abc 返回 nil，弃用）。
+local TOKEN_PREFIXES = {
+  "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+  "sk-ant-", "sk-", "tvly-",
+}
+
+-- 对文本做脱敏：先替换已知明文值，再按前缀格式遮蔽 token 值。
+-- 顺序很重要：已知值替换优先（更长更精确，避免模式先行后值已变）。
+local function redact(text, config)
+  if not text or text == "" then return text end
+  local out = tostring(text)
+  for _, secret in ipairs(known_secrets(config)) do
+    out = plain_replace(out, secret, "***")
+  end
+  -- 词元扫描: 对每个 [%w_]（含 - 的连续 token 候选）检查前缀，
+  -- 命中则保留前缀、值部分换 ***；函数替换单遍完成，无二次匹配。
+  out = out:gsub("[%w_%-]+", function(tok)
+    for _, prefix in ipairs(TOKEN_PREFIXES) do
+      if tok:sub(1, #prefix) == prefix then
+        return prefix .. "***"
+      end
+    end
+    return tok
+  end)
+  return out
+end
+
+-- 单条消息 → 紧凑单行（tool 结果截断放宽到 1000 字符；
+-- content 先经 redact 脱敏——历史中可能含明文密钥）
+local function msg_line(msg, config)
   if type(msg) ~= "table" then return tostring(msg) end
   local role = msg.role or "?"
   local parts = { "[" .. role .. "]" }
   if msg.tool_call_id then parts[#parts + 1] = "(" .. msg.tool_call_id .. ")" end
   if msg.content and msg.content ~= "" then
-    local c = tostring(msg.content):gsub("\n", " "):gsub("\r", "")
+    local c = redact(msg.content, config):gsub("\n", " "):gsub("\r", "")
     if #c > 1000 then c = c:sub(1, 997) .. "..." end
     parts[#parts + 1] = c
   end
@@ -1793,7 +1872,7 @@ local function collect(config, history)
   if history and #history > 0 then
     local start = math.max(1, #history - max_msgs + 1)
     for i = start, #history do
-      lines[#lines + 1] = msg_line(history[i])
+      lines[#lines + 1] = msg_line(history[i], config)
     end
   else
     lines[#lines + 1] = "(empty)"
@@ -1833,6 +1912,7 @@ return {
   collect = collect,
   upload = upload,
   mask = mask,
+  redact = redact,
 }
 end
 
@@ -3548,6 +3628,28 @@ local function exec(name, args, deps)
     if not ok_guard then
       return guard_err
     end
+
+    -- 执行前内存护栏（真机第四次 OOM 根因，gist 59379f，free=35KB）:
+    -- OpenOS 所有进程共享同一块内存（2MB 内存条）——shell_execute 启动的
+    -- 子进程（探针脚本 require 模块 + HTTP 请求响应缓冲）运行期间的峰值
+    -- 内存主进程无法复查（enforce_memory 只在 chat() 前检查，覆盖不到
+    -- 工具执行中）。且 v0.3.50 重启后新进程 uptime 255s 即崩：子进程
+    -- require 双份模块 + 大响应体 → 与主进程驻留叠加超 2MB。
+    -- 护栏: 执行前测 freeMemory，低于 mem_exec_min_free（默认 500KB，
+    -- 略高于 mem_pressure 的 400KB——先拒重活再裁历史）拒绝执行，
+    -- 提示先压缩历史；普通轻命令（ls/version 等）不受影响。
+    local ok_c, computer = pcall(require, "computer")
+    if ok_c and computer and computer.freeMemory then
+      local ok_f, free = pcall(computer.freeMemory)
+      if ok_f and type(free) == "number" then
+        local cfg = (deps and deps.load_config and deps.load_config()) or {}
+        local min_free = tonumber(cfg.mem_exec_min_free) or 500000
+        if free < min_free then
+          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files/json_query 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
+        end
+      end
+    end
+
     local timeout = tonumber(args.timeout) or 60
     local ok, result = pcall(function()
       local thread_ok, thread = pcall(require, "thread")
@@ -4526,6 +4628,37 @@ local function mem_pressure(config)
   return free < threshold
 end
 
+-- 内存压力强制裁剪（真机第二次/第三次 OOM 根因修复，gist 10d45721/3c0c3914）:
+-- free 内存低谷（真机 278KB→101KB 实测）时 encode 大历史必 OOM→error
+-- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
+-- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
+-- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
+-- 第三次 OOM（gist 3c0c3914，free=101KB）：mem_pressure 原只在 exchange
+-- 开头检查一次，长探索工具循环（多轮 read_file 大结果 append）中途
+-- free 跌破阈值无复查 → 继续 encode 峰值 OOM。修复：本函数在 exchange
+-- 开头与工具循环每轮 chat() 前各调一次，触发即物理裁剪到 mem_trim_bytes。
+-- 三层防御（宽裕→悬崖）:
+--   1. 字节阈值自动折叠（上方 auto compact）→ 折叠段物理回收，表字节
+--      真实下降——宽裕期保上下文（先于下方 mem_pressure 触发）；
+--   2. 窗口超限（ensure_context_budget 80% 硬保护 / 模型 compact_history
+--      工具）→ 折叠，防 400/超限；
+--   3. 内存紧张（此处 mem_pressure）→ 物理裁剪（trim_to_bytes 到
+--      mem_trim_bytes 默认 60KB，悬崖保命——已 OOM 三次，保命优先）。
+-- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
+-- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
+local function enforce_memory(messages, config, persist, session)
+  if not mem_pressure(config) then return end
+  print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
+  local before = #messages
+  local trim_budget = tonumber(config.mem_trim_bytes) or 60000
+  trim_to_bytes(messages, trim_budget)
+  if persist then
+    if session then rebuild_session_history(session, messages)
+    else rebuild_history(messages) end
+  end
+  print("[mem] 裁剪 " .. (before - #messages) .. " 条")
+end
+
 local function process_exchange(messages, config, user_input, persist, session)
   messages[#messages + 1] = {role = "user", content = user_input}
 
@@ -4567,31 +4700,10 @@ local function process_exchange(messages, config, user_input, persist, session)
     end
   end
 
-  -- 内存压力强制裁剪（真机第二次 OOM 根因修复，gist 10d45721）:
-  -- free 内存低谷（真机 278KB 实测）时 encode 大历史必 OOM→error
-  -- （chat.lua pcall 捕获，TUI 只显示不落盘——第二轮无响应）。v0.3.45
-  -- 的投影式折叠（folded 标记不删除）只缩小请求体、**不释放内存**——
-  -- 93.6KB JSONL 解析后历史表 ~300KB 驻留不变，free 低谷 encode 仍爆。
-  -- 三层防御（宽裕→悬崖）:
-  --   1. 字节阈值自动折叠（上方 auto compact）→ 折叠段物理回收，表字节
-  --      真实下降——宽裕期保上下文（先于下方 mem_pressure 触发）；
-  --   2. 窗口超限（ensure_context_budget 80% 硬保护 / 模型 compact_history
-  --      工具）→ 折叠，防 400/超限；
-  --   3. 内存紧张（此处 mem_pressure）→ 物理裁剪（trim_to_bytes 到
-  --      mem_trim_bytes 默认 60KB，悬崖保命——已 OOM 两次，保命优先）。
-  -- 自动折叠后表字节回落到摘要+保留段，mem_pressure 大概率不触发。
-  -- 裁剪后持久化（JSONL 同步缩小，历史可追溯性由 /new 归档承担）。
-  if mem_pressure(config) then
-    print("[mem] 空闲内存紧张，物理裁剪历史（保锚点+最近消息）...")
-    local before = #messages
-    local trim_budget = tonumber(config.mem_trim_bytes) or 60000
-    trim_to_bytes(messages, trim_budget)
-    if persist then
-      if session then rebuild_session_history(session, messages)
-      else rebuild_history(messages) end
-    end
-    print("[mem] 裁剪 " .. (before - #messages) .. " 条")
-  end
+  -- 内存压力强制裁剪（真机第二/三次 OOM 根因修复，见 enforce_memory）:
+  -- free 低谷时 encode 大历史必 OOM，此处 exchange 开头检查一次，
+  -- 工具循环每轮 chat() 前还会复查（第三次 OOM 修复，见下方循环）。
+  enforce_memory(messages, config, persist, session)
 
   -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
   -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
@@ -4644,6 +4756,12 @@ local function process_exchange(messages, config, user_input, persist, session)
     -- 已实时显示；io.write 直写终端会与 TUI 屏幕叠加产生多状态行残留。
     if not UI_INPUT then io.write("Thinking...\n") end
     tool_steps = tool_steps + 1
+    -- 工具循环中途内存复查（真机第三次 OOM 根因修复，gist 3c0c3914）:
+    -- 长探索（多轮 read_file 大结果 append）中途 free 会跌破 400KB 阈值，
+    -- 而 exchange 开头只检查一次——encode 峰值（2-3x 文本）仍在低谷爆。
+    -- 每轮 chat() 前复查，触发即物理裁剪（不执行工具、不回滚本轮，
+    -- 与 exchange 开头路径同语义；mem_pressure 未触发时零开销）。
+    enforce_memory(messages, config, persist, session)
     local response = chat(messages, config)
 
     if response.error then
