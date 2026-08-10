@@ -242,9 +242,31 @@ local function ask_subagent()
       print("子代理配置已写入 " .. cfg_path)
     else
       print("无法写入配置文件: " .. cfg_path)
+      end
+    end
+    -- docs 启动器（用户反馈 "lua docs.lua 命令不可用": docs.lua 曾装
+    -- 在 AGENT_DIR 内且无 PATH 入口——cwd 任意时找不到。v0.3.77:
+    -- docs.lua 本体落 AGENT_DIR 父目录（同 update.lua），此处创建
+    -- /home/bin/docs.lua 启动器 → 任意目录 `docs` 或 `lua docs.lua`
+    -- 均可用。docs 本体由清单下载（relpath=="docs.lua" 特判落父目录），
+    -- 启动器只转发，缺失时提示先 install。）
+    local docs_script = up_dir .. "/docs.lua"
+    local docs_launcher = "/home/bin/docs.lua"
+    local df = io.open(docs_launcher, "w")
+    if df then
+      df:write("-- docs launcher (created by install.lua)\n")
+      df:write("local script = " .. string.format("%q", docs_script) .. "\n")
+      df:write("local fs_mod = require('filesystem')\n")
+      df:write("if not fs_mod.exists(script) then\n")
+      df:write("  print('docs.lua 未安装到 ' .. script)\n")
+      df:write("  print('请先运行: lua install.lua（会下载 docs.lua）')\n")
+      df:write("  return\n")
+      df:write("end\n")
+      df:write("local chunk = assert(loadfile(script))\n")
+      df:write("chunk(...)\n")
+      df:close()
     end
   end
-end
 
 print("OC Agent 安装器")
 print("===============")
@@ -359,6 +381,12 @@ if manifest then
     local dest
     if relpath == "init.lua" then
       dest = AGENT_DIR .. "/agent.lua"  -- 入口改名
+    elseif relpath == "docs.lua" then
+      -- docs.lua 落 AGENT_DIR 父目录（与 update.lua 同层，非 agent/
+      -- 内部）: 用户反馈"lua docs.lua 命令不可用"——装进 agent/ 后
+      -- cwd 任意时找不到，且与 docs 启动器（/home/bin/docs.lua）路径
+      -- 一致。父目录 = AGENT_DIR 去掉尾部 /agent。
+      dest = (AGENT_DIR:match("^(.*)/agent$") or "/home") .. "/docs.lua"
     else
       dest = AGENT_DIR .. "/" .. relpath
     end
@@ -466,7 +494,9 @@ if manifest then
     end
   end
 
-  -- 2) docs 盘识别（只显示状态；安装/卸载由 lua docs.lua install/uninstall）
+  -- 2) docs 盘识别（只显示状态；安装/卸载由 docs 命令——
+  --    v0.3.77: /home/bin/docs.lua 启动器已建，任意目录 `docs install`
+  --    或 `lua docs.lua install` 均可用）
   do
     local docs = scan_docs_installed()
     if #docs > 0 then
@@ -474,7 +504,7 @@ if manifest then
         print("docs 已安装: " .. d.path .. "  (版本 " .. d.version .. ")")
       end
     else
-      print("docs 未安装（如需离线文档:  lua docs.lua install）")
+      print("docs 未安装（如需离线文档:  docs install）")
     end
   end
 
