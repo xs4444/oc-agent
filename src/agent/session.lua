@@ -28,8 +28,13 @@ local history_path = config_mod.history_path
 --   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
 -- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
 -- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
-local MAX_HISTORY = 60
-local MAX_HISTORY_BYTES = 200000  -- ~200KB budget; large tool results trimmed away
+-- 内存自适应缩放（2026-08-10 真机 4MB 升级）: 硬常量按
+-- config_mod.mem_scale（= totalMemory/2MB）缩放。2MB 机器 scale=1
+-- 行为不变；4MB 机器 scale=2: 更多历史进内存表（更多上下文给模型）。
+-- 显式 config（mem_load_budget 等）仍优先——此处仅模块级硬常量。
+local MEM_SCALE = config_mod.mem_scale or 1
+local MAX_HISTORY = math.floor(60 * MEM_SCALE)
+local MAX_HISTORY_BYTES = math.floor(200000 * MEM_SCALE)  -- ~200KB×scale budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 -- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
 -- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。
@@ -472,7 +477,7 @@ local function load_history()
   -- 条数上限（内存表有界）: 超过 MAX_LOAD_HISTORY 条丢更早的——真机
   -- 93.6KB JSONL 全量解析后表 ~300KB（OOM 根因之一）。文件本身
   -- append-only 完整保留（可追溯），只限内存表。
-  local MAX_LOAD_HISTORY = 120
+  local MAX_LOAD_HISTORY = math.floor(120 * MEM_SCALE)
   local function ingest(line)
     local ok2, msg = pcall(json.decode, line)
     if ok2 and type(msg) == "table" and msg.role then

@@ -148,7 +148,7 @@ local mock_computer = {}
 function mock_computer.address() return OC._address end
 function mock_computer.uptime() return OC._uptime end
 function mock_computer.freeMemory() return OC._free_mem end
-function mock_computer.totalMemory() return 1048576 end
+function mock_computer.totalMemory() return 2097152 end  -- 2MB 基准（与 config.lua 内存自适应 scale 一致）
 function mock_computer.energy() return 100 end
 function mock_computer.maxEnergy() return 200 end
 function mock_computer.users() return end
