@@ -185,6 +185,49 @@ local function collect(config, history)
     lines[#lines + 1] = "(empty)"
   end
 
+  -- 运行时诊断段（v0.3.56）: 内存曲线 / 最后一次内存裁剪 / 最后一次
+  -- chat 请求。数据源 init.lua 的 DIAG 表（_G._AGENT_DIAG 全局挂载，
+  -- 与 json 全局同先例）。用途: 对话卡死无反馈时（真机第 7 次现场，
+  -- gist 5ff1d4——[mem] 裁剪后对话中断）报告可见:
+  --   - mem curve: 内存下降路径（哪轮开始跌破阈值）
+  --   - last mem trim: 裁剪事件（触发时间/前后 free/裁剪条数）——
+  --     若 free_after 未回升说明 GC 未释放堆（裁剪无效）
+  --   - last chat: 最后一次请求耗时与错误——elapsed 接近 retry_budget
+  --     （默认 300s）说明端点慢/挂起；error 有值说明编码/请求失败
+  local diag = type(_G._AGENT_DIAG) == "table" and _G._AGENT_DIAG or nil
+  if diag then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "--- Diagnostics ---"
+    if diag.mem_curve and #diag.mem_curve > 0 then
+      local pts = {}
+      for _, p in ipairs(diag.mem_curve) do
+        pts[#pts + 1] = string.format("%.1fs→%d", p.uptime or 0, p.free or 0)
+      end
+      lines[#lines + 1] = "mem curve (uptime→free): " .. table.concat(pts, ", ")
+    else
+      lines[#lines + 1] = "mem curve: (no samples)"
+    end
+    if diag.last_trim then
+      local t = diag.last_trim
+      lines[#lines + 1] = "last mem trim: uptime=" .. string.format("%.1fs", t.uptime or 0)
+        .. " free_before=" .. tostring(t.free_before)
+        .. " removed=" .. tostring(t.removed)
+        .. " free_after=" .. tostring(t.free_after)
+        .. (t.free_after and t.free_before and t.free_after < t.free_before
+          and "  <-- GC 未释放堆（裁剪无效）" or "")
+    else
+      lines[#lines + 1] = "last mem trim: (never)"
+    end
+    if diag.last_chat then
+      local c = diag.last_chat
+      lines[#lines + 1] = "last chat: uptime=" .. string.format("%.1fs", c.uptime or 0)
+        .. " elapsed=" .. string.format("%.1fs", c.elapsed or 0)
+        .. " error=" .. tostring(c.error or "nil")
+    else
+      lines[#lines + 1] = "last chat: (never)"
+    end
+  end
+
   return table.concat(lines, "\n")
 end
 
