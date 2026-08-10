@@ -31,3 +31,6 @@ agent_config.txt
 perf_result.txt
 backup-*.rar
 test_harness/results/
+
+# 测试/运行时归档残留
+*.archive.jsonl
