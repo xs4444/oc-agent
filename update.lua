@@ -94,8 +94,13 @@ local function current_version()
   return install_info and install_info.version or "(未知)"
 end
 
--- 确定目标 ref: 双源检测（GitHub tags API 实时权威，jsDelivr data API
--- 回退——jsDelivr 索引滞后是已知问题），两者都取最新，取较新者
+-- 确定目标 ref: jsDelivr data API 优先（2026-08-10 修复: 原实现先请求
+-- api.github.com，用户网络 GitHub 不可达时 fetch 无超时保护 → 卡死
+-- 无输出；且"检查最新版本"打印在请求之后，卡住时用户什么都看不到。
+-- 现顺序: 先打印进度 → jsDelivr 优先（国内可达）→ 仅当 jsDelivr
+-- 失败时回退 GitHub tags API。jsDelivr data API 索引滞后是已知问题，
+-- 但下载 install.lua/清单本体仍是 jsDelivr CDN（BASE），滞后窗口内
+-- 可能更新到次新 tag——可接受（再跑一次即追平）。
 local function pick_newer(a, b)
   if not a then return b end
   if not b then return a end
@@ -113,9 +118,16 @@ local function pick_newer(a, b)
   return a
 end
 
-local tag_gh = github_tag()
+print("检查最新版本...")
 local tag_js = latest_tag()
-local tag = pick_newer(tag_gh, tag_js)
+print("  jsDelivr 源: " .. tostring(tag_js or "?"))
+local tag = tag_js
+if not tag_js then
+  print("  (jsDelivr 无结果，尝试 GitHub 源...)")
+  local tag_gh = github_tag()
+  print("  GitHub 源: " .. tostring(tag_gh or "?"))
+  tag = tag_gh
+end
 local ref = tag or "master"
 
 print("检查最新版本...")
