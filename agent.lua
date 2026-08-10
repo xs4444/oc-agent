@@ -469,6 +469,12 @@ end
 -- 且该目录可写（/relocate 迁移后写入的引导项），则所有数据路径
 -- （config/history/sessions）切换到目标盘。目标盘不可写（盘被拔/只读）
 -- 时回退原盘——自动容错。
+-- 验证（2026-08-10 ocvm）: ①m01467 首次启动 + config 含 data_dir →
+--   /relocate 显示"当前数据目录: /tmp"切换生效；②独立探针复刻
+--   find_writable_base+probe_data_dir 全部步骤通过（base 探测 → config
+--   读取 → unserialize → 目标可写）。此前"重启后未切换"均为测试驱动
+--   假象（tmux capture-pane 含屏幕历史，"Goodbye!/home #"是旧残留，
+--   lua agent.lua 被旧 TUI 当聊天消息——进程从未真正重启）。
 local function probe_data_dir(base)
   local fs = require("filesystem")
   local f = io.open(base .. "/agent_config.txt", "r")
@@ -1247,7 +1253,6 @@ local BUILTIN = {
   "agent.tools.subagent",
   "agent.tools.question",
   "agent.tools.compact",
-  "agent.tools.disk",
 }
 
 -- Names already loaded by the BUILTIN loop (below). scan_dir skips these
@@ -4136,7 +4141,6 @@ local DEPS = {
   json = json,
   http_post = http_post,
   load_config = load_config,
-  save_config = save_config,
   wait_modem_message = subagent_mod.wait_modem_message,
   subagent_listen_port = SUBAGENT_LISTEN_PORT,
   subagent_reply_port = SUBAGENT_REPLY_PORT,
@@ -4146,10 +4150,6 @@ local DEPS = {
   compact_history = session_mod.compact_history,
   get_context = nil,
   rebuild_current = nil,
-  -- 磁盘管理与数据迁移工具（agent.tools.disk）: session/config 引用。
-  -- rebuild_current 在 process_exchange 里按需刷新（与压缩工具同机制）。
-  session = session_mod,
-  get_writable_base = function() return WRITABLE_BASE end,
 }
 
 -- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
@@ -4554,106 +4554,142 @@ local function handle_command(cmd, config, messages)
     local p = session_mod.current_path()
     local name = p:match("([^/\\]+)%.jsonl$") or "default"
     print(name .. ": " .. #messages .. " messages")
-  elseif command == "/cleanup" then
-    -- 磁盘清理（2026-08-10）: 删旧会话 + 截断超限 history。
-    -- 用法: /cleanup           保留最近 5 个会话（含当前）
-    --       /cleanup 0         只保留当前会话，其余全删
-    --       /cleanup 10        保留最近 10 个会话
-    local keep = 5
-    if parts[2] then
-      local n = tonumber(parts[2])
-      if n and n >= 0 then keep = n
-      else print("Usage: /cleanup [keep N]  (N = 保留最近 N 个会话，默认 5)") return end
-    end
-    -- 1) 清理旧会话文件
-    local deleted, freed = session_mod.cleanup_sessions(keep)
-    print("[cleanup] 删除 " .. deleted .. " 个旧会话，释放 " .. freed .. "B")
-    -- 2) 截断超限 history（文件 > mem_history_max_bytes 时缩到内存表规模；
-    --    与 load_history 启动时同一防护，运行中手动触发）
-    local hp = session_mod.current_path()
-    local hf = io.open(hp, "r")
-    if hf then
-      local hsz = hf:seek("end") or 0
-      hf:close()
-      local ok_c2, cfg2 = pcall(load_config)
-      local max_file2 = tonumber(ok_c2 and cfg2 and cfg2.mem_history_max_bytes) or 256000
-      if hsz > max_file2 then
-        print("[cleanup] history " .. hsz .. "B 超限 " .. max_file2 .. "B，截断到内存表（"
-          .. #messages .. " 条）...")
-        rebuild_history(messages)
+  elseif command == "/relocate" then
+    -- 配置数据存储路径迁移（2026-08-10，引导式）: 把 config/history/
+    -- sessions 迁移到另一块可写盘（OC 数据盘小，写满会导致 OOM——见
+    -- v0.3.53 磁盘防护）。原盘 config 写 data_dir 引导，重启后自动
+    -- 落到新盘；本进程内立即切换 session 路径。
+    -- 用法: /relocate               引导式（列出可写盘 → 输入路径 → 确认）
+    --       /relocate <path>        直接迁移到指定路径
+    local fs_r = require("filesystem")
+    local target = parts[2]
+    local function readline(prompt)
+      io.write(prompt)
+      if UI_INPUT then
+        return UI_INPUT()
       else
-        print("[cleanup] history " .. hsz .. "B（未超限 " .. max_file2 .. "B）")
+        return io.read()
       end
     end
-  elseif command == "/relocate" then
-    -- 迁移数据目录到另一盘（2026-08-10）: /relocate <可写路径>
-    -- 把 config/history/sessions 复制到目标盘，原盘 config 写
-    -- data_dir 引导——重启后自动落到新盘；本进程内立即切换
-    -- session 路径。用法: /relocate /mnt/<短盘符>
-    if not parts[2] then
-      print("Usage: /relocate <path>  (目标盘需可写，如 /mnt/xxxx)")
-      print("  迁移 config/history/sessions 到目标盘并写 data_dir 引导")
-    else
-      local target = parts[2]
-      local fs_r = require("filesystem")
-      -- 校验目标可写（/home 只读环境落到挂载盘）
-      local probe = io.open(target .. "/wprobe.txt", "w")
-      if not probe then
-        print("[relocate] 目标不可写: " .. target)
-      else
-        probe:close()
-        os.remove(target .. "/wprobe.txt")
-        local moved = 0
-        local failed = {}
-        -- 1) config（含 data_dir 引导本身——目标盘也写一份，防原盘 config
-        --    丢失后新盘无引导；data_dir 字段由下方统一写入）
-        local cfg_ok, cfg_cur = pcall(load_config)
-        local cfg_data = cfg_ok and cfg_cur or {}
-        -- 复制当前数据文件（存在才复制）
-        local src_cfg = WRITABLE_BASE .. "/agent_config.txt"
-        local r1 = copy_file_chunked(src_cfg, target .. "/agent_config.txt")
-        if r1 == false then failed[#failed + 1] = "config" end
-        if r1 ~= nil then moved = moved + 1 end
-        local src_hist = session_mod.current_path()
-        if src_hist ~= WRITABLE_BASE .. "/agent_history.txt" then
-          -- /session 切换中: 也复制默认 history（引导加载用）
-          local r0 = copy_file_chunked(WRITABLE_BASE .. "/agent_history.txt",
-            target .. "/agent_history.txt")
-          if r0 == false then failed[#failed + 1] = "default history" end
-          if r0 ~= nil then moved = moved + 1 end
-        end
-        local r2 = copy_file_chunked(src_hist, target .. "/agent_history.txt")
-        if r2 == false then failed[#failed + 1] = "history" end
-        if r2 ~= nil then moved = moved + 1 end
-        -- 3) sessions 目录（复制 *.jsonl；归档 .txt 保留原盘）
-        local ok_dir, d_iter = pcall(fs_r.list, SESSIONS_DIR)
-        if ok_dir and type(d_iter) == "function" then
-          for name in d_iter do
-            if name:sub(-6) == ".jsonl" then
-              local r3 = copy_file_chunked(SESSIONS_DIR .. "/" .. name, target .. "/sessions/" .. name)
-              if r3 == false then failed[#failed + 1] = "session " .. name end
-              if r3 ~= nil then moved = moved + 1 end
+      if not target then
+        -- 引导: 列出可写挂载盘（df.lua 同款组件 API）+ 识别线索
+        --（根目录几个文件名）→ 编号选择或取消。
+        print("[relocate] 当前数据目录: " .. WRITABLE_BASE)
+        print("[relocate] 可写挂载盘:")
+        local ok_m, iter = pcall(fs_r.mounts)
+        local choices = {}
+        if not ok_m or type(iter) ~= "function" then
+          print("[relocate] (无法枚举挂载盘)")
+        else
+          local idx = 0
+          for proxy, path in iter do
+            if path ~= "/" and path ~= WRITABLE_BASE then
+              local probe = io.open(path .. "/wprobe.txt", "w")
+              if probe then
+                probe:close()
+                os.remove(path .. "/wprobe.txt")
+                idx = idx + 1
+                local info = path
+                local ok_l, label = pcall(function() return proxy.getLabel() end)
+                if ok_l and label then info = info .. "  (" .. label .. ")" end
+                local ok_t, total = pcall(function() return proxy.spaceTotal() end)
+                local ok_u, used = pcall(function() return proxy.spaceUsed() end)
+                if ok_t and ok_u and type(total) == "number" and type(used) == "number" then
+                  if total == math.huge then
+                    info = info .. "  free=unlimited"
+                  else
+                    info = info .. "  free=" .. math.floor((total - used) / 1024) .. "KB"
+                  end
+                end
+                -- 识别线索: 该盘根目录前几个文件名
+                local samples = {}
+                local ok_s, s_iter = pcall(fs_r.list, path)
+                if ok_s and type(s_iter) == "function" then
+                  local n = 0
+                  for entry in s_iter do
+                    n = n + 1
+                    if n > 3 then break end
+                    samples[#samples + 1] = tostring(entry)
+                  end
+                end
+                if #samples > 0 then
+                  info = info .. "  files: " .. table.concat(samples, ", ")
+                end
+                print("  " .. idx .. ") " .. info)
+                choices[idx] = path
+              else
+                print("  [只读] " .. path)
+              end
             end
           end
         end
-        -- 4) 原盘 config 写 data_dir 引导
-        cfg_data.data_dir = target
-        local ok_save_dir, err_save = pcall(save_config, cfg_data)
-        if not ok_save_dir then
-          failed[#failed + 1] = "data_dir 引导写入: " .. tostring(err_save)
+        if #choices == 0 then
+          print("[relocate] 没有其他可写盘")
+          return false, config, messages
         end
-        -- 5) 本进程内立即切换 session 路径（重启后由 data_dir 引导自动生效）
-        session_mod.set_paths(target .. "/agent_history.txt")
-        session_mod.set_sessions_dir(target .. "/sessions")
-        print("[relocate] 已迁移 " .. moved .. " 个文件到 " .. target
-          .. "（data_dir 引导已写入原盘 config）")
-        if #failed > 0 then
-          print("[relocate] 部分失败: " .. table.concat(failed, ", "))
+        local sel = readline("选择目标盘编号（回车取消）: ")
+        local n = tonumber(sel or "")
+        if not n or n < 1 or n > #choices then
+          print("[relocate] 已取消")
+          return false, config, messages
         end
-        print("[relocate] 本会话已切换；重启 agent 后 data_dir 引导使全部路径落到新盘")
-        -- 迁移后内存表仍在（历史已复制到新盘文件），无需重载
+        target = choices[n]
+        print("[relocate] 目标盘: " .. target)
+      end
+      -- 校验目标可写
+      local probe = io.open(target .. "/wprobe.txt", "w")
+      if not probe then
+        print("[relocate] 目标不可写: " .. target)
+        print("[relocate] 用 /relocate 引导式查看可用挂载盘")
+        return false, config, messages
+      end
+    probe:close()
+    os.remove(target .. "/wprobe.txt")
+    -- 执行迁移（只复制到新盘+写引导，不删除原盘数据——误选可逆）
+    local moved = 0
+    local failed = {}
+    -- 1) config 复制到目标盘
+    local r1 = copy_file_chunked(WRITABLE_BASE .. "/agent_config.txt", target .. "/agent_config.txt")
+    if r1 == false then failed[#failed + 1] = "config" end
+    if r1 ~= nil then moved = moved + 1 end
+    -- 2) history（当前会话 + 默认路径兜底）
+    local src_hist = session_mod.current_path()
+    local r2 = copy_file_chunked(src_hist, target .. "/agent_history.txt")
+    if r2 == false then failed[#failed + 1] = "history" end
+    if r2 ~= nil then moved = moved + 1 end
+    if src_hist ~= WRITABLE_BASE .. "/agent_history.txt" then
+      local r0 = copy_file_chunked(WRITABLE_BASE .. "/agent_history.txt", target .. "/agent_history.txt")
+      if r0 == false then failed[#failed + 1] = "default history" end
+      if r0 ~= nil then moved = moved + 1 end
+    end
+    -- 3) sessions 目录（复制 *.jsonl；归档 .txt 保留原盘）
+    local ok_dir, d_iter = pcall(fs_r.list, SESSIONS_DIR)
+    if ok_dir and type(d_iter) == "function" then
+      for name in d_iter do
+        if name:sub(-6) == ".jsonl" then
+          local r3 = copy_file_chunked(SESSIONS_DIR .. "/" .. name, target .. "/sessions/" .. name)
+          if r3 == false then failed[#failed + 1] = "session " .. name end
+          if r3 ~= nil then moved = moved + 1 end
+        end
       end
     end
+    -- 4) 原盘 config 写 data_dir 引导（重启后自动落新盘）
+    local cfg_ok, cfg_cur = pcall(load_config)
+    local cfg_data = cfg_ok and cfg_cur or {}
+    cfg_data.data_dir = target
+    local ok_save_dir, err_save = pcall(save_config, cfg_data)
+    if not ok_save_dir then
+      failed[#failed + 1] = "data_dir 引导写入: " .. tostring(err_save)
+    end
+    -- 5) 本进程内立即切换 session 路径
+    session_mod.set_paths(target .. "/agent_history.txt")
+    session_mod.set_sessions_dir(target .. "/sessions")
+    print("[relocate] 已迁移 " .. moved .. " 个文件到 " .. target
+      .. "（data_dir 引导已写入原盘 config）")
+    if #failed > 0 then
+      print("[relocate] 部分失败: " .. table.concat(failed, ", "))
+    end
+    print("[relocate] 本会话已切换；重启 agent 后 data_dir 引导使全部路径落到新盘")
   elseif command == "/version" then
     -- 读取安装时写入的 version.txt（install.lua 生成）
     local vf = io.open(AGENT_DIR .. "/version.txt", "r")
@@ -4735,6 +4771,7 @@ local function handle_command(cmd, config, messages)
     print("  /hist           Show current session name and message count")
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
+    print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
@@ -5485,7 +5522,7 @@ local function main(config, ...)
       end)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
-        "/sessions", "/session", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
+        "/sessions", "/session", "/relocate", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
