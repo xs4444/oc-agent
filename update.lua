@@ -161,7 +161,11 @@ if not code then
   return
 end
 
-local f = io.open("install.lua", "w")
+-- install.lua 落点 = 与 update.lua 同目录（PATH 启动器下 cwd 不固定，
+-- 不能写相对 "install.lua"——2026-08-10 用户实测：update 不在 PATH、
+-- 且 cwd 任意时脚本会装错位置）。
+local script_dir = arg and arg[0] and arg[0]:match("^(.*)[/\\][^/\\]+$") or "."
+local f = io.open(script_dir .. "/install.lua", "w")
 f:write(code)
 f:close()
 print("安装器已更新（" .. #code .. " 字节），开始安装...")
@@ -171,5 +175,6 @@ print("")
 -- （DEST_DIR=实际安装盘的 /agent 上级目录；四盘场景下 install 不会
 -- 重新引导选盘或装错盘。locate_install 未找到时传 nil 走 install
 -- 自身的引导式选盘）
-local chunk = assert(loadfile("install.lua"))
+local install_script = script_dir .. "/install.lua"
+local chunk = assert(loadfile(install_script))
 chunk(INSTALL_DIR ~= "/home/agent" and INSTALL_DIR:match("^(.*)/agent$") or nil, ref)
