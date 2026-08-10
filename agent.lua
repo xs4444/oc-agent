@@ -941,9 +941,23 @@ end
 -- Append-only session log: each line is one JSON-encoded message.
 -- Append per message (O(new) memory) instead of rewriting the whole history
 -- (O(n) each call, O(n^2) cumulative). load_history replays + trims.
+-- 写盘失败警告（真机 2026-08-10 现场: 数据盘满 → io.open("a") 失败原本
+-- 静默——新消息只进内存不进文件，且会话继续积累最终 encode OOM;
+-- json.lua:98 table.concat 是 encode 峰值点）。首次失败打印一次，
+-- disk_warned 防止刷屏。
+local disk_warned = false
+local function warn_disk(label)
+  if disk_warned then return end
+  disk_warned = true
+  print("[disk] 警告: " .. label .. " 写盘失败（数据盘可能已满）——"
+    .. "新消息仅存内存，重启后丢失；请清理磁盘或 /new 归档后重试")
+end
 local function append_history(msg)
   local f = io.open(history_path, "a")
-  if not f then return end
+  if not f then
+    warn_disk("history")
+    return
+  end
   f:write(json.encode(msg), "\n")
   f:close()
 end
@@ -951,33 +965,43 @@ end
 -- Full rewrite of the session log (after compaction / new session / reset).
 local function rebuild_history(messages)
   local f = io.open(history_path, "w")
-  if not f then return end
+  if not f then
+    warn_disk("history")
+    return
+  end
   for _, m in ipairs(messages) do
     f:write(json.encode(m), "\n")
   end
   f:close()
 end
 
+-- 加载 history 到内存表（有界）。流式逐行读取——真机 2026-08-10 OOM
+-- 根因修复: 旧实现 f:read("*a") 一次性读全文件再逐行 decode，峰值 =
+-- 文件全文 + 解析表 + decode 中间态，数据盘满（history 巨大）时 2MB
+-- 内存必爆；且 /debug 的 collect 也走 load_history → gist 提交失败。
+-- 现改为逐行读: 峰值 = 单行 + 有界表（MAX_LOAD_HISTORY 条 + 字节预算），
+-- 与文件总大小解耦。legacy 迁移路径保留全读（旧格式一次性迁移，量小）。
 local function load_history()
   local fs = require("filesystem")
   if not fs.exists(history_path) then return {} end
   local f = io.open(history_path, "r")
   if not f then return {} end
-  local content = f:read("*a")
-  f:close()
-  if content == "" then return {} end
 
-  -- JSON-line format: one message per line, skip corrupt lines.
-  -- Detect it first: the first char is "{" AND the content contains a
-  -- quoted "role" key. A legacy whole-table file never matches (OC's
-  -- serialization writes bare keys like role="user", no quotes), so this
-  -- can't be a false positive — and it prevents a JSON-lines file whose
-  -- first line happens to be a valid Lua expression from being
-  -- mis-migrated by the unserialize path below.
-  local is_json_lines = content:sub(1, 1) == "{" and content:find('"role"', 1, true) ~= nil
+  -- 首行探测格式（原逻辑只依赖 content 首字符 + 引号 role 键）
+  local first_line = f:read("*l")
+  if not first_line then f:close() return {} end
+  local line0 = first_line:gsub("\r$", "")
+  local is_json_lines = line0:sub(1, 1) == "{" and line0:find('"role"', 1, true) ~= nil
 
   if not is_json_lines then
-    -- Legacy format (whole-table serialization): migrate once to JSON-line format.
+    -- Legacy format (whole-table serialization): migrate once to JSON-line
+    -- format. 一次性迁移（旧格式文件通常远小于 JSONL 积累），全读可接受。
+    f:close()
+    local f2 = io.open(history_path, "r")
+    if not f2 then return {} end
+    local content = f2:read("*a")
+    f2:close()
+    if content == "" then return {} end
     local ser = require("serialization")
     local ok, data = pcall(ser.unserialize, content)
     if ok and type(data) == "table" and (data[1] or data.role) then
@@ -985,15 +1009,16 @@ local function load_history()
       rebuild_history(list)  -- migrate
       return trim_history(list)
     end
+    return {}
   end
 
-  -- JSON-line format: one message per line, skip corrupt lines.
+  -- JSON-line format: 流式逐行，跳过损坏行。
   local messages = {}
   -- 条数上限（内存表有界）: 超过 MAX_LOAD_HISTORY 条丢更早的——真机
   -- 93.6KB JSONL 全量解析后表 ~300KB（OOM 根因之一）。文件本身
   -- append-only 完整保留（可追溯），只限内存表。
   local MAX_LOAD_HISTORY = 120
-  for line in content:gmatch("[^\r\n]+") do
+  local function ingest(line)
     local ok2, msg = pcall(json.decode, line)
     if ok2 and type(msg) == "table" and msg.role then
       if #messages == MAX_LOAD_HISTORY then
@@ -1002,11 +1027,38 @@ local function load_history()
       messages[#messages + 1] = msg
     end
   end
+  ingest(line0)
+  for line in f:lines() do
+    ingest(line:gsub("\r$", ""))
+  end
+  f:close()
   -- 字节上限: 解析后表裁剪到 mem_load_budget（可配，默认 100KB）。
   -- 配置经 pcall 读取（真机/测试均安全，缺失/损坏回退默认值）。
   local ok_cfg, cfg = pcall(config_mod.load)
   local load_budget = tonumber(ok_cfg and cfg and cfg.mem_load_budget) or 100000
   trim_to_bytes(messages, load_budget)
+
+  -- 磁盘防护（真机 2026-08-10 现场: 数据盘满 + history 文件巨大）:
+  -- append-only 文件跨会话无限累积（内存表每次只取 ≤120 条/100KB，
+  -- 但文件本身只增不减），盘小（OC 数据盘通常 <1MB）时最终写满——
+  -- 磁盘满又导致 append 静默失败 → 会话内存膨胀 → encode OOM
+  -- （json.lua:98）。修复: 文件超过 mem_history_max_bytes（默认 256KB）
+  -- 时自动 rebuild 截断到内存表规模（早段仅文件里有，内存表本就不
+  -- 加载它们，截断不丢任何已加载内容；可追溯性由 /new 归档承担）。
+  -- 文件大小用标准库 io.open+seek 获取（OpenOS filesystem 库无 size，
+  -- 组件 getSize 需 proxy 解析；标准库最稳，测试环境也可用）。
+  local history_size = 0
+  local hf = io.open(history_path, "r")
+  if hf then
+    history_size = hf:seek("end") or 0
+    hf:close()
+  end
+  local max_file = tonumber(ok_cfg and cfg and cfg.mem_history_max_bytes) or 256000
+  if history_size > max_file then
+    print("[disk] history 文件 " .. history_size .. "B 超过上限 " .. max_file
+      .. "B，自动截断到当前内存表（" .. #messages .. " 条）...")
+    rebuild_history(messages)
+  end
   return trim_history(messages)
 end
 
