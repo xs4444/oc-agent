@@ -7,7 +7,7 @@
 --      wget https://raw.githubusercontent.com/xs4444/oc-agent/master/install.lua install.lua
 --   然后:           lua install.lua
 --   可选参数:       lua install.lua [目录] [ref]
---                   ref 默认 main，可用 <sha> 精确锁版（v2 新增）
+--                   ref 默认 master，可用 <sha> 精确锁版（v2 新增）
 --
 -- 功能:
 --   * 多文件模式（Phase 3b，默认）: 下载 files.json 清单，将 src/agent/
@@ -18,6 +18,12 @@
 --   * 双源 fallback（jsDelivr CDN 优先 + GitHub raw 备用）
 --   * 自动探测可写目录 / 命令行指定目录
 --   * 可选: 写子代理配置文件（subagent = true）
+--   * 四盘场景引导（v0.3.63）:
+--      - 选择 agent 安装盘（无参数时引导式列盘选择，不再自动取首个可写盘）
+--      - 选择 swap 盘（折叠归档/history 数据盘——写 config.data_dir 引导，
+--        agent 首次启动自动把数据落 swap 盘）
+--      - docs 盘识别（扫描各盘 /doc/version.txt，显示已安装状态，
+--        docs.lua 负责实际安装/卸载）
 -- ═══════════════════════════════════════════════════════════════
 
 -- 命令行参数: [1]=目标目录, [2]=Git ref（默认 master，可用 <sha>）
@@ -34,23 +40,154 @@ local EXPECTED_MIN = 60000  -- 回退模式: 单文件 agent.lua 应至少 60KB
 
 local fs = require("filesystem")
 
--- 目标目录: 优先取命令行参数 (lua install.lua /mnt/xxx)，否则自动找可写位置
-if not DEST_DIR or DEST_DIR == "" then
-  local function is_writable(dir)
-    local probe = dir .. "/.writetest"
-    local f = io.open(probe, "w")
-    if f then f:close(); os.remove(probe); return true end
-    return false
+-- 可写探测
+local function is_writable(dir)
+  local probe = dir .. "/.writetest"
+  local f = io.open(probe, "w")
+  if f then f:close(); os.remove(probe); return true end
+  return false
+end
+
+-- 可写挂载盘列表: {path, label, free_kb, writable}（df.lua 同款组件 API）
+local function scan_writable_mounts()
+  local out = {}
+  local ok_m, iter = pcall(fs.mounts)
+  if not ok_m or type(iter) ~= "function" then return out end
+  for proxy, path in iter do
+    if path ~= "/" and is_writable(path) then
+      local label = ""
+      local ok_l, l = pcall(function() return proxy.getLabel() end)
+      if ok_l and l then label = l end
+      local free_kb = 0
+      local ok_t, total = pcall(function() return proxy.spaceTotal() end)
+      local ok_u, used = pcall(function() return proxy.spaceUsed() end)
+      if ok_t and ok_u and type(total) == "number" and type(used) == "number"
+          and total ~= math.huge then
+        free_kb = math.floor((total - used) / 1024)
+      end
+      -- 识别线索: 根目录前几个文件名（区分各盘）
+      local samples = {}
+      local ok_s, s_iter = pcall(fs.list, path)
+      if ok_s and type(s_iter) == "function" then
+        local n = 0
+        for entry in s_iter do
+          n = n + 1
+          if n > 3 then break end
+          samples[#samples + 1] = tostring(entry)
+        end
+      end
+      out[#out + 1] = {path = path, label = label, free_kb = free_kb,
+        samples = samples}
+    end
   end
-  if is_writable("/home") then
-    DEST_DIR = "/home"
-  else
-    for _, mount in fs.mounts() do
-      if mount and mount ~= "/" and is_writable(mount) then
-        DEST_DIR = mount
-        break
+  return out
+end
+
+-- 选择引导（可写盘列表 → 编号选择/取消）。prompt 说明用途；
+-- 返回盘路径或 nil（取消）。
+local function choose_disk(prompt, mounts, skip_path)
+  print("")
+  print(prompt)
+  local shown = {}
+  local idx = 0
+  for _, m in ipairs(mounts) do
+    if m.path ~= skip_path then
+      idx = idx + 1
+      local info = "  " .. idx .. ") " .. m.path
+      if m.label ~= "" then info = info .. "  (" .. m.label .. ")" end
+      if m.free_kb > 0 then info = info .. "  free=" .. m.free_kb .. "KB" end
+      if #m.samples > 0 then info = info .. "  files: " .. table.concat(m.samples, ", ") end
+      print(info)
+      shown[idx] = m.path
+    end
+  end
+  if idx == 0 then
+    print("  (没有可选的盘)")
+    return nil
+  end
+  io.write("输入编号（回车取消）: ")
+  local answer = io.read() or ""
+  local n = tonumber(answer:gsub("%s", ""))
+  if not n or n < 1 or n > #shown then
+    return nil
+  end
+  return shown[n]
+end
+
+-- docs 已安装状态扫描（docs.lua 同款: /mnt/*/doc/version.txt + /doc/version.txt）
+-- 返回 {path=..., version=...} 列表
+local function scan_docs_installed()
+  local found = {}
+  local ok_m, iter = pcall(fs.mounts)
+  if ok_m and type(iter) == "function" then
+    for _, path in iter do
+      if path ~= "/" then
+        local full = path .. "/doc/version.txt"
+        local f = io.open(full, "r")
+        if f then
+          local v = f:read("*a"):gsub("%s", "")
+          f:close()
+          if v ~= "" then found[#found + 1] = {path = path .. "/doc", version = v} end
+        end
       end
     end
+  end
+  local f_root = io.open("/doc/version.txt", "r")
+  if f_root then
+    local v = f_root:read("*a"):gsub("%s", "")
+    f_root:close()
+    if v ~= "" then found[#found + 1] = {path = "/doc", version = v} end
+  end
+  return found
+end
+
+-- 目标目录: 命令行参数优先 (lua install.lua /mnt/xxx)；否则引导式
+-- 列出可写盘让用户选择 agent 安装盘（四盘场景: 不再盲目取首个可写盘）
+local mounts = scan_writable_mounts()
+if not DEST_DIR or DEST_DIR == "" then
+  if #mounts == 0 then
+    if is_writable("/home") then
+      DEST_DIR = "/home"
+    else
+      DEST_DIR = "."
+    end
+  elseif #mounts == 1 and mounts[1].path ~= "/home" then
+    DEST_DIR = mounts[1].path
+    print("检测到唯一可写盘: " .. DEST_DIR)
+  else
+    -- 引导: /home 优先作为默认选项（传统路径），其余盘编号选择
+    print("")
+    print("选择 agent 安装盘:")
+    local idx = 0
+    local shown = {}
+    local home_shown = false
+    if is_writable("/home") then
+      -- /home 在根盘（系统盘）上，可写时单独列为 0 号选项
+      home_shown = true
+      print("  0) /home  (系统盘用户目录)")
+    end
+    for _, m in ipairs(mounts) do
+      idx = idx + 1
+      local info = "  " .. idx .. ") " .. m.path
+      if m.label ~= "" then info = info .. "  (" .. m.label .. ")" end
+      if m.free_kb > 0 then info = info .. "  free=" .. m.free_kb .. "KB" end
+      if #m.samples > 0 then info = info .. "  files: " .. table.concat(m.samples, ", ") end
+      print(info)
+      shown[idx] = m.path
+    end
+    io.write("输入编号（回车 = /home）: ")
+    local answer = io.read() or ""
+    local n = tonumber(answer:gsub("%s", ""))
+    if n and n >= 1 and n <= #shown then
+      DEST_DIR = shown[n]
+    elseif home_shown then
+      DEST_DIR = "/home"
+    elseif #shown > 0 then
+      DEST_DIR = shown[1]
+    else
+      DEST_DIR = "."
+    end
+    print("agent 安装盘: " .. DEST_DIR)
   end
 end
 if not DEST_DIR or DEST_DIR == "" then DEST_DIR = "." end
@@ -259,6 +396,55 @@ if manifest then
   end
 
   ask_subagent()
+
+  -- ── 四盘场景引导（v0.3.63）──────────────────────────
+  -- 1) swap 盘选择: 折叠归档/history/sessions 数据盘。写入 agent_config.txt
+  --    的 data_dir 字段——agent 启动时 probe_data_dir 探测到该字段即把
+  --    数据路径切到 swap 盘（等价于部署后手动 /relocate，安装期一步完成）。
+  do
+    local swap = choose_disk("选择 swap 盘（agent 数据盘: 历史/折叠归档/会话；回车跳过）",
+      mounts, DEST_DIR)
+    if swap then
+      local ser = require("serialization")
+      local cfg_path = DEST_DIR .. "/agent_config.txt"
+      local cfg = {}
+      local cf = io.open(cfg_path, "r")
+      if cf then
+        local ok_c, parsed = pcall(ser.unserialize, cf:read("*a"))
+        cf:close()
+        if ok_c and type(parsed) == "table" then cfg = parsed end
+      end
+      cfg.data_dir = swap
+      -- 无 config 时补默认模型配置（首次运行直接可用）
+      if not cfg.api_key then cfg.api_key = "" end
+      if not cfg.model then cfg.model = "deepseek-v4-flash-free" end
+      if not cfg.api_url then
+        cfg.api_url = "https://opencode.ai/zen/v1/chat/completions"
+      end
+      local f = io.open(cfg_path, "w")
+      if f then
+        f:write(ser.serialize(cfg))
+        f:close()
+        print("swap 盘已配置: " .. swap .. "（data_dir 引导写入 " .. cfg_path .. "）")
+      else
+        print("无法写入配置文件: " .. cfg_path)
+      end
+    else
+      print("未选择 swap 盘（数据将落在安装盘）。部署后可用 /relocate 迁移。")
+    end
+  end
+
+  -- 2) docs 盘识别（只显示状态；安装/卸载由 lua docs.lua install/uninstall）
+  do
+    local docs = scan_docs_installed()
+    if #docs > 0 then
+      for _, d in ipairs(docs) do
+        print("docs 已安装: " .. d.path .. "  (版本 " .. d.version .. ")")
+      end
+    else
+      print("docs 未安装（如需离线文档:  lua docs.lua install）")
+    end
+  end
 
   -- ── PATH 集成: 创建 /home/bin/agent 启动器（OpenOS 默认 PATH 含 /home/bin）──
   local launcher_ok = false
