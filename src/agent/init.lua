@@ -628,15 +628,22 @@ local function handle_command(cmd, config, messages)
     local r1 = copy_file_chunked(WRITABLE_BASE .. "/agent_config.txt", target .. "/agent_config.txt")
     if r1 == false then failed[#failed + 1] = "config" end
     if r1 ~= nil then moved = moved + 1 end
-    -- 2) history（当前会话 + 默认路径兜底）
+    -- 2) history（当前会话 + 默认路径兜底）+ 折叠归档（swap 盘核心数据:
+    -- compact 折叠段 <history>.archive.jsonl 是"分页文件"本体——折叠段
+    -- 原文冷存储于此，迁移必须一并搬走，否则新盘上模型读不回旧消息）
     local src_hist = session_mod.current_path()
-    local r2 = copy_file_chunked(src_hist, target .. "/agent_history.txt")
-    if r2 == false then failed[#failed + 1] = "history" end
-    if r2 ~= nil then moved = moved + 1 end
+    local function copy_hist(src, dst)
+      local r = copy_file_chunked(src, dst)
+      if r == false then failed[#failed + 1] = dst end
+      if r ~= nil then moved = moved + 1 end
+      -- 归档同迁（存在才复制；r==nil 表示源不存在，归档也跳过）
+      local r_a = copy_file_chunked(src .. ".archive.jsonl", dst .. ".archive.jsonl")
+      if r_a == false then failed[#failed + 1] = dst .. ".archive.jsonl" end
+      if r_a ~= nil then moved = moved + 1 end
+    end
+    copy_hist(src_hist, target .. "/agent_history.txt")
     if src_hist ~= WRITABLE_BASE .. "/agent_history.txt" then
-      local r0 = copy_file_chunked(WRITABLE_BASE .. "/agent_history.txt", target .. "/agent_history.txt")
-      if r0 == false then failed[#failed + 1] = "default history" end
-      if r0 ~= nil then moved = moved + 1 end
+      copy_hist(WRITABLE_BASE .. "/agent_history.txt", target .. "/agent_history.txt")
     end
     -- 3) sessions 目录（复制 *.jsonl；归档 .txt 保留原盘）
     local ok_dir, d_iter = pcall(fs_r.list, SESSIONS_DIR)
