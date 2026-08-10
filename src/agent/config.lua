@@ -34,7 +34,33 @@ local function find_writable_base()
 end
 
 -- Top-level side effect (module load time): probe the writable base once.
-local writable_base = find_writable_base()
+-- data_dir 引导（2026-08-10 磁盘迁移功能）: 原盘 config 里若有 data_dir
+-- 且该目录可写（/relocate 迁移后写入的引导项），则所有数据路径
+-- （config/history/sessions）切换到目标盘。目标盘不可写（盘被拔/只读）
+-- 时回退原盘——自动容错。
+local function probe_data_dir(base)
+  local fs = require("filesystem")
+  local f = io.open(base .. "/agent_config.txt", "r")
+  if not f then return base end
+  local content = f:read("*a")
+  f:close()
+  local ser = require("serialization")
+  local ok, d = pcall(ser.unserialize, content)
+  if not ok or type(d) ~= "table" or type(d.data_dir) ~= "string" or d.data_dir == "" then
+    return base
+  end
+  local target = d.data_dir
+  if target == base then return base end
+  local probe = io.open(target .. "/wprobe.txt", "w")
+  if probe then
+    probe:close()
+    os.remove(target .. "/wprobe.txt")
+    print("[relocate] 数据目录由 " .. base .. " 切换到 " .. target .. "（config.data_dir）")
+    return target
+  end
+  return base
+end
+local writable_base = probe_data_dir(find_writable_base())
 local config_path = writable_base .. "/agent_config.txt"
 local history_path = writable_base .. "/agent_history.txt"
 local sessions_dir = writable_base .. "/sessions"

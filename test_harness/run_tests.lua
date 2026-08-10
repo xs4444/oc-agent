@@ -637,6 +637,7 @@ local EXPECTED_TOOLS = {
   "component_list", "component_doc", "component_invoke",
   "web_search", "shell_execute", "subagent_call", "ask_user",
   "compact_history", "search_files", "glob",
+  "list_storage", "cleanup_disk", "relocate_data",
 }
 local tools_have = {}
 for _, t in ipairs(agent_test.TOOLS) do
