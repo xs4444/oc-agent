@@ -139,6 +139,23 @@ print("  当前版本: " .. cur)
 print("  安装位置: " .. INSTALL_DIR)
 print("  最新版本: " .. tostring(latest or "?"))
 
+-- 反向更新守卫（2026-08-10 用户实测: jsDelivr data API 索引滞后返回
+-- 0.3.66，把已装 v0.3.69（T2002）降级到 T1733——update 无版本比较就
+-- 执行）。latest 与 cur 均为 files.json 的 version（ISO 时间戳
+-- YYYY-MM-DDTHHMM，字典序 = 时间序），直接字符串比较即可。
+-- 触发时中止并提示手动 ref（自动检测不可信——GitHub 不可达 + data
+-- API 滞后，唯一可靠路径是 lua update.lua <ref>）。
+if latest and latest ~= "?" and cur and cur ~= "(未知)" and cur ~= "?" then
+  if latest < cur then
+    print("")
+    print("  ⚠️  检测到的版本 " .. latest .. " 不新于当前 " .. cur)
+    print("  （jsDelivr 索引滞后——自动检测不可信）")
+    print("  已中止，避免反向更新。请手动指定版本:")
+    print("  lua update.lua <ref>   例如: lua update.lua v0.3.70")
+    return
+  end
+end
+
 if latest and latest ~= "?" and cur == latest then
   print("已是最新版本，无需更新。")
   return
