@@ -730,6 +730,36 @@ local function handle_command(cmd, config, messages)
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
+  elseif command == "/preset-200k" then
+    -- 一键 200K 上下文配置（2026-08-10 用户需求）: context_window=200000。
+    -- 字节预算（byte_budget/mem_prefold_bytes/mem_load_budget）已按内存
+    -- scale² 自动放大（4MB→800KB，可承载 ~200K tokens 中文），无需
+    -- 改动——本命令只写窗口并校验硬件是否匹配。2MB 平台警告但照设
+    -- （窗口是模型属性，与硬件无关；只是历史装不满会被折叠浪费）。
+    local ok_c, comp = pcall(require, "computer")
+    local total = 0
+    if ok_c and type(comp) == "table" and comp.totalMemory then
+      local ok_t, t = pcall(comp.totalMemory)
+      if ok_t and type(t) == "number" then total = t end
+    end
+    local cfg_ok, cfg_p = pcall(load_config)
+    local cfg_d = cfg_ok and cfg_p or {}
+    cfg_d.context_window = 200000
+    local ok_s, err_s = pcall(save_config, cfg_d)
+    if not ok_s then
+      print("[preset-200k] 写入失败: " .. tostring(err_s))
+    else
+      print("[preset-200k] context_window=200000 已写入 config")
+      if total > 0 and total < 4194304 then
+        print("[preset-200k] ⚠️ 当前内存 " .. math.floor(total / 1048576)
+          .. "MB < 4MB——字节预算约 " .. math.floor(200000 / 3.5 / 1000)
+          .. "K tokens（中文），窗口喂不满会被折叠浪费；建议装 4MB 内存条")
+      else
+        print("[preset-200k] 内存充足（4MB+）：字节预算已按 scale² 放大，"
+          .. "可承载 ~200K tokens 中文 ✓")
+      end
+      print("[preset-200k] 重启 agent 后生效（当前进程仍用旧窗口）")
+    end
   elseif command == "/ctx" then
     cmd_ctx(config, messages)
   elseif command == "/ml" then
@@ -755,6 +785,7 @@ local function handle_command(cmd, config, messages)
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
+    print("  /preset-200k    One-shot: set context_window=200000 (+ memory check)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
@@ -1586,7 +1617,7 @@ local function main(config, ...)
       end)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
-        "/sessions", "/session", "/relocate", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
+        "/sessions", "/session", "/relocate", "/preset-200k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
