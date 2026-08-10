@@ -17,7 +17,7 @@ GTNH 专属内容从 [GTNH Miraheze Wiki](https://gtnh.miraheze.org/wiki/Main_Pa
 
 ## GTNH fork 补全说明
 
-原 vanilla ocdoc.cil.li 镜像缺失以下 GTNH fork 内容，已从 `../repos/OpenComputers/src/main/` 源码补全：
+原 vanilla ocdoc.cil.li 镜像缺失以下 GTNH fork 内容，已从 `../repos/opencomputers/src/main/` 源码补全：
 
 **新增组件页（10）**：`configurator`（EnderIO 导管配置，15 方法）、`tps_card`（GTNH fork，14 方法）、`arcane_crafting`（Thaumcraft，3 方法）、`relay`（4 方法）、`upgrade_me`（AE2，37 方法）、`serial_port`（TIS-3D，3 方法）、`beekeeper`（Forestry，8 方法）、`barcode_reader`（被动）、`keyboard`（信号式）、`redstone_in_motion` 已标注 fork 未集成
 
@@ -83,7 +83,7 @@ python scripts/doku2md.py
 
 ## 注意
 
-- 文档对应**原版 OC**；GTNH fork 实装以 `../opencomputers/` 源码为准
+- 文档对应**原版 OC**；GTNH fork 实装以 `../repos/opencomputers/` 源码为准
 - `markdown/gtnh/` 下的页面来自 GTNH wiki + 源码分析，反映 GTNH 整合包特有的行为与配置
 - `crossmod_integration.md` 的 API 方法表从源码 `@Callback` 注解直接提取，确保准确
 - 页面会更新，如需最新版重新抓取 raw/ 或 GTNH wiki dump
