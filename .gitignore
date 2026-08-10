@@ -4,11 +4,9 @@ __pycache__/
 *.egg-info/
 
 # 大型/二进制目录（模拟器、便携环境、模组数据）
-emulators/
-pi/
-pi-subagents/
-opencomputers/
-oc-ai/
+# 参考库统一位于 repos/（2026-08-10 迁移）: repos/emulators repos/pi
+# repos/pi-subagents repos/opencomputers repos/oc-ai repos/deepseek-reasonix
+repos/
 lua_portable/
 
 # 临时输出与杂项
@@ -32,5 +30,4 @@ test_harness/perf_result.txt
 agent_config.txt
 perf_result.txt
 backup-*.rar
-repos/
 test_harness/results/

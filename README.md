@@ -120,10 +120,6 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── reasoning_e2e_test.lua  # reasoning_content 传回真机 e2e（工具链无 400）
 │   ├── test_docs_interact.lua  # docs.lua 交互引导全流程（安装/卸载/状态）
 │   └── ...                # 子代理/能力边界/内存/搜索/文件工具测试
-├── emulators/             # 第三方 OC 模拟器 → emulators/README.md
-│   ├── OCEmu/             # 真实 OC machine.lua 沙箱（Lua 5.2）
-│   ├── ocvm/              # C++ 模拟器（Linux，含修复）
-│   └── OpenComputersVM/   # JavaFX 模拟器（Windows GUI）
 ├── wiki/                  # OC wiki 离线镜像 → wiki/README.md
 │   ├── raw/               # DokuWiki 原始文本（215 页）
 │   ├── markdown/          # Markdown 转换版（40+ 页，含 GTNH 指南）
@@ -140,11 +136,16 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 │   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
 │   └── build_single.lua / make_manifest.lua
 ├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）→ lua_portable/README.md
-├── repos/                 # 外部源码研究（gitignored）
-├── opencomputers/         # GTNH OpenComputers fork 源码（参考）
-├── oc-ai/                 # DonChong2000/oc-ai 源码（参考）
-├── pi/                    # pi.dev agent 源码（架构参考）
-└── pi-subagents/          # nicobailon/pi-subagents 源码（子代理参考）
+├── repos/                 # 外部参考库（gitignored，2026-08-10 统一迁移于此）
+│   ├── emulators/         # 第三方 OC 模拟器 → repos/emulators/README.md
+│   │   ├── OCEmu/         # 真实 OC machine.lua 沙箱（Lua 5.2）
+│   │   ├── ocvm/          # C++ 模拟器（Linux，含修复）
+│   │   └── OpenComputersVM/  # JavaFX 模拟器（Windows GUI）
+│   ├── opencomputers/     # GTNH OpenComputers fork 源码（参考）
+│   ├── oc-ai/             # DonChong2000/oc-ai 源码（参考）
+│   ├── pi/                # pi.dev agent 源码（架构参考）
+│   ├── pi-subagents/      # nicobailon/pi-subagents 源码（子代理参考）
+│   └── deepseek-reasonix/ # deepseek-reasonix 源码（推理/编码参考）
 ```
 
 ## 测试环境（内网 Ubuntu 测试服务器）
