@@ -196,12 +196,15 @@ local function chat(messages, config, opts)
   -- 防御：encode 失败返回 error（调用方走错误分支），进程不退出。
   -- 第 8 次 OOM（gist 852193，v0.3.55 现场，encode 再次爆）加固:
   --   1. 无条件 collectgarbage——enforce_memory 只在 free < 400KB 时
-  --      才 GC，free 450KB 而 encode 峰值（table.concat ≈2-3x 请求体）
-  --      瞬间击穿 2MB 时不触发。encode 前 GC 让 Lua 堆回最低点，
-  --      成本毫秒级（2MB 堆增量 GC），无副作用。
+  --      才 GC，free 450KB 而 encode 峰值瞬间击穿 2MB 时不触发。
+  --      encode 前 GC 让 Lua 堆回最低点，成本毫秒级，无副作用。
   --   2. 体积估算 vs 剩余内存——超标返回明确错误（引导压缩），
   --      而非等到 pcall 捕获 OOM（后者报错信息与现场脱节）。
-  -- 注: 摘要请求（opts.skip_tools）同样受益，无需特判。
+  -- 峰值系数: json.lua 分片优化后 encode 峰值 ≈1.2x 文本（注释实证:
+  -- 55K tokens≈190KB → 峰值 ~230KB；无转义字符串零复制、片段引用进
+  -- out 表、最终一次 concat）。守卫用 1.5x（实测 + 20% 余量）——
+  -- 曾误用 3x（旧 json 时代的数字）导致合法请求被误拒（200KB 请求体
+  -- + 600KB free 时 3x 超阈值但实际 240KB 峰值完全可行）。
   pcall(collectgarbage, "collect")
   do
     local ok_c2, computer2 = pcall(require, "computer")
@@ -212,9 +215,9 @@ local function chat(messages, config, opts)
         if type(m.content) == "string" then est = est + #m.content end
         if type(m.tool_calls) == "table" then est = est + 256 * #m.tool_calls end
       end
-      if ok_f2 and type(free2) == "number" and est * 3 > free2 * 0.85 then
+      if ok_f2 and type(free2) == "number" and est * 1.5 > free2 * 0.85 then
         return { error = "请求编码失败 (内存不足): 请求体估算 " .. est
-          .. "B（encode 峰值 ≈3x）超出可用 " .. free2
+          .. "B（encode 峰值 ≈1.5x）超出可用 " .. free2
           .. "B。请先压缩历史（compact_history 工具或 /compact）释放内存后重试" }
       end
     end
