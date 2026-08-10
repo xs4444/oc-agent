@@ -492,8 +492,12 @@ if manifest then
       -- 下载 update.lua 本体到 AGENT_DIR 父目录（与 agent/ 同盘，供
       -- 启动器引用；复用 install 自身的 fetch() 双源 fallback——
       -- 2026-08-10 用户实测: 裸 internet 全局是 nil（install 的
-      -- fetch 内部才 require），且 pcall 解包逻辑错误，498 行崩）
-      if not fs.exists(up_script) then
+      -- fetch 内部才 require），且 pcall 解包逻辑错误，498 行崩）。
+      -- **总是覆盖**（2026-08-10 修复: 曾 `if not fs.exists` 只在缺失时
+      -- 下载——用户已有旧版 GitHub-first update.lua 时永不更新，
+      -- update 命令一直卡死。install 是更新入口，每次必须把 update.lua
+      -- 同步到最新。）
+      do
         local f_up = io.open(up_script, "w")
         if f_up then
           local got = false
@@ -512,7 +516,7 @@ if manifest then
             os.remove(up_script)
             print("[update] update.lua 下载失败——请网络可用后重跑 install，或手动 wget")
           else
-            print("[update] update.lua 已安装: " .. up_script)
+            print("[update] update.lua 已同步: " .. up_script)
           end
         else
           print("[update] 无法写入 " .. up_script)
