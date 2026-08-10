@@ -502,6 +502,24 @@ local config_path = writable_base .. "/agent_config.txt"
 local history_path = writable_base .. "/agent_history.txt"
 local sessions_dir = writable_base .. "/sessions"
 
+-- 内存自适应缩放（2026-08-10，真机升级 4MB 后）: 全部内存类默认阈值
+-- 按 totalMemory/2MB 缩放（2MB 基准调校值 × scale）——4MB 机器
+-- scale=2: 阈值翻倍（更大历史/更大响应体/更晚折叠），2MB 机器
+-- scale=1 行为不变；同一 agent.lua 免改配置。显式配置优先
+--（load() 中 `if not data.X` 只在缺省时填缩放值）。
+-- 探测失败（精简/测试环境无 totalMemory）→ scale=1 安全回退。
+local function detect_mem_scale()
+  local ok_c, computer = pcall(require, "computer")
+  if ok_c and computer and computer.totalMemory then
+    local ok_t, total = pcall(computer.totalMemory)
+    if ok_t and type(total) == "number" and total > 0 then
+      return total / 2097152
+    end
+  end
+  return 1
+end
+local MEM_SCALE = detect_mem_scale()
+
 local function load()
   local fs = require("filesystem")
   if not fs.exists(config_path) then return nil end
@@ -517,23 +535,32 @@ local function load()
     -- 运行时自动显示上下文（每次响应后一行 [ctx]），可设 false 关闭
     if data.ctx_auto == nil then data.ctx_auto = true end
     -- 内存压力压缩阈值（字节）: freeMemory() 低于此值即强制折叠早期消息
-    -- （真机 OOM→error 根因修复；默认 400KB——OC 1.4MB 内存下 encode
-    -- 峰值 137-230KB，真机低谷 278KB 时 encode 必超限）
-    if not data.mem_compact_threshold then data.mem_compact_threshold = 400000 end
+    -- （真机 OOM→error 根因修复；默认 400KB×scale——OC 1.4MB 内存下
+    -- encode 峰值 137-230KB，真机低谷 278KB 时 encode 必超限；4MB
+    -- 机器 800KB，内存充裕时更晚触发）
+    if not data.mem_compact_threshold then
+      data.mem_compact_threshold = math.floor(400000 * MEM_SCALE)
+    end
     -- 内存压力物理裁剪阈值（字节）: mem_pressure 触发时历史表裁剪到该值
-    -- 以下（真机第二次 OOM 修复——折叠只缩请求体不释放内存；默认 60KB，
-    -- 裁剪后 encode 峰值大幅下降，缓存前缀 miss 一次保命）
-    if not data.mem_trim_bytes then data.mem_trim_bytes = 60000 end
+    -- 以下（真机第二次 OOM 修复——折叠只缩请求体不释放内存；默认
+    -- 60KB×scale，裁剪后 encode 峰值大幅下降，缓存前缀 miss 一次保命）
+    if not data.mem_trim_bytes then
+      data.mem_trim_bytes = math.floor(60000 * MEM_SCALE)
+    end
     -- 历史加载内存上限（字节）: load_history 解析后表裁剪到该值以下
-    -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 100KB 内存表，
+    -- （93.6KB JSONL 全量加载 → 表 ~300KB；默认 100KB×scale 内存表，
     -- JSONL 文件 append-only 完整保留，只限内存表）
-    if not data.mem_load_budget then data.mem_load_budget = 100000 end
+    if not data.mem_load_budget then
+      data.mem_load_budget = math.floor(100000 * MEM_SCALE)
+    end
     -- 传统自动压缩字节阈值（mem_prefold_bytes）: 表字节超此值即系统自动
     -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
-    -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 100KB，先于
-    -- mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节
-    -- 真实下降（默认 100KB < byte_budget 150KB → 自动折叠先于裁剪）。
-    if not data.mem_prefold_bytes then data.mem_prefold_bytes = 100000 end
+    -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 100KB×scale，
+    -- 先于 mem_pressure 裁剪触发（宽裕期保上下文）；折叠段物理回收后表
+    -- 字节真实下降（默认 < byte_budget 150KB×scale → 自动折叠先于裁剪）。
+    if not data.mem_prefold_bytes then
+      data.mem_prefold_bytes = math.floor(100000 * MEM_SCALE)
+    end
     -- 摘要请求专用输出预算（summary_max_tokens）: deepseek 强思考模型下
     -- opencode 的 4096 不够——reasoning 先吃大部分输出预算，可见摘要
     -- content 被挤掉 → 摘要残缺 → 上下文没压住 → 重复压缩。默认 16384。
@@ -554,9 +581,12 @@ local function load()
     -- 单次请求响应体累积上限（字节）: 结构性内存护栏——OOM 无法预测
     -- （单次响应峰值不可知），硬上限保证任何单次峰值都落在安全线内。
     -- max_tokens 8192 的 reasoning 响应 JSON 可能 100KB+，decode 峰值
-    -- 2-3x 单次就爆（真机 2MB 内存）；默认 131072（128KB）——合法响应
-    -- ≈60KB 足够容纳且防爆。超限返回明确 error（不静默截断）。
-    if not data.response_body_limit then data.response_body_limit = 131072 end
+    -- 2-3x 单次就爆（真机 2MB 内存）；默认 131072×scale（2MB=128KB，
+    -- 4MB=256KB）——合法响应 ≈60KB 足够容纳且防爆。超限返回明确 error
+    -- （不静默截断）。
+    if not data.response_body_limit then
+      data.response_body_limit = math.floor(131072 * MEM_SCALE)
+    end
     return data
   end
   return nil
@@ -595,6 +625,9 @@ return {
   config_path = config_path,
   history_path = history_path,
   sessions_dir = sessions_dir,
+  -- 内存自适应缩放系数（totalMemory/2MB）: session.lua/init.lua 硬常量
+  -- 同步缩放（MAX_HISTORY/MAX_HISTORY_BYTES/MAX_LOAD_HISTORY 等）
+  mem_scale = MEM_SCALE,
 }
 end
 
@@ -630,8 +663,13 @@ local history_path = config_mod.history_path
 --   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
 -- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
 -- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
-local MAX_HISTORY = 60
-local MAX_HISTORY_BYTES = 200000  -- ~200KB budget; large tool results trimmed away
+-- 内存自适应缩放（2026-08-10 真机 4MB 升级）: 硬常量按
+-- config_mod.mem_scale（= totalMemory/2MB）缩放。2MB 机器 scale=1
+-- 行为不变；4MB 机器 scale=2: 更多历史进内存表（更多上下文给模型）。
+-- 显式 config（mem_load_budget 等）仍优先——此处仅模块级硬常量。
+local MEM_SCALE = config_mod.mem_scale or 1
+local MAX_HISTORY = math.floor(60 * MEM_SCALE)
+local MAX_HISTORY_BYTES = math.floor(200000 * MEM_SCALE)  -- ~200KB×scale budget; large tool results trimmed away
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 -- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
 -- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。
@@ -1074,7 +1112,7 @@ local function load_history()
   -- 条数上限（内存表有界）: 超过 MAX_LOAD_HISTORY 条丢更早的——真机
   -- 93.6KB JSONL 全量解析后表 ~300KB（OOM 根因之一）。文件本身
   -- append-only 完整保留（可追溯），只限内存表。
-  local MAX_LOAD_HISTORY = 120
+  local MAX_LOAD_HISTORY = math.floor(120 * MEM_SCALE)
   local function ingest(line)
     local ok2, msg = pcall(json.decode, line)
     if ok2 and type(msg) == "table" and msg.role then
@@ -4964,9 +5002,9 @@ local function ensure_context_budget(messages, config, persist, session)
   -- token 估算通过不代表 encode 不 OOM：json.encode 峰值 ≈ 2-3x 文本字节
   -- （结果 + parts 数组 + 输入）。真机实证：ctx 43%（55K tokens≈190KB 文本）
   -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
-  -- 独立字节预算（config.byte_budget 可调，默认 150KB），作为自动折叠
-  -- （mem_prefold_bytes 100KB）之后的最终兜底：超限直接裁剪早期消息
-  -- （保留 head 锚点 + 最近 5 条）。
+  -- 独立字节预算（config.byte_budget 可调，默认 150KB×scale——4MB 机器
+  -- 300KB），作为自动折叠（mem_prefold_bytes）之后的最终兜底：超限直接
+  -- 裁剪早期消息（保留 head 锚点 + 最近 5 条）。
   local byte_est = 0
   for _, m in ipairs(messages) do
     if not m.folded then
@@ -4974,7 +5012,8 @@ local function ensure_context_budget(messages, config, persist, session)
           + #(m.tool_calls and tostring(m.tool_calls) or "")
     end
   end
-  local BYTE_BUDGET = tonumber(config.byte_budget) or 150000
+  local MEM_SCALE_I = (require("agent.config")).mem_scale or 1
+  local BYTE_BUDGET = tonumber(config.byte_budget) or math.floor(150000 * MEM_SCALE_I)
   if byte_est > BYTE_BUDGET then
     print("上下文 " .. fmt_num(byte_est) .. " 字节超内存预算 " .. fmt_num(BYTE_BUDGET) .. "，裁剪早期消息...")
     local guard = 0
