@@ -450,7 +450,11 @@ if manifest then
     end
   end
 
-  -- ── PATH 集成: 创建 /home/bin/agent 启动器（OpenOS 默认 PATH 含 /home/bin）──
+  -- ── PATH 集成: 创建 /home/bin/agent + update 启动器（OpenOS 默认
+  -- PATH 含 /home/bin）──
+  -- update 启动器同样注册: 否则用户只能 lua update.lua（update.lua
+  -- 需从 GitHub 下载到当前目录——install 后直接敲 update 找不到命令，
+  -- 2026-08-10 用户实测反馈）。启动器自下载/复用同名脚本。
   local launcher_ok = false
   local launcher_path = "/home/bin/agent.lua"
   do
@@ -468,6 +472,44 @@ if manifest then
       lf:close()
       launcher_ok = true
     end
+    -- update 启动器（更新脚本本体由安装流程下载到 AGENT_DIR 父目录）
+    local up_dir = AGENT_DIR:match("^(.*)/agent$") or "/home"
+    local up_script = up_dir .. "/update.lua"
+    local up_launcher = "/home/bin/update.lua"
+    local uf = io.open(up_launcher, "w")
+    if uf then
+      uf:write("-- update launcher (created by install.lua)\n")
+      uf:write("local script = " .. string.format("%q", up_script) .. "\n")
+      uf:write("local fs_mod = require('filesystem')\n")
+      uf:write("if not fs_mod.exists(script) then\n")
+      uf:write("  print('update.lua 未安装到 ' .. script)\n")
+      uf:write("  print('请先运行: lua install.lua（会下载 update.lua）')\n")
+      uf:write("  return\n")
+      uf:write("end\n")
+      uf:write("local chunk = assert(loadfile(script))\n")
+      uf:write("chunk(...)\n")
+      uf:close()
+      -- 下载 update.lua 本体到 AGENT_DIR 父目录（与 agent/ 同盘，供
+      -- 启动器引用；用与 install 自身相同的双源 fallback）
+      if not fs.exists(up_script) then
+        local f_up = io.open(up_script, "w")
+        if f_up then
+          for _, base in ipairs(SOURCES) do
+            local handle = pcall(internet.request, base .. "/update.lua")
+            local ok_h, h = handle
+            if ok_h and h then
+              local ok_w = true
+              for chunk_data in h do
+                if not f_up:write(chunk_data) then ok_w = false break end
+              end
+              h:close()
+              if ok_w then break end
+            end
+          end
+          f_up:close()
+        end
+      end
+    end
   end
 
   print("")
@@ -482,7 +524,8 @@ if manifest then
     print("  ⚠️  无法写入 " .. launcher_path .. "（PATH 启动器创建失败）")
     print("     可手动: lua " .. AGENT_DIR .. "/agent.lua")
   end
-  print("  更新方式:  lua update.lua")
+  print("  更新方式:  update           -- 任意目录直接运行（PATH 集成）")
+  print("             或 lua update.lua")
 else
   -- ── 回退模式 (v1 单文件流程，完全兼容) ─────────────────
   print("")
