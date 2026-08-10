@@ -644,6 +644,40 @@ function tui.readInput()
         state.completionCycle = nil
         pcall(tui.drawInput)
       end
+    elseif ev == "touch" or ev == "drag" then
+      -- 指针定位（v0.3.68 新增，OpenOS 终端同款——真机 4 盘场景用户
+      -- 需求"捕获指针操作复制粘贴"）: screen 组件发 touch/drag
+      -- (x, y, button, player)。点击输入行 → 把输入光标定位到点击列
+      -- （按显示宽度换算：中文占 2 列）；点击消息区/状态栏 → 不打断
+      -- 编辑（拖选复制是客户端功能，机器侧静默——此前 touch 事件落入
+      -- 循环底部未匹配分支被丢弃，点击完全无反应）。
+      local tx, ty = char, code
+      if type(tx) == "number" and type(ty) == "number" then
+        local inputY = state.height - (state.scrollSafe and 1 or 0)
+        if ty == inputY then
+          -- 输入行: 按列换算字符索引（第 1 列是边框，prompt 从 4/5 列起）
+          local line_start = lastLineStart(state.inputBuffer)
+          local multiline = line_start > 0
+          local inputStart = multiline and 5 or 4
+          local rel = tx - inputStart
+          if rel < 0 then rel = 0 end
+          -- 遍历显示文本找 rel 列对应字符索引（逐字符累积显示宽度）
+          local displayText = multiline and usub(state.inputBuffer, line_start + 1)
+            or state.inputBuffer
+          local idx = 0
+          local w = 0
+          while idx < ulen(displayText) do
+            local ch = usub(displayText, idx + 1, idx + 1)
+            local cw = ulen(ch) == 2 and 2 or 1
+            if w + cw > rel then break end
+            w = w + cw
+            idx = idx + 1
+          end
+          state.inputCursor = line_start + idx
+          state.completionCycle = nil
+          pcall(tui.drawInput)
+        end
+      end
     elseif ev == "scroll" then
       -- 鼠标滚轮: char == 1 上滚 3 行, -1 下滚 3 行（oc-ai 同）
       if char == 1 then
