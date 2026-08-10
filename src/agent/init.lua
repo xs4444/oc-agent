@@ -1640,6 +1640,19 @@ local function main(config, ...)
             parts[#parts + 1] = string.format("cache %.0f%%", hit / (hit + miss) * 100)
           end
         end
+        -- 内存显示（2026-08-10 用户需求: 状态栏要 mem）: free/total MB。
+        -- pcall 全防御——组件不可用/调用失败时静默跳过（与 ctx/cache
+        -- 同款容错；真机 4MB 平台显示 "mem 2.3/4.0M"）。
+        local ok_c, comp = pcall(require, "computer")
+        if ok_c and type(comp) == "table" then
+          local ok_f, free = pcall(comp.freeMemory)
+          local ok_t, total = pcall(comp.totalMemory)
+          if ok_f and type(free) == "number" and ok_t and type(total) == "number"
+              and total > 0 then
+            parts[#parts + 1] = string.format("mem %.1f/%.1fM",
+              free / 1048576, total / 1048576)
+          end
+        end
         parts[#parts + 1] = config.model
         return table.concat(parts, "  ")
       end)
