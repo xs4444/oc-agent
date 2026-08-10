@@ -885,13 +885,35 @@ local function expand_keep_markers(summary, transcript_parts)
   end))
 end
 
--- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——摘要
+-- 折叠段归档（2026-08-10 硬盘利用）: compact_history 物理删除折叠段前，
+-- 先 append 到 <history_path>.archive.jsonl（磁盘冷存储，内存零成本）。
+-- 用途: ①可追溯——被折叠的原文永久保留，模型需要旧消息时可 read_file
+-- 读归档（JSONL 逐行，grep 定位）；②修正旧注释"JSONL append-only 完整
+-- 保留"的谎言——compact 后调用方 rebuild_history 用内存表重写文件，
+-- 折叠段从主文件消失，此前是彻底丢失。
+-- 限制: 磁盘满时静默跳过（compact 主流程不受影响，内存优先）；归档只
+-- 增不减，超限由 /relocate 换盘或手动清理承担（用户明确"尽可能利用
+-- 硬盘"）。
+local function archive_folded(messages)
+  if not messages or #messages == 0 then return end
+  local f = io.open(history_path .. ".archive.jsonl", "a")
+  if not f then return end
+  for _, m in ipairs(messages) do
+    local ok_w, werr = pcall(f.write, f, json.encode(m), "\n")
+    if not ok_w then break end
+  end
+  f:close()
+end
+-- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——
 -- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
 -- 承载旧消息内容；折叠段不进请求体、对缓存无贡献，留在内存表纯占内存
 -- （真机第二次 OOM 根因: 折叠不释放内存，93.6KB JSONL → 表 ~300KB
--- 驻留）。删除仅释放内存；JSONL append-only 完整保留可追溯。旧摘要
--- 消息被新摘要取代（锚定更新语义不变）。请求构造/估算的 folded 分支
--- 逻辑保留（无害兼容——折叠段已不存在，未来也不会再产生）。
+-- 驻留）。删除仅释放内存；**原文由 archive_folded 归档到
+-- history.archive.jsonl（磁盘冷存储）承担可追溯**（旧注释称"JSONL
+-- append-only 完整保留"与实际不符——compact 后 rebuild_history 用内存
+-- 表重写主文件，折叠段会从主文件消失）。旧摘要消息被新摘要取代（锚定
+-- 更新语义不变）。请求构造/估算的 folded 分支逻辑保留（无害兼容——
+-- 折叠段已不存在，未来也不会再产生）。
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
   local keep = COMPACT_KEEP
@@ -939,6 +961,9 @@ local function compact_history(messages, config)
   while first_keep > 1 and messages[first_keep].role == "tool" do
     first_keep = first_keep - 1
   end
+  -- 折叠段归档到磁盘（先于物理删除; old 含旧摘要以外的全部折叠消息。
+  -- 磁盘满静默跳过——内存优先，compact 主流程不受影响）
+  archive_folded(old)
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
   for i = first_keep, #messages do
     result[#result + 1] = messages[i]
@@ -1537,7 +1562,7 @@ local function build_system_prompt()
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
-    .. "- compact_history: Compress old conversation messages into an LLM summary (recent messages stay verbatim). Call it when your runtime status shows context usage at 60% or more of the model window, or when the history holds many stale tool results. Key tool outputs and errors are preserved in the summary.\n\n"
+    .. "- compact_history: Compress old conversation messages into an LLM summary (recent messages stay verbatim). Call it when your runtime status shows context usage at 60% or more of the model window, or when the history holds many stale tool results. Key tool outputs and errors are preserved in the summary. Folded messages are archived verbatim to the history file's sibling `*.archive.jsonl` (JSONL, one message per line) — if you later need a detail that the summary lost, read the archive with read_file/search_files.\n\n"
     .. "Context management: your context window is finite. To avoid HTTP 400 errors (context overflow):\n"
     .. "- Read files with read_file using offset/limit slices — never read the same large file repeatedly, and don't dump whole files into the conversation\n"
     .. "- Keep outputs and tool results concise; prefer json_query/text_ops for extraction\n"
@@ -1698,10 +1723,21 @@ local function chat(messages, config, opts)
       error = "HTTP " .. tostring(code) .. ": " .. tostring(resp):sub(1, 500)}
   end
 
-  local data, decode_err = json.decode(resp)
+  -- decode 包 pcall（2026-08-10 补齐——encode 侧有 pcall+守卫，decode
+  -- 侧曾是裸调用）: json.decode 失败时 error() 抛出（无内部捕获），
+  -- 而旧代码期望 (data, decode_err) 双值——decode_err 恒为 nil，
+  -- 损坏 JSON（端点半截响应）或 decode OOM（131072B 响应构建表+字符串
+  -- 峰值可观）会直接崩进程回 shell，TUI 无提示（用户感知为"卡死"）。
+  -- 修复: pcall 包裹，失败返回明确错误；decode 峰值与 encode 同源
+  -- （响应体 131072 硬上限已由 http 层保证，此处只补崩溃兜底）。
+  local ok_d, data = pcall(json.decode, resp)
+  if not ok_d then
+    return {content = nil, tool_calls = nil, finish_reason = "error",
+      error = "JSON decode: " .. tostring(data)}
+  end
   if not data then
     return {content = nil, tool_calls = nil, finish_reason = "error",
-      error = "JSON decode: " .. tostring(decode_err)}
+      error = "JSON decode: empty response"}
   end
 
   local choice = data.choices and data.choices[1]

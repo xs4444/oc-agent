@@ -283,13 +283,35 @@ local function expand_keep_markers(summary, transcript_parts)
   end))
 end
 
--- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——摘要
+-- 折叠段归档（2026-08-10 硬盘利用）: compact_history 物理删除折叠段前，
+-- 先 append 到 <history_path>.archive.jsonl（磁盘冷存储，内存零成本）。
+-- 用途: ①可追溯——被折叠的原文永久保留，模型需要旧消息时可 read_file
+-- 读归档（JSONL 逐行，grep 定位）；②修正旧注释"JSONL append-only 完整
+-- 保留"的谎言——compact 后调用方 rebuild_history 用内存表重写文件，
+-- 折叠段从主文件消失，此前是彻底丢失。
+-- 限制: 磁盘满时静默跳过（compact 主流程不受影响，内存优先）；归档只
+-- 增不减，超限由 /relocate 换盘或手动清理承担（用户明确"尽可能利用
+-- 硬盘"）。
+local function archive_folded(messages)
+  if not messages or #messages == 0 then return end
+  local f = io.open(history_path .. ".archive.jsonl", "a")
+  if not f then return end
+  for _, m in ipairs(messages) do
+    local ok_w, werr = pcall(f.write, f, json.encode(m), "\n")
+    if not ok_w then break end
+  end
+  f:close()
+end
+-- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——
 -- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
 -- 承载旧消息内容；折叠段不进请求体、对缓存无贡献，留在内存表纯占内存
 -- （真机第二次 OOM 根因: 折叠不释放内存，93.6KB JSONL → 表 ~300KB
--- 驻留）。删除仅释放内存；JSONL append-only 完整保留可追溯。旧摘要
--- 消息被新摘要取代（锚定更新语义不变）。请求构造/估算的 folded 分支
--- 逻辑保留（无害兼容——折叠段已不存在，未来也不会再产生）。
+-- 驻留）。删除仅释放内存；**原文由 archive_folded 归档到
+-- history.archive.jsonl（磁盘冷存储）承担可追溯**（旧注释称"JSONL
+-- append-only 完整保留"与实际不符——compact 后 rebuild_history 用内存
+-- 表重写主文件，折叠段会从主文件消失）。旧摘要消息被新摘要取代（锚定
+-- 更新语义不变）。请求构造/估算的 folded 分支逻辑保留（无害兼容——
+-- 折叠段已不存在，未来也不会再产生）。
 local function compact_history(messages, config)
   if #messages <= COMPACT_KEEP + 1 then return nil end
   local keep = COMPACT_KEEP
@@ -337,6 +359,9 @@ local function compact_history(messages, config)
   while first_keep > 1 and messages[first_keep].role == "tool" do
     first_keep = first_keep - 1
   end
+  -- 折叠段归档到磁盘（先于物理删除; old 含旧摘要以外的全部折叠消息。
+  -- 磁盘满静默跳过——内存优先，compact 主流程不受影响）
+  archive_folded(old)
   local result = {{role = "system", content = "[对话摘要] " .. summary}}
   for i = first_keep, #messages do
     result[#result + 1] = messages[i]
