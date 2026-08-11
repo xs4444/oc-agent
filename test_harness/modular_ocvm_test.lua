@@ -2,7 +2,7 @@
 --
 -- 验证内容：
 --   1. 多文件 require 链在真实 OpenOS 中工作（agent.json / agent.tools 等模块加载）
---   2. 入口 init.lua（部署为 agent.lua）暴露 agent_test 钩子且 TOOLS 完整 14 项
+--   2. 入口 init.lua（部署为 agent.lua）暴露 agent_test 钩子且 TOOLS 完整 19 项
 --   3. 插件自举闭环：向 tools/ 目录写入新模块 → 重新扫描 → 自动注册 → 可调用
 --
 -- 用法: lua /mnt/<short>/modular_ocvm_test.lua /mnt/<short>
@@ -73,13 +73,15 @@ check("agent_test.wait_modem_message", ok_load and type(agent_test.wait_modem_me
 check("global json table (compat)", type(json) == "table" and type(json.encode) == "function")
 
 local tools = agent_test.TOOLS
-check("TOOLS count = 14", type(tools) == "table" and #tools == 14, tools and #tools)
--- 14 个工具集合齐全（顺序来自 BUILTIN 模块顺序：file/data/component/search/shell/subagent）
+check("TOOLS count = 19", type(tools) == "table" and #tools == 19, tools and #tools)
+-- 19 个工具集合齐全（顺序来自 BUILTIN 模块顺序：file/data/component/search/shell/subagent/network）
 local EXPECTED = {
   "read_file","edit_file","append_file","write_file","list_directory",
+  "search_files","glob",
   "json_query","calc","text_ops",
   "component_list","component_doc","component_invoke",
-  "web_search","shell_execute","subagent_call",
+  "web_search","shell_execute",
+  "subagent_call","subagent_discover","ask_user","compact_history",
 }
 local names = {}
 if type(tools) == "table" then
@@ -91,7 +93,7 @@ for _, e in ipairs(EXPECTED) do
   for _, n in ipairs(names) do if n == e then found = true break end end
   if not found then missing[#missing + 1] = e end
 end
-check("all 14 tools present", #names == 14 and #missing == 0,
+check("all 19 tools present", #names == 19 and #missing == 0,
   table.concat(missing, ",") .. " | actual: " .. table.concat(names, ","))
 
 -- ── 3. 插件自举闭环 ──────────────────────────────────────────────
@@ -143,9 +145,9 @@ local ok_rescan, tools2 = pcall(require, "agent.tools")
 check("rescan after plugin write", ok_rescan and type(tools2.list) == "function", tools2)
 log("DIAG tools2.tools_dir=" .. tostring(ok_rescan and tools2.tools_dir))
 local tools2_list = ok_rescan and tools2.list() or {}
-check("TOOLS now 15", #tools2_list == 15, #tools2_list)
+check("TOOLS now 20", #tools2_list == 20, #tools2_list)
 -- 诊断：显式传绝对路径扫描（若成功 → 证明 TOOLS_DIR 推导在 OpenOS 下失效）
-if ok_rescan and #tools2_list ~= 15 then
+if ok_rescan and #tools2_list ~= 20 then
   tools2.scan_dir(base .. "/agent/tools")
   local after_explicit = #tools2.list()
   log("DIAG explicit scan_dir count: " .. after_explicit)
@@ -173,7 +175,7 @@ for k in pairs(package.loaded) do
 end
 local ok_rescan2, tools3 = pcall(require, "agent.tools")
 local tools3_count = ok_rescan2 and #tools3.list() or -1
-check("bad module skipped, count stays 15", ok_rescan2 and tools3_count == 15, tools3_count)
+check("bad module skipped, count stays 20", ok_rescan2 and tools3_count == 20, tools3_count)
 -- 清理坏模块（插件模块保留，验证持久性）
 os.remove(bad_path)
 

@@ -113,15 +113,68 @@ class OcvmDriver:
         print("[ocvm] WARNING: shell prompt not detected, continuing anyway")
 
     def upload(self, files):
+        """上传文件或目录到所有挂载盘。目录递归上传（保持相对结构），
+        支持 modular 测试（require agent.json 等需要 base/agent/ 子目录）。
+
+        目录映射语法: "src/agent=agent" 把 src/agent 内容传为 <mount>/agent/
+        （modular 测试需要 base/agent/ 布局，而源码在 src/agent/）。"""
         status, out = self.run(f"ls -d {VM_DIR}/{TMP_DIR}/*/", timeout=10)
         dirs = [l.strip() for l in out.split() if l.strip().startswith("/")]
+        # ls -d 偶发解析失败（boot 时序）: fallback 用 find 列目录
+        if not dirs:
+            status2, out2 = self.run(f"find {VM_DIR}/{TMP_DIR} -maxdepth 1 -type d", timeout=10)
+            dirs = [l.strip() for l in out2.split()
+                    if l.strip().startswith("/") and l.strip() != f"{VM_DIR}/{TMP_DIR}"]
         print(f"[ocvm] mounts on host: {[d.split('/')[-1][:8] for d in dirs]}")
         sftp = self.ssh.open_sftp()
+        count = 0
         for d in dirs:
             for f in files:
-                sftp.put(f, d + os.path.basename(f))
+                # 映射语法 "path=newname": 拆出真实路径与目标路径
+                # 目录映射 "src/agent=agent" → <mount>/agent/…
+                # 文件映射 "src/agent/init.lua=agent/agent.lua" → <mount>/agent/agent.lua
+                # 注意: 用整串判断 =（mapped 目标可能含 / 或 \, basename 会
+                # 被 Windows 路径分隔符截断——init.lua=agent\agent.lua 的
+                # basename 是 agent.lua, 不含 =）
+                mapped_name = None
+                src_path = f
+                if "=" in f and os.path.exists(f.split("=")[0]):
+                    src_path, mapped_name = f.split("=", 1)
+                if os.path.isdir(src_path):
+                    # 目录: 递归上传, 保持相对结构
+                    # 默认目录名 = 源码目录 basename; 映射时用映射名
+                    name = mapped_name or os.path.basename(src_path)
+                    for root, _, names in os.walk(src_path):
+                        rel = os.path.relpath(root, src_path)
+                        dst_dir = d + "/" + name if rel == "." else d + "/" + name + "/" + rel.replace("\\", "/")
+                        for n in names:
+                            src = os.path.join(root, n)
+                            dst = dst_dir + "/" + n
+                            try:
+                                sftp.mkdir(dst_dir)
+                            except OSError:
+                                pass  # 已存在
+                            sftp.put(src, dst)
+                            count += 1
+                else:
+                    if mapped_name:
+                        # 文件映射: 目标可含子路径 (agent/agent.lua 或 agent\agent.lua)
+                        # 注意: mapped_name 来自 Windows 串, 分隔符可能是 \ 或 /
+                        if "/" in mapped_name or "\\" in mapped_name:
+                            mapped_dir = os.path.dirname(mapped_name).replace("\\", "/")
+                            dst_dir = d + "/" + mapped_dir
+                        else:
+                            dst_dir = d
+                        try:
+                            sftp.mkdir(dst_dir)
+                        except OSError:
+                            pass  # 已存在
+                        sftp.put(src_path, dst_dir + "/" + os.path.basename(mapped_name))
+                    else:
+                        sftp.put(f, d + os.path.basename(f))
+                    count += 1
         sftp.close()
-        print(f"[ocvm] uploaded {len(files)} file(s) to {len(dirs)} mount(s)")
+        print(f"[ocvm] uploaded {count} file(s) to {len(dirs)} mount(s)")
 
     def find_agent_mount(self):
         """探测数据盘挂载短名 (每次重启会变)。
@@ -204,10 +257,16 @@ def main():
     agent = os.path.normpath(agent)
     files = [agent] if os.path.exists(agent) else []
     files.append(os.path.abspath(script_path))
-    # EXTRA_FILES: 逗号分隔的额外上传文件（如离线文档包 oc-docs.tar）
+    # EXTRA_FILES: 逗号分隔的额外上传文件/目录（如离线文档包 oc-docs.tar、
+    # src/agent=agent 目录映射——modular 测试需要 base/agent/ 布局）
     for extra in os.environ.get("EXTRA_FILES", "").split(","):
         extra = extra.strip()
-        if extra and os.path.exists(extra):
+        if not extra:
+            continue
+        # 映射语法 "path=newname": 校验 path 部分存在；abspath 保留映射串
+        # （upload() 内部自行拆 "="，这里不能丢映射信息）
+        path_part = extra.split("=", 1)[0] if "=" in extra else extra
+        if os.path.exists(path_part):
             files.append(os.path.abspath(extra))
     d.upload(files)
     mount = d.find_agent_mount()
