@@ -989,6 +989,37 @@ test("file proxy: timeout path",
 os.remove("test_fsrv_tmp.txt")
 modem.close(sub_mod.FILE_PORT)
 
+print("")
+print("═══════════════════════════════════════")
+print("Interrupt (Ctrl+C) Tests")
+print("═══════════════════════════════════════")
+
+-- 中断支持（v0.3.86）: 可中断 os.sleep 补丁——非 Ready（chat/工具）
+-- 期间 Ctrl+C 的 interrupted 事件被补丁捕获设标志; 阻塞点轮询检测。
+-- 单测: 安装补丁 → 入队 interrupted → 调 os.sleep(2) → 应立即返回
+-- （<2s）且 interrupt.poll() 为 true; 再验证 consume 清除。
+do
+  local int_mod = require("agent.interrupt")
+  int_mod.install()
+  -- 入队 interrupted 事件（模拟用户 Ctrl+C）
+  table.insert(oc_mock._event_queue, {"interrupted"})
+  local t0 = os.clock()
+  os.sleep(2)
+  local dt = os.clock() - t0
+  test("interrupt: os.sleep returns early on Ctrl+C", dt < 1.5 and int_mod.poll(),
+    "dt=" .. string.format("%.2f", dt) .. " poll=" .. tostring(int_mod.poll()))
+  -- consume 清除标志
+  local was = int_mod.consume()
+  test("interrupt: consume returns and clears", was == true and not int_mod.poll(),
+    "was=" .. tostring(was) .. " poll_after=" .. tostring(int_mod.poll()))
+  -- 无事件时 os.sleep 正常等待
+  local t1 = os.clock()
+  os.sleep(0.05)
+  test("interrupt: os.sleep normal (no event)", os.clock() - t1 >= 0.04 and not int_mod.poll(),
+    "dt=" .. string.format("%.2f", os.clock() - t1))
+  int_mod.clear()
+end
+
 -- wait_modem_message on_other 转发（v0.3.85 死锁修复）: 主代理
 -- subagent_call 等待回复期间，非回复端口的文件请求经 on_other 回调
 -- 处理，不丢弃——否则 explorer 子代理等文件回复 60s / 主代理等任务

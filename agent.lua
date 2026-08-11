@@ -275,6 +275,7 @@ package.preload["agent.http"] = function()
 -- ═══════════════════════════════════════════════════════════════
 
 local json = require("agent.json")
+local interrupt = require("agent.interrupt")  -- v0.3.86: Ctrl+C 中断支持
 
 -- ═══════════════════════════════════════════════════════════════
 -- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
@@ -325,6 +326,7 @@ local function http_post_once(url, headers, body)
   local chunks = {}
   local timed_out = false
   local too_large = false
+  local interrupted = false
   local iter_ok, iter_err = pcall(function()
     local n = 0
     -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
@@ -334,6 +336,12 @@ local function http_post_once(url, headers, body)
     local read_deadline = os.clock() + MAX_RESPONSE_WAIT
     local total = 0
     for chunk in handle do
+      -- v0.3.86: Ctrl+C 中断——interrupt.install() 补丁的 os.sleep 检测到
+      -- interrupted 事件设标志; 每 chunk 检查, 提前终止响应读取
+      if interrupt.poll() then
+        interrupted = true
+        return
+      end
       if os.clock() >= read_deadline then
         timed_out = true
         return
@@ -363,6 +371,10 @@ local function http_post_once(url, headers, body)
   if too_large then
     return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
   end
+  if interrupted then
+    interrupt.clear()
+    return nil, nil, "interrupted"
+  end
   local response_body = table.concat(chunks)
 
   -- Some emulators (ocvm) fill the response asynchronously; retry briefly.
@@ -370,6 +382,11 @@ local function http_post_once(url, headers, body)
   local mt = getmetatable(handle)
   if mt and mt.__index and mt.__index.response then
     for _ = 1, 10 do
+      -- v0.3.86: 中断检查（补丁 os.sleep 已设标志）
+      if interrupt.poll() then
+        interrupt.clear()
+        return nil, nil, "interrupted"
+      end
       local ok2, c = pcall(mt.__index.response)
       if ok2 and type(c) == "number" then
         code = c
@@ -389,6 +406,10 @@ local function http_post(url, headers, body)
   while true do
     attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
+    -- v0.3.86: 用户中断——不重试，直接返回（Ctrl+C 语义: 立即停）
+    if err == "interrupted" then
+      return code, resp, err
+    end
     local transient = err ~= nil or code == 429 or (code and code >= 500)
     if not transient then
       return code, resp, err
@@ -1955,12 +1976,16 @@ end
 -- 请求经它处理。不转发就丢弃（event.pull 消费即失），形成死锁: 子代理
 -- 等文件回复 60s，主代理等任务回复 240s，互相等待直到超时（真机 gist
 -- 现场: explorer 子代理执行 list_directory/read_file 卡 thinking）。
+-- v0.3.86: interrupted 事件（Ctrl+C）设中断标志提前返回——返回 nil
+-- 前清除标志; 调用方（subagent_call）把 nil + 中断转成 "interrupted"
+-- 错误，用户可 Ctrl+C 终止 subagent_call 等待。
 local function wait_modem_message(timeout, reply_port, on_other)
   local event = require("event")
+  local interrupt = require("agent.interrupt")
   local waited = 0
   local step = 0.5
   while timeout == nil or waited < timeout do
-    local sig = {event.pull(step, "modem_message")}
+    local sig = {event.pull(step, "modem_message", "interrupted")}
     if sig[1] == "modem_message" then
       local sender = sig[3]
       local port = sig[4]
@@ -1971,6 +1996,9 @@ local function wait_modem_message(timeout, reply_port, on_other)
       if on_other then
         on_other(sig)
       end
+    elseif sig[1] == "interrupted" then
+      interrupt.set()
+      return nil
     end
     waited = waited + step
   end
@@ -2047,6 +2075,80 @@ return {
   FILE_PORT = FILE_PORT,
   FILE_TIMEOUT = FILE_TIMEOUT,
 }
+end
+
+-- agent.agent.interrupt (embedded module)
+package.preload["agent.interrupt"] = function()
+-- ═══════════════════════════════════════════════════════════════
+-- agent.interrupt — Ctrl+C 中断支持（v0.3.86）
+--
+-- 痛点: 非 Ready 状态（chat 请求 / 工具执行 / 重试退避 / subagent
+-- 等待）时 Ctrl+C 无效——OpenOS 的 os.sleep 内部 event.pull("timer")
+-- 带过滤，interrupted 事件不匹配被丢弃; http 读循环 / wait_modem_message
+-- 同理。事件到不了处理代码。
+--
+-- 方案: 可中断 os.sleep 补丁——无过滤轮询改为多过滤 pull
+-- ("timer","interrupted","modem_message")，interrupted 匹配时设置标志
+-- 提前返回; modem_message 转发给注册 handler（文件服务——chat 期间
+-- explorer 请求实时处理，不排队不丢）。所有阻塞点 yield 后检查标志。
+--
+-- 阻塞点接入清单:
+--   http.lua     读循环每 chunk + 重试退避（yield 后检查 interrupt.poll）
+--   subagent.lua wait_modem_message 多过滤 + interrupted 检测
+--   init.lua     process_exchange 工具循环 + chat 错误处理
+-- ═══════════════════════════════════════════════════════════════
+
+local event = require("event")
+
+local FLAG = false
+
+local M = {}
+
+M.set = function() FLAG = true end
+M.clear = function() FLAG = false end
+M.poll = function() return FLAG end
+
+-- 消费式读取: 返回并清除标志（process_exchange 每轮工具循环用）
+M.consume = function()
+  local v = FLAG
+  FLAG = false
+  return v
+end
+
+-- 注册: sleep 期间收到的 modem_message 转发（main() 注入文件服务 hook）
+M.forward = nil
+
+M.installed = false
+
+-- 可中断 os.sleep 补丁（替换 OpenOS 原版）。幂等。
+-- 原版内部 event.pull("timer") 单过滤——Ctrl+C 的 interrupted 被丢弃。
+-- 多过滤 ("timer","interrupted","modem_message"): interrupted 设标志
+-- 提前返回（调用方检测 poll 终止阻塞）; modem_message 转发 handler
+-- （文件服务）; timer 忽略（agent 不用 event.timer）。其他事件（key_down
+-- 等）仍被丢弃——chat 期间本就不应接受输入，语义合理。
+M.install = function()
+  if M.installed then return end
+  os.sleep = function(t)
+    local deadline = os.clock() + (t or 0)
+    while true do
+      local remaining = deadline - os.clock()
+      if remaining <= 0 then return end
+      local sig = {event.pull(math.min(0.1, remaining), "timer", "interrupted", "modem_message")}
+      if not sig[1] then return end
+      if sig[1] == "interrupted" then
+        FLAG = true
+        return
+      elseif sig[1] == "modem_message" then
+        local h = M.forward
+        if h then pcall(h, sig) end
+      end
+      -- "timer": 忽略（agent 无 event.timer 依赖）
+    end
+  end
+  M.installed = true
+end
+
+return M
 end
 
 -- agent.agent.debug (embedded module)
@@ -4455,6 +4557,12 @@ local function exec(name, args, deps)
       local sender, port, payload = wait_modem_message(timeout, SUBAGENT_REPLY_PORT)
       pcall(modem.close, SUBAGENT_REPLY_PORT)
       if not sender then
+        -- v0.3.86: 中断（Ctrl+C）→ 返回 "interrupted"，不是超时
+        local interrupt = require("agent.interrupt")
+        if interrupt.poll() then
+          interrupt.clear()
+          return "subagent_call interrupted by user"
+        end
         return "subagent timeout after " .. timeout .. "s (no reply from " .. addr .. ")"
       end
       local ok_json, reply = pcall(json.decode, payload or "")
@@ -4680,6 +4788,10 @@ local execute_mod = require("agent.execute")
 
 local chat_mod = require("agent.chat")
 local chat = chat_mod.chat
+
+-- v0.3.86: Ctrl+C 中断支持（可中断 os.sleep 补丁 + 标志位）——chat/
+-- 工具阻塞期间用户中断生效。install() 在 main() 里调用。
+local interrupt_mod = require("agent.interrupt")
 
 local subagent_mod = require("agent.subagent")
 local load_session_history, append_session_history, rebuild_session_history =
@@ -5760,6 +5872,12 @@ local function process_exchange(messages, config, user_input, persist, session, 
     persist_diag()
 
     if response.error then
+      -- v0.3.86: 用户中断（Ctrl+C）——立即终止，不进 400 重试/裁剪网
+      if tostring(response.error):find("interrupted", 1, true) then
+        interrupt_mod.clear()
+        print("[interrupt] 请求被用户中断")
+        return {error = "interrupted by user"}
+      end
       if not retried_400 and tostring(response.error):find("400") then
         -- 400 不一定是上下文超限（也可能是 reasoning 缺失/格式/限流）。
         -- 仅当估算确实超限（>85% 窗口）才裁剪重试；其余直接报错保留现场。
@@ -6012,6 +6130,13 @@ local function process_exchange(messages, config, user_input, persist, session, 
             persist_diag()
             local ok_call, result = pcall(execute_tool, tool_name, tool_args)
             DIAG.last_tool = nil  -- 工具完成: 清除
+            -- v0.3.86: 工具执行期间用户 Ctrl+C（如 shell_execute 长命令、
+            -- subagent_call 等待中）→ 中断循环，不再让模型继续工具调用
+            if interrupt_mod.poll() then
+              interrupt_mod.clear()
+              print("[interrupt] 工具执行被用户中断，终止本轮")
+              return {error = "interrupted by user"}
+            end
             if not ok_call then
               result = "Error: " .. tostring(result)
             end
@@ -6120,6 +6245,14 @@ local function main(config, ...)
     print("Error: No internet card found. Tier 2 Internet Card required.")
     return
   end
+
+  -- ── 中断补丁（v0.3.86）: 可中断 os.sleep——chat/工具阻塞期间 Ctrl+C
+  -- 生效。原版 os.sleep 内部 event.pull("timer") 单过滤, interrupted
+  -- 事件被丢弃。补丁多过滤 ("timer","interrupted","modem_message"),
+  -- interrupted 设标志; modem_message 转发文件服务（chat 期间 explorer
+  -- 请求实时处理, 不排队不丢——与 v0.3.85 的 wait_modem_message on_other
+  -- 同路）。install() 幂等。
+  require("agent.interrupt").install()
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the
@@ -6301,6 +6434,9 @@ local function main(config, ...)
       -- v0.3.85: 注入 DEPS.file_serve——subagent_call 等待回复期间的
       -- 文件请求经 wait_modem_message 的 on_other 转发到这里（死锁修复）
       DEPS.file_serve = FILE_SERVE_HOOK
+      -- v0.3.86: 可中断 os.sleep 补丁的 modem_message 也转发到这里——
+      -- chat 阻塞期间 explorer 请求实时处理（不排队不丢）
+      require("agent.interrupt").forward = FILE_SERVE_HOOK
     end
   end)
 

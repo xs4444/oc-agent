@@ -134,6 +134,12 @@ local function exec(name, args, deps)
       local sender, port, payload = wait_modem_message(timeout, SUBAGENT_REPLY_PORT)
       pcall(modem.close, SUBAGENT_REPLY_PORT)
       if not sender then
+        -- v0.3.86: 中断（Ctrl+C）→ 返回 "interrupted"，不是超时
+        local interrupt = require("agent.interrupt")
+        if interrupt.poll() then
+          interrupt.clear()
+          return "subagent_call interrupted by user"
+        end
         return "subagent timeout after " .. timeout .. "s (no reply from " .. addr .. ")"
       end
       local ok_json, reply = pcall(json.decode, payload or "")
