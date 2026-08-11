@@ -208,7 +208,14 @@ local function collect(config, history)
         local content = f:read("*a")
         f:close()
         local ok_j, snap = pcall(json.decode, content)
-        if ok_j and type(snap) == "table" and (snap.last_chat or snap.last_trim) then
+        -- v0.3.82 修复: 恢复条件补 chat_started/last_tool——卡死现场恰恰
+        -- 只有这两个字段（chat 进行中未完成 / 工具执行中未完成），原
+        -- 条件 (last_chat or last_trim) 把它们过滤掉 → 重启后显示
+        -- "(never)"，诊断盲区重现（真机现场: gist dec2a65 后的
+        -- 卡死报告历史 2 条但 last chat (never)、无 IN PROGRESS 标记）。
+        if ok_j and type(snap) == "table"
+            and (snap.last_chat or snap.last_trim
+              or snap.chat_started or snap.last_tool) then
           diag = snap
           snapshot = true
         end
