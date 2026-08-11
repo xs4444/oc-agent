@@ -2185,6 +2185,23 @@ local function collect(config, history)
     else
       lines[#lines + 1] = "last chat: (never)"
     end
+    -- 进行中标记（v0.3.80）: chat_started 有值 = 卡在 chat 请求进行中
+    -- （未完成——last_chat 只有上一次成功的）；last_tool 有值 = 卡在
+    -- 工具执行中（subagent_call 240s / shell 60s 等长阻塞工具）。
+    -- 真机 gist dec2a65 现场（uptime 8.5h 卡死，快照只有上次成功的
+    -- 6.8s chat）暴露盲区——卡住的那次请求/工具从未完成，无记录。
+    if diag.chat_started then
+      local c = diag.chat_started
+      lines[#lines + 1] = ">> CHAT IN PROGRESS: started uptime=" .. string.format("%.1fs", c.uptime or 0)
+        .. " est_bytes=" .. tostring(c.est or 0)
+        .. "  <-- 卡在 chat 请求进行中（从未完成）"
+    end
+    if diag.last_tool then
+      local t = diag.last_tool
+      lines[#lines + 1] = ">> TOOL IN PROGRESS: " .. tostring(t.name or "?")
+        .. " started uptime=" .. string.format("%.1fs", t.uptime or 0)
+        .. "  <-- 卡在工具执行中（从未完成）"
+    end
   end
 
   return table.concat(lines, "\n")
@@ -5359,9 +5376,9 @@ end
 -- （触发时间/前后 free/裁剪条数）、最后一次 chat 请求（耗时/错误）。
 -- 经 _G._AGENT_DIAG 全局挂载（与 json 全局同先例），debug.lua collect
 -- 读取；TUI/REPL 卡死时用户 /debug 即可见最后状态。
-local DIAG = { mem_curve = {}, last_trim = nil, last_chat = nil }
+local DIAG = { mem_curve = {}, last_trim = nil, last_chat = nil,
+  chat_started = nil, last_tool = nil }
 rawset(_G, "_AGENT_DIAG", DIAG)
-
 -- DIAG 快照持久化（2026-08-10 debug 优化: gist 535cfe 现场丢失教训——
 -- 用户卡死时重启 agent 再 /debug，Diagnostics 全空（进程内 DIAG 清空，
 -- 历史是旧会话加载的）。修复: 每次 chat/裁剪更新后写盘
@@ -5557,8 +5574,23 @@ local function process_exchange(messages, config, user_input, persist, session)
     -- gist 5ff1d4——[mem] 裁剪后对话中断）debug 报告可见最后一次请求的
     -- 耗时与错误，区分"端点慢/挂起（elapsed 接近 retry_budget）"与
     -- "编码失败（error 有值）"。chat 内部 pcall 捕获不抛异常。
+    -- v0.3.80 补充"进行中"标记: gist dec2a65 现场（uptime 8.5h 卡死，
+    -- last chat 只有上一次成功的 6.8s——卡住的那次 chat 从未完成，快照
+    -- 无记录）暴露盲区: persist_diag 只在 chat 完成后写。现在 chat 调用
+    -- 前先写 chat_started（uptime + 请求体估算），卡死时快照能区分
+    -- "卡在 chat 进行中"（chat_started 有值且无对应 last_chat）。
     local t_start = now_uptime()
+    DIAG.chat_started = { uptime = t_start, est = 0 }
+    -- 请求体估算（与 encode 守卫同口径）: 非 folded 消息字节和
+    for _, m in ipairs(messages) do
+      if not m.folded then
+        DIAG.chat_started.est = DIAG.chat_started.est
+          + #(m.content or "") + #(m.tool_calls and tostring(m.tool_calls) or "")
+      end
+    end
+    persist_diag()
     local response = chat(messages, config)
+    DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
       uptime = t_start,
       elapsed = now_uptime() - t_start,
@@ -5811,7 +5843,14 @@ local function process_exchange(messages, config, user_input, persist, session)
             local tool_args = fn.arguments
             -- TUI: 状态栏显示正在运行的工具
             if UI_HOOKS.onToolCall then UI_HOOKS.onToolCall(tool_name) end
+            -- 工具执行标记（v0.3.80 诊断）: 执行前写 last_tool（uptime+名
+            -- 称），完成后清除——卡死时快照能定位"卡在哪个工具"。工具
+            -- 执行可能长时间阻塞（subagent_call 240s / shell 60s），
+            -- chat_started 只覆盖请求阶段，工具阶段靠本标记。
+            DIAG.last_tool = { uptime = now_uptime(), name = tool_name }
+            persist_diag()
             local ok_call, result = pcall(execute_tool, tool_name, tool_args)
+            DIAG.last_tool = nil  -- 工具完成: 清除
             if not ok_call then
               result = "Error: " .. tostring(result)
             end
