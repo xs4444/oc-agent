@@ -18,6 +18,7 @@
 -- ═══════════════════════════════════════════════════════════════
 
 local event = require("event")
+local computer = require("computer")
 
 local FLAG = false
 
@@ -48,7 +49,11 @@ M.installed = false
 M.install = function()
   if M.installed then return end
   os.sleep = function(t)
-    local deadline = os.clock() + (t or 0)
+    -- 基准用 computer.uptime()（v0.3.88 热修复）: os.clock() 在 OC/ocvm
+    -- 是 CPU 时间——空闲不前进，os.sleep(t>0) 的 deadline 永不达到 →
+    -- while true 死循环挂起（probe_interrupt3 实证: os.sleep(2) 挂死,
+    -- probe_clock 实证: sleep 2s clock 只走 0.024s）。uptime 是墙钟。
+    local deadline = computer.uptime() + (t or 0)
     while true do
       -- 先拉事件再检查超时（v0.3.87 修复）: OpenOS internet.request
       -- 迭代器等待数据时调 os.sleep(0)（yield 让出）——原实现先检查
@@ -56,7 +61,7 @@ M.install = function()
       -- interrupted 永远收不到（probe_interrupt 实证: 等待期注入
       -- interrupted 补丁未触发）。改为先 pull(0)（非阻塞让出 + 消费
       -- pending 事件）再检查超时，os.sleep(0) 也能捕获中断。
-      local remaining = deadline - os.clock()
+      local remaining = deadline - computer.uptime()
       local wait = remaining > 0 and math.min(0.1, remaining) or 0
       local sig = {event.pull(wait, "timer", "interrupted", "modem_message")}
       if sig[1] == "interrupted" then
