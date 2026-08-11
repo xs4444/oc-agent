@@ -1680,8 +1680,12 @@ local function main(config, ...)
           local ok_t, total = pcall(comp.totalMemory)
           if ok_f and type(free) == "number" and ok_t and type(total) == "number"
               and total > 0 then
-            parts[#parts + 1] = string.format("mem %.1f/%.1fM",
-              free / 1048576, total / 1048576)
+            -- 显示"占用/总量 + 占用百分比"（2026-08-11 用户反馈: free/total
+            -- 易误读成占用——真机显示 3.4/4.0M 实为空闲 3.4MB，实际占用
+            -- 仅 0.6MB。改为 used/total，直观反映真实占用）。
+            local used = math.max(0, total - free)
+            parts[#parts + 1] = string.format("mem %.1f/%.1fM (%.0f%%)",
+              used / 1048576, total / 1048576, used / total * 100)
           end
         end
         parts[#parts + 1] = config.model
