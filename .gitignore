@@ -15,7 +15,8 @@ out.txt
 nul
 
 # opencode 运行时（会话历史、临时状态）
-.opencode/
+.opencode/*
+!.opencode/skills/
 .codegraph/
 logs/watch_release_*.log
 
@@ -34,3 +35,6 @@ test_harness/results/
 
 # 测试/运行时归档残留
 *.archive.jsonl
+
+# 但项目级 skill 需要提交
+!.opencode/skills/
