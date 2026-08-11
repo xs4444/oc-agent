@@ -1,6 +1,6 @@
 {
   "files": {
-    "chat.lua": 17591,
+    "chat.lua": 18542,
     "config.lua": 10790,
     "debug.lua": 16025,
     "execute.lua": 2769,
@@ -17,9 +17,9 @@
     "tools/question.lua": 2059,
     "tools/search.lua": 4566,
     "tools/shell.lua": 6988,
-    "tools/subagent.lua": 8279,
+    "tools/subagent.lua": 8571,
     "tui.lua": 35436,
     "docs.lua": 14689
   },
-  "version": "2026-08-11T1903"
+  "version": "2026-08-11T2022"
 }
