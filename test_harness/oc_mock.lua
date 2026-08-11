@@ -58,6 +58,8 @@ local OC = {
   },
   _free_mem = 524288,
   _uptime = 1234.5,
+  _uptime_offset = nil,  -- 首次 uptime() 时基准=真实时钟，之后随真实时钟前进
+  _uptime_base_clock = nil,
   _address = "computer-addr-001",
 }
 
@@ -151,7 +153,15 @@ end
 
 local mock_computer = {}
 function mock_computer.address() return OC._address end
-function mock_computer.uptime() return OC._uptime end
+function mock_computer.uptime() 
+  -- v0.3.88: uptime 随真实时钟前进（interrupt 补丁改用 uptime 基准后，
+  -- 固定值会导致 os.sleep(t>0) deadline 永不达到 → 单测死循环）。
+  -- 首次调用建立基准，之后返回 基准 + 真实流逝时间。
+  if OC._uptime_base_clock == nil then
+    OC._uptime_base_clock = os.clock()
+  end
+  return OC._uptime + (os.clock() - OC._uptime_base_clock)
+end
 function mock_computer.freeMemory() return OC._free_mem end
 function mock_computer.totalMemory() return 2097152 end  -- 2MB 基准（与 config.lua 内存自适应 scale 一致）
 function mock_computer.energy() return 100 end

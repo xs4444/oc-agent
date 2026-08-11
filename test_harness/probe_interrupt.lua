@@ -42,8 +42,14 @@ log("interrupt patch installed: os.sleep replaced=" .. tostring(os.sleep ~= nil)
 -- 2 秒后注入 interrupted（模拟 Ctrl+C——event.timer 异步，不阻塞请求）
 local ok_e, event = pcall(require, "event")
 if not ok_e then log("FATAL: no event lib"); return end
+local ok_c, computer = pcall(require, "computer")
+if not ok_c then log("FATAL: no computer lib"); return end
+-- uptime() 与 event.timer 同基准（墙钟），os.clock() 是 CPU 时间——分开记录
+-- 才能判定 interrupted 注入是否落在 chat 请求窗口内
+local up0 = computer.uptime()
+log("uptime start: " .. string.format("%.1f", up0))
 local timer_id = event.timer(2, function()
-  log("[timer] injecting interrupted at t=" .. string.format("%.1f", os.clock()))
+  log("[timer] injecting interrupted at uptime=" .. string.format("%.1f", computer.uptime()) .. " cpu=" .. string.format("%.1f", os.clock()))
   computer.pushSignal("interrupted")
 end)
 log("timer scheduled id=" .. tostring(timer_id))
@@ -54,10 +60,12 @@ local config = {api_key = api_key, model = model, api_url = api_url, context_win
 local messages = {{role = "user", content = "Reply with exactly: INTERRUPT_PROBE_DONE"}}
 
 log("calling chat (model should think 5-15s)...")
+local up_before = computer.uptime()
 local t0 = os.clock()
 local resp = chat(messages, config)
 local dt = os.clock() - t0
-log("chat returned after " .. string.format("%.1fs", dt))
+local up_after = computer.uptime()
+log("chat returned after " .. string.format("%.1fs cpu", dt) .. " uptime window [" .. string.format("%.1f", up_before) .. "," .. string.format("%.1f", up_after) .. "]")
 log("chat err=" .. tostring(resp and resp.error))
 log("chat content=" .. tostring(resp and resp.content):sub(1, 50))
 if resp and resp.error and tostring(resp.error):find("interrupted", 1, true) then
