@@ -16,8 +16,21 @@ log("=== OC Agent In-VM Test ===")
 log("Lua version: " .. _VERSION)
 
 -- Load agent.lua in test mode (skips main())
+-- 挂载路径是 /mnt/<mount>/agent.lua（非 /mnt/agent.lua），用 base 参数定位
+local base_dir = ({...})[1] or "/mnt"
+local agent_path = base_dir .. "/agent.lua"
+if not _G.fs or not _G.fs.exists then
+  -- 保险: 遍历 /mnt 找含 agent.lua 的挂载（与 chat2_test.lua 同策略）
+  local fs_ok, fs_mod = pcall(require, "filesystem")
+  if fs_ok and fs_mod and fs_mod.exists then
+    for item in fs_mod.list("/mnt") do
+      local full = "/mnt/" .. item
+      if fs_mod.exists(full .. "/agent.lua") then agent_path = full .. "/agent.lua" break end
+    end
+  end
+end
 _TEST_MODE = true
-local ok, err = pcall(dofile, "/mnt/agent.lua")
+local ok, err = pcall(dofile, agent_path)
 if not ok then
   log("AGENT LOAD FAILED: " .. tostring(err))
 else
@@ -25,6 +38,15 @@ else
 end
 
 -- Test JSON codec
+-- 单文件 agent.lua 的 json 是模块化局部（全局 json 仅占位空表——旧版
+-- 单文件时代全局 json 是真实模块，vm_test 直接依赖它已失效）。显式
+-- require: 单文件构建内联注册 package.preload，可解析。
+local ok_json_mod, json_mod = pcall(require, "agent.json")
+if not ok_json_mod then
+  log("WARN: require agent.json failed (" .. tostring(json_mod) .. ") — trying global fallback")
+  json_mod = json  -- 全局占位（空表时后续测试会如实报 ENCODE FAIL）
+end
+local json = json_mod
 log("--- JSON tests ---")
 local function jt(label, val)
   local enc_ok, encoded = pcall(json.encode, val)
@@ -92,18 +114,22 @@ log("fs.exists /mnt/agent.lua: " .. tostring(fs.exists("/mnt/agent.lua")))
 log("fs.exists /bin/ls: " .. tostring(fs.exists("/bin/ls")))
 
 -- Write results
-local f = io.open("/mnt/test_result.txt", "w")
+-- 必须写到挂载盘根目录（base 参数，如 /mnt/34c），host 侧 find tmp_t 才能
+-- 抓到；文件名遵循 harness 约定: <stem>_result.txt（result_file_name()）。
+-- 旧版硬编码 /mnt/test_result.txt（根盘不可写）+ /home/（VM 内 TMP 盘，
+-- 不映射 host tmp_t）→ host 永远找不到 → NO RESULT FILE。
+local f = io.open(base_dir .. "/vm_test_result.txt", "w")
 if f then
   f:write(table.concat(results, "\n") .. "\n")
   f:close()
-  log("Results written to /mnt/test_result.txt")
+  log("Results written to " .. base_dir .. "/vm_test_result.txt")
 else
-  log("ERROR: could not write /mnt/test_result.txt")
+  log("ERROR: could not write " .. base_dir .. "/vm_test_result.txt")
   -- try /home
-  local f2 = io.open("/home/test_result.txt", "w")
+  local f2 = io.open("/home/vm_test_result.txt", "w")
   if f2 then
     f2:write(table.concat(results, "\n") .. "\n")
     f2:close()
-    log("Results written to /home/test_result.txt")
+    log("Results written to /home/vm_test_result.txt")
   end
 end

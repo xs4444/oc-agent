@@ -216,17 +216,32 @@ class OcvmDriver:
         self.send(f"lua /mnt/{mount}/{os.path.basename(script_path)} {args}")
         print(f"[ocvm] launched: lua /mnt/{mount}/{os.path.basename(script_path)} {args}")
 
-    def wait_result(self, script_path, extra_result_names=()):
-        """宿主机侧轮询结果文件。返回内容或 None。"""
+    def wait_result(self, script_path, extra_result_names=(), settle_polls=3):
+        """宿主机侧轮询结果文件。返回内容或 None。
+
+        竞态修复（v0.3.84 回归实测发现）: VM 内脚本边写边读时，首次轮询
+        可能捕获增量写入中的部分内容（如 chat2_test 只存到前 5 行）。现
+        在拿到非空内容后继续观察 settle_polls 轮——内容不再增长视为稳定
+        才返回，避免本地结果文件不完整。
+        """
         stem = os.path.basename(script_path).rsplit(".", 1)[0]
         names = [result_file_name(script_path), stem + ".txt"] + list(extra_result_names)
         pattern = " -o ".join(f"-name '{n}'" for n in names) or "-name result.txt"
+        last = None
+        stable = 0
         for _ in range(RESULT_TIMEOUT // RESULT_POLL_INTERVAL):
             time.sleep(RESULT_POLL_INTERVAL)
             status, out = self.run(f"find {VM_DIR}/{TMP_DIR} -type f \\( {pattern} \\) -exec cat {{}} \\;", timeout=10)
             if out.strip():
-                return out
-        return None
+                if out == last:
+                    stable += 1
+                    if stable >= settle_polls:
+                        return out
+                else:
+                    stable = 0
+                    last = out
+                # 内容在增长 → 继续等稳定
+        return last  # 超时: 返回最后看到的内容（可能有未完成部分）
 
 
 def main():
