@@ -185,16 +185,27 @@ function mock_event.pull(timeout, ...)
   -- 这里若用 os.sleep 会递归进补丁版（补丁内部又 event.pull）→ 死循环。
   -- 用原始 sleep（mock 环境下是 no-op fallback）。
   local raw_sleep = raw_os_sleep or (function() end)
+  -- 过滤语义（v0.3.89 对齐真机 OpenOS）: 参数1 是事件名 pattern（match，
+  -- 非精确），后续参数匹配事件【参数位置】（signal[2]、signal[3]…）——
+  -- AND 位置匹配，不是"匹配多个事件名"。例: pull(t,"modem_message",
+  -- "interrupted") 要求事件名 match "modem_message" 且 参数1=="interrupted"。
+  local name_pat, pos_filters = nil, {}
+  if #filter > 0 then
+    name_pat = filter[1]
+    for i = 2, #filter do pos_filters[i - 1] = filter[i] end
+  end
   while true do
     -- deliver queued modem events first
     if #OC._event_queue > 0 then
       local sig = table.remove(OC._event_queue, 1)
-      -- 多过滤支持（v0.3.86 中断补丁: os.sleep 用
-      -- event.pull(t, "timer","interrupted","modem_message") 变长过滤——
-      -- OpenOS 原生支持，mock 此前只匹配 filter[1]）
-      local match = #filter == 0
-      for _, f in ipairs(filter) do
-        if f == sig[1] then match = true break end
+      local match = name_pat == nil
+      if not match and type(sig[1]) == "string" and sig[1]:match(name_pat) then
+        match = true
+      end
+      if match then
+        for i, f in ipairs(pos_filters) do
+          if f ~= nil and f ~= sig[i + 1] then match = false break end
+        end
       end
       if match then
         return table.unpack(sig)

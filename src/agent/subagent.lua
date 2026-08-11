@@ -117,7 +117,13 @@ local function wait_modem_message(timeout, reply_port, on_other)
   local waited = 0
   local step = 0.5
   while timeout == nil or waited < timeout do
-    local sig = {event.pull(step, "modem_message", "interrupted")}
+    -- 无过滤 pull + 自判事件名（v0.3.89 修复）: OpenOS event.pull 的
+    -- 多过滤语义是"事件名 match 参数1 且 参数N 匹配事件第 N 参数"（AND
+    -- 位置匹配），不是匹配多个事件名——("modem_message","interrupted")
+    -- 要求事件名含 modem_message 且参数1=="interrupted"，interrupted
+    -- 事件（{"interrupted", <time>}）永远被拒，Ctrl+C 在此失效
+    -- （probe_pullmulti 实证）。改无过滤 pull，非目标事件忽略重拉。
+    local sig = {event.pull(step)}
     if sig[1] == "modem_message" then
       local sender = sig[3]
       local port = sig[4]
