@@ -1746,6 +1746,26 @@ local function chat(messages, config, opts)
   end
   local req_tools = nil
   if not opts.skip_tools then req_tools = tools_mod.list() end
+  -- tools normalize（2026-08-11 真机 chat 全挂根因，gist 现场 + ocvm probe）:
+  -- OC json.lua 把空表 {} 编码为 []（数组）。端点严格校验
+  -- parameters.properties=[] 直接 400——subagent_discover（v0.3.78 新增，
+  -- 唯一空 properties 工具）导致所有请求 400 → "完全无法 chat 卡 thinking"。
+  -- 统一在编码前删除空 properties/required 字段（省略合法: OpenAI 规范
+  -- 两者皆 optional），防未来新工具再踩。
+  if req_tools then
+    for _, t in ipairs(req_tools) do
+      local fn = t and t["function"]
+      local params = fn and fn.parameters
+      if type(params) == "table" then
+        if type(params.properties) == "table" and next(params.properties) == nil then
+          params.properties = nil
+        end
+        if type(params.required) == "table" and next(params.required) == nil then
+          params.required = nil
+        end
+      end
+    end
+  end
   local ok_enc, body = pcall(json.encode, {
     model = config.model or "deepseek-v4-flash-free",
     messages = api_messages,
@@ -4202,7 +4222,11 @@ local tools = {
   {type="function", ["function"]={
     name="subagent_discover",
     description="Broadcast a discovery ping on the modem network to find online subagents (computers running agent.lua --subagent, listening on the task port). Each online subagent replies with its modem address and model. Returns a list of found subagents (address + model), or 'none found'. Call this BEFORE subagent_call to obtain the target address — remote modem addresses cannot be obtained from component_list (that only lists local components). Discovery window is 5 seconds.",
-    parameters={type="object", properties={}, required={}}
+    -- 无参数工具: 不声明空 properties/required——OC json.lua 把空表 {}
+    -- 编码为 []（数组），端点严格校验 properties=[] 直接 400（2026-08-11
+    -- ocvm probe 实证: properties=[] → 400, 省略 → 200）。省略合法:
+    -- OpenAI 规范 parameters.properties 为 optional。
+    parameters={type="object"}
   }},
 }
 
