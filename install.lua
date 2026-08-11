@@ -227,6 +227,9 @@ local function write_file(path, content)
 end
 
 -- 子代理配置（v1 逻辑: 回答 y 则写 subagent=true 到 config）
+-- v0.3.79 修复: ①docs 启动器块曾被误插进本函数（up_dir 未定义 → 选 y
+-- 报 concatenate nil）——已移到 PATH 集成块；②改为合并式写 config
+-- （原实现整表覆盖，会丢 data_dir 引导/context_window 等既有配置）
 local function ask_subagent()
   print("")
   io.write("将此机器配置为子代理 (监听模式)? [y/N]: ")
@@ -234,7 +237,19 @@ local function ask_subagent()
   if answer:gsub("%s", ""):lower() == "y" then
     local ser = require("serialization")
     local cfg_path = DEST_DIR .. "/agent_config.txt"
-    local cfg = {api_key = "", model = "deepseek-v4-flash-free", api_url = "https://opencode.ai/zen/v1/chat/completions", subagent = true}
+    local cfg = {}
+    local cf = io.open(cfg_path, "r")
+    if cf then
+      local ok_c, parsed = pcall(ser.unserialize, cf:read("*a"))
+      cf:close()
+      if ok_c and type(parsed) == "table" then cfg = parsed end
+    end
+    if not cfg.api_key then cfg.api_key = "" end
+    if not cfg.model then cfg.model = "deepseek-v4-flash-free" end
+    if not cfg.api_url then
+      cfg.api_url = "https://opencode.ai/zen/v1/chat/completions"
+    end
+    cfg.subagent = true
     local f = io.open(cfg_path, "w")
     if f then
       f:write(ser.serialize(cfg))
@@ -242,31 +257,9 @@ local function ask_subagent()
       print("子代理配置已写入 " .. cfg_path)
     else
       print("无法写入配置文件: " .. cfg_path)
-      end
-    end
-    -- docs 启动器（用户反馈 "lua docs.lua 命令不可用": docs.lua 曾装
-    -- 在 AGENT_DIR 内且无 PATH 入口——cwd 任意时找不到。v0.3.77:
-    -- docs.lua 本体落 AGENT_DIR 父目录（同 update.lua），此处创建
-    -- /home/bin/docs.lua 启动器 → 任意目录 `docs` 或 `lua docs.lua`
-    -- 均可用。docs 本体由清单下载（relpath=="docs.lua" 特判落父目录），
-    -- 启动器只转发，缺失时提示先 install。）
-    local docs_script = up_dir .. "/docs.lua"
-    local docs_launcher = "/home/bin/docs.lua"
-    local df = io.open(docs_launcher, "w")
-    if df then
-      df:write("-- docs launcher (created by install.lua)\n")
-      df:write("local script = " .. string.format("%q", docs_script) .. "\n")
-      df:write("local fs_mod = require('filesystem')\n")
-      df:write("if not fs_mod.exists(script) then\n")
-      df:write("  print('docs.lua 未安装到 ' .. script)\n")
-      df:write("  print('请先运行: lua install.lua（会下载 docs.lua）')\n")
-      df:write("  return\n")
-      df:write("end\n")
-      df:write("local chunk = assert(loadfile(script))\n")
-      df:write("chunk(...)\n")
-      df:close()
     end
   end
+end
 
 print("OC Agent 安装器")
 print("===============")
@@ -580,6 +573,28 @@ if manifest then
           print("[update] 无法写入 " .. up_script)
         end
       end
+    end
+    -- docs 启动器（用户反馈 "lua docs.lua 命令不可用": docs.lua 曾装
+    -- 在 AGENT_DIR 内且无 PATH 入口——cwd 任意时找不到。v0.3.77:
+    -- docs.lua 本体落 AGENT_DIR 父目录（同 update.lua），此处创建
+    -- /home/bin/docs.lua 启动器 → 任意目录 `docs` 或 `lua docs.lua`
+    -- 均可用。v0.3.79: 本块曾误插进 ask_subagent 函数（up_dir 未定义
+    -- → 选 y 报错），已移回 PATH 集成块。）
+    local docs_script = up_dir .. "/docs.lua"
+    local docs_launcher = "/home/bin/docs.lua"
+    local df = io.open(docs_launcher, "w")
+    if df then
+      df:write("-- docs launcher (created by install.lua)\n")
+      df:write("local script = " .. string.format("%q", docs_script) .. "\n")
+      df:write("local fs_mod = require('filesystem')\n")
+      df:write("if not fs_mod.exists(script) then\n")
+      df:write("  print('docs.lua 未安装到 ' .. script)\n")
+      df:write("  print('请先运行: lua install.lua（会下载 docs.lua）')\n")
+      df:write("  return\n")
+      df:write("end\n")
+      df:write("local chunk = assert(loadfile(script))\n")
+      df:write("chunk(...)\n")
+      df:close()
     end
   end
 
