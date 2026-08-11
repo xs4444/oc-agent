@@ -17,7 +17,11 @@ local tools = {
   {type="function", ["function"]={
     name="subagent_discover",
     description="Broadcast a discovery ping on the modem network to find online subagents (computers running agent.lua --subagent, listening on the task port). Each online subagent replies with its modem address and model. Returns a list of found subagents (address + model), or 'none found'. Call this BEFORE subagent_call to obtain the target address — remote modem addresses cannot be obtained from component_list (that only lists local components). Discovery window is 5 seconds.",
-    parameters={type="object", properties={}, required={}}
+    -- 无参数工具: 不声明空 properties/required——OC json.lua 把空表 {}
+    -- 编码为 []（数组），端点严格校验 properties=[] 直接 400（2026-08-11
+    -- ocvm probe 实证: properties=[] → 400, 省略 → 200）。省略合法:
+    -- OpenAI 规范 parameters.properties 为 optional。
+    parameters={type="object"}
   }},
 }
 
