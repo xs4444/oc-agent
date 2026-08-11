@@ -1031,7 +1031,7 @@ local function enforce_memory(messages, config, persist, session)
     .. " → " .. fmt_num(f_after) .. "）")
 end
 
-local function process_exchange(messages, config, user_input, persist, session)
+local function process_exchange(messages, config, user_input, persist, session, tools_override)
   messages[#messages + 1] = {role = "user", content = user_input}
 
   -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具通过 DEPS
@@ -1155,7 +1155,7 @@ local function process_exchange(messages, config, user_input, persist, session)
       end
     end
     persist_diag()
-    local response = chat(messages, config)
+    local response = chat(messages, config, {tools = tools_override})
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
       uptime = t_start,
@@ -1602,6 +1602,51 @@ local function main(config, ...)
                 req_messages[#req_messages + 1] = {role = "user", content = "[来自主代理的上下文]\n" .. req.context}
               end
               local task_text = req.task or ""
+              -- explorer 角色（v0.3.84）: 只读探索子代理——工具集过滤为
+              -- 只读集合（物理不能写），且 file 工具代理到主代理执行
+              -- （内网读主代理硬盘代码/文档，经 modem FILE_PORT 9092）。
+              -- 工具集覆盖规则: TOOLS 声明里 name 在只读白名单 → 保留;
+              -- 写工具/shell/ask_user/subagent_call 等 → 剔除。
+              -- 执行拦截: execute_tool 全局替换——read_file/list_directory/
+              -- search_files/glob 转发到 subagent_mod.file_proxy(master=
+              -- sender)（任务发送者即主代理地址），其余走原 execute_mod.run。
+              local tools_override = nil
+              if req.role and req.role == "explorer" then
+                local READONLY = {
+                  read_file = true, list_directory = true,
+                  search_files = true, glob = true,
+                  component_list = true, component_doc = true,
+                  json_query = true, calc = true, text_ops = true,
+                  web_search = true, subagent_discover = true,
+                }
+                local FILE_PROXY_TOOLS = {
+                  read_file = true, list_directory = true,
+                  search_files = true, glob = true,
+                }
+                tools_override = {}
+                for _, t in ipairs(TOOLS) do
+                  local name = t and t["function"] and t["function"].name
+                  if name and READONLY[name] then
+                    tools_override[#tools_override + 1] = t
+                  end
+                end
+                local orig_execute = execute_tool
+                execute_tool = function(name, args_str)
+                  if FILE_PROXY_TOOLS[name] then
+                    local args = {}
+                    local ok_args = pcall(function()
+                      args = json.decode(args_str)
+                    end)
+                    local res = subagent_mod.file_proxy(name, type(args) == "table" and args or {}, DEPS, sender)
+                    if type(res) == "string" and res:sub(1, 6) == "Error:" then
+                      return nil, res
+                    end
+                    return res, nil
+                  end
+                  return orig_execute(name, args_str)
+                end
+                print("[subagent] explorer mode: " .. #tools_override .. " readonly tools, file ops proxied to " .. tostring(sender))
+              end
               if req.role and req.role ~= "" then
                 task_text = "[角色: " .. req.role .. "]\n" .. task_text
               end
@@ -1610,7 +1655,7 @@ local function main(config, ...)
               -- Guard against unexpected exceptions escaping process_exchange:
               -- busy_session must be released either way, or this session would
               -- be permanently stuck busy and reject all new tasks.
-              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil)
+              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil, tools_override)
               if not ok_proc then result = { error = tostring(result) } end
               busy_session = nil  -- release (opencode: Active → Reusable)
               local reply
@@ -1635,6 +1680,31 @@ local function main(config, ...)
 
   local messages = load_history()
   local term_history = {}
+
+  -- ── 文件服务（v0.3.84）: explorer 子代理经 modem 读主代理硬盘 ──
+  -- 主代理空闲时（TUI readInput 事件回调 / REPL 每轮对话间隙）处理
+  -- 只读文件请求（read_file/list_directory/search_files/glob，绝不写）。
+  -- chat 阻塞期间请求在事件队列排队，恢复空闲后处理。
+  -- 仅在有 modem 网卡时启用；失败静默（无网卡机器不受影响）。
+  local FILE_EXEC = function(name, args)
+    local ok, result = pcall(execute_tool, name, json.encode(args))
+    if not ok then return false, tostring(result) end
+    if type(result) == "string" and result:sub(1, 6) == "Error:" then
+      return false, result
+    end
+    return true, result
+  end
+  local FILE_SERVE_HOOK = nil  -- 由 TUI/REPL 分支设置（避免无 modem 时重复 require）
+  pcall(function()
+    local component = require("component")
+    if component.modem then
+      component.modem.open(subagent_mod.FILE_PORT)
+      -- 统一入口: TUI 回调推模式 / REPL 拉模式
+      FILE_SERVE_HOOK = function(sig)
+        return subagent_mod.handle_file_message(FILE_EXEC, sig[3], sig[4], sig[6])
+      end
+    end
+  end)
 
   -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
   -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。
@@ -1721,7 +1791,7 @@ local function main(config, ...)
     if ui then
       -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
       ui.setStatus("Ready")
-      local input = ui.readInput()
+      local input = ui.readInput(FILE_SERVE_HOOK)  -- 文件服务回调（modem 请求不丢失）
       if input == nil then
         ui.print("^C", ui.colors.dim)
         goto continue
@@ -1757,6 +1827,18 @@ local function main(config, ...)
     end
 
     io.write("> ")
+    if FILE_SERVE_HOOK then
+      -- REPL 模式: io.read 阻塞期间事件排队，回到主循环时集中处理
+      -- （文件服务请求——explorer 子代理读主代理硬盘）
+      local ok_e, event = pcall(require, "event")
+      if ok_e then
+        while true do
+          local sig = {event.pull(0, "modem_message")}
+          if not sig[1] then break end
+          FILE_SERVE_HOOK(sig)
+        end
+      end
+    end
     local input = io.read()
     if not input then break end
     input = input:gsub("\n", "")
