@@ -108,12 +108,16 @@ end
 -- 请求经它处理。不转发就丢弃（event.pull 消费即失），形成死锁: 子代理
 -- 等文件回复 60s，主代理等任务回复 240s，互相等待直到超时（真机 gist
 -- 现场: explorer 子代理执行 list_directory/read_file 卡 thinking）。
+-- v0.3.86: interrupted 事件（Ctrl+C）设中断标志提前返回——返回 nil
+-- 前清除标志; 调用方（subagent_call）把 nil + 中断转成 "interrupted"
+-- 错误，用户可 Ctrl+C 终止 subagent_call 等待。
 local function wait_modem_message(timeout, reply_port, on_other)
   local event = require("event")
+  local interrupt = require("agent.interrupt")
   local waited = 0
   local step = 0.5
   while timeout == nil or waited < timeout do
-    local sig = {event.pull(step, "modem_message")}
+    local sig = {event.pull(step, "modem_message", "interrupted")}
     if sig[1] == "modem_message" then
       local sender = sig[3]
       local port = sig[4]
@@ -124,6 +128,9 @@ local function wait_modem_message(timeout, reply_port, on_other)
       if on_other then
         on_other(sig)
       end
+    elseif sig[1] == "interrupted" then
+      interrupt.set()
+      return nil
     end
     waited = waited + step
   end

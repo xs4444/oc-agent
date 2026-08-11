@@ -10,6 +10,7 @@
 -- ═══════════════════════════════════════════════════════════════
 
 local json = require("agent.json")
+local interrupt = require("agent.interrupt")  -- v0.3.86: Ctrl+C 中断支持
 
 -- ═══════════════════════════════════════════════════════════════
 -- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
@@ -60,6 +61,7 @@ local function http_post_once(url, headers, body)
   local chunks = {}
   local timed_out = false
   local too_large = false
+  local interrupted = false
   local iter_ok, iter_err = pcall(function()
     local n = 0
     -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
@@ -69,6 +71,12 @@ local function http_post_once(url, headers, body)
     local read_deadline = os.clock() + MAX_RESPONSE_WAIT
     local total = 0
     for chunk in handle do
+      -- v0.3.86: Ctrl+C 中断——interrupt.install() 补丁的 os.sleep 检测到
+      -- interrupted 事件设标志; 每 chunk 检查, 提前终止响应读取
+      if interrupt.poll() then
+        interrupted = true
+        return
+      end
       if os.clock() >= read_deadline then
         timed_out = true
         return
@@ -98,6 +106,10 @@ local function http_post_once(url, headers, body)
   if too_large then
     return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
   end
+  if interrupted then
+    interrupt.clear()
+    return nil, nil, "interrupted"
+  end
   local response_body = table.concat(chunks)
 
   -- Some emulators (ocvm) fill the response asynchronously; retry briefly.
@@ -105,6 +117,11 @@ local function http_post_once(url, headers, body)
   local mt = getmetatable(handle)
   if mt and mt.__index and mt.__index.response then
     for _ = 1, 10 do
+      -- v0.3.86: 中断检查（补丁 os.sleep 已设标志）
+      if interrupt.poll() then
+        interrupt.clear()
+        return nil, nil, "interrupted"
+      end
       local ok2, c = pcall(mt.__index.response)
       if ok2 and type(c) == "number" then
         code = c
@@ -124,6 +141,10 @@ local function http_post(url, headers, body)
   while true do
     attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
+    -- v0.3.86: 用户中断——不重试，直接返回（Ctrl+C 语义: 立即停）
+    if err == "interrupted" then
+      return code, resp, err
+    end
     local transient = err ~= nil or code == 429 or (code and code >= 500)
     if not transient then
       return code, resp, err

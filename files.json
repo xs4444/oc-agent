@@ -4,11 +4,12 @@
     "config.lua": 10790,
     "debug.lua": 16025,
     "execute.lua": 2769,
-    "http.lua": 7485,
-    "init.lua": 92175,
+    "http.lua": 8256,
+    "init.lua": 93817,
+    "interrupt.lua": 2948,
     "json.lua": 8490,
     "session.lua": 31523,
-    "subagent.lua": 8523,
+    "subagent.lua": 8895,
     "tools.lua": 5730,
     "tools/compact.lua": 3277,
     "tools/component.lua": 4960,
@@ -17,9 +18,9 @@
     "tools/question.lua": 2059,
     "tools/search.lua": 4566,
     "tools/shell.lua": 6988,
-    "tools/subagent.lua": 8938,
+    "tools/subagent.lua": 9195,
     "tui.lua": 36452,
     "docs.lua": 14689
   },
-  "version": "2026-08-12T0028"
+  "version": "2026-08-12T0052"
 }

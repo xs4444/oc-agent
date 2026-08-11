@@ -100,6 +100,10 @@ local execute_mod = require("agent.execute")
 local chat_mod = require("agent.chat")
 local chat = chat_mod.chat
 
+-- v0.3.86: Ctrl+C 中断支持（可中断 os.sleep 补丁 + 标志位）——chat/
+-- 工具阻塞期间用户中断生效。install() 在 main() 里调用。
+local interrupt_mod = require("agent.interrupt")
+
 local subagent_mod = require("agent.subagent")
 local load_session_history, append_session_history, rebuild_session_history =
   subagent_mod.load_session_history, subagent_mod.append_session_history, subagent_mod.rebuild_session_history
@@ -1179,6 +1183,12 @@ local function process_exchange(messages, config, user_input, persist, session, 
     persist_diag()
 
     if response.error then
+      -- v0.3.86: 用户中断（Ctrl+C）——立即终止，不进 400 重试/裁剪网
+      if tostring(response.error):find("interrupted", 1, true) then
+        interrupt_mod.clear()
+        print("[interrupt] 请求被用户中断")
+        return {error = "interrupted by user"}
+      end
       if not retried_400 and tostring(response.error):find("400") then
         -- 400 不一定是上下文超限（也可能是 reasoning 缺失/格式/限流）。
         -- 仅当估算确实超限（>85% 窗口）才裁剪重试；其余直接报错保留现场。
@@ -1431,6 +1441,13 @@ local function process_exchange(messages, config, user_input, persist, session, 
             persist_diag()
             local ok_call, result = pcall(execute_tool, tool_name, tool_args)
             DIAG.last_tool = nil  -- 工具完成: 清除
+            -- v0.3.86: 工具执行期间用户 Ctrl+C（如 shell_execute 长命令、
+            -- subagent_call 等待中）→ 中断循环，不再让模型继续工具调用
+            if interrupt_mod.poll() then
+              interrupt_mod.clear()
+              print("[interrupt] 工具执行被用户中断，终止本轮")
+              return {error = "interrupted by user"}
+            end
             if not ok_call then
               result = "Error: " .. tostring(result)
             end
@@ -1539,6 +1556,14 @@ local function main(config, ...)
     print("Error: No internet card found. Tier 2 Internet Card required.")
     return
   end
+
+  -- ── 中断补丁（v0.3.86）: 可中断 os.sleep——chat/工具阻塞期间 Ctrl+C
+  -- 生效。原版 os.sleep 内部 event.pull("timer") 单过滤, interrupted
+  -- 事件被丢弃。补丁多过滤 ("timer","interrupted","modem_message"),
+  -- interrupted 设标志; modem_message 转发文件服务（chat 期间 explorer
+  -- 请求实时处理, 不排队不丢——与 v0.3.85 的 wait_modem_message on_other
+  -- 同路）。install() 幂等。
+  require("agent.interrupt").install()
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the
@@ -1720,6 +1745,9 @@ local function main(config, ...)
       -- v0.3.85: 注入 DEPS.file_serve——subagent_call 等待回复期间的
       -- 文件请求经 wait_modem_message 的 on_other 转发到这里（死锁修复）
       DEPS.file_serve = FILE_SERVE_HOOK
+      -- v0.3.86: 可中断 os.sleep 补丁的 modem_message 也转发到这里——
+      -- chat 阻塞期间 explorer 请求实时处理（不排队不丢）
+      require("agent.interrupt").forward = FILE_SERVE_HOOK
     end
   end)
 

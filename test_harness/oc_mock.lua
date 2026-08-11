@@ -2,6 +2,11 @@
 -- OC Mock — shim OC APIs for host-side testing
 -- ══════════════════════════════════════════════════════
 
+-- 原始 os.sleep 引用（中断补丁前保存）: agent.interrupt 的补丁会替换
+-- os.sleep（多过滤 event.pull），mock_event.pull 内部必须用原版避免
+-- 递归（补丁版 os.sleep 内部又 event.pull → 互调死循环）。
+raw_os_sleep = os.sleep
+
 -- OC-like serialization (simple version)
 local mock_serialization = {}
 function mock_serialization.serialize(val, pretty)
@@ -166,18 +171,29 @@ local mock_event = {}
 function mock_event.pull(timeout, ...)
   local filter = {...}
   local deadline = os.clock() + (timeout or 5)
+  -- 保存原版 sleep 引用: 中断补丁（agent.interrupt）替换 os.sleep 后，
+  -- 这里若用 os.sleep 会递归进补丁版（补丁内部又 event.pull）→ 死循环。
+  -- 用原始 sleep（mock 环境下是 no-op fallback）。
+  local raw_sleep = raw_os_sleep or (function() end)
   while true do
     -- deliver queued modem events first
     if #OC._event_queue > 0 then
       local sig = table.remove(OC._event_queue, 1)
-      if #filter == 0 or filter[1] == sig[1] then
+      -- 多过滤支持（v0.3.86 中断补丁: os.sleep 用
+      -- event.pull(t, "timer","interrupted","modem_message") 变长过滤——
+      -- OpenOS 原生支持，mock 此前只匹配 filter[1]）
+      local match = #filter == 0
+      for _, f in ipairs(filter) do
+        if f == sig[1] then match = true break end
+      end
+      if match then
         return table.unpack(sig)
       end
       -- non-matching event: drop and continue (keeps test simple)
     end
     if os.clock() >= deadline then return nil end
     -- small yield so the deadline check happens; no-op if os.sleep absent
-    if os.sleep then os.sleep(0.01) end
+    if raw_sleep then raw_sleep(0.01) end
   end
 end
 function mock_event.timer(interval, func, ...) return 1 end

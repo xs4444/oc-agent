@@ -25,6 +25,7 @@ local MODULES = {
   "agent.execute",
   "agent.chat",
   "agent.subagent",
+  "agent.interrupt",
   "agent.debug",
   "agent.tui",
 }
