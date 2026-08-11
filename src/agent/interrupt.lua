@@ -50,10 +50,15 @@ M.install = function()
   os.sleep = function(t)
     local deadline = os.clock() + (t or 0)
     while true do
+      -- 先拉事件再检查超时（v0.3.87 修复）: OpenOS internet.request
+      -- 迭代器等待数据时调 os.sleep(0)（yield 让出）——原实现先检查
+      -- remaining<=0 直接 return，t=0 时从不 event.pull，Ctrl+C 的
+      -- interrupted 永远收不到（probe_interrupt 实证: 等待期注入
+      -- interrupted 补丁未触发）。改为先 pull(0)（非阻塞让出 + 消费
+      -- pending 事件）再检查超时，os.sleep(0) 也能捕获中断。
       local remaining = deadline - os.clock()
-      if remaining <= 0 then return end
-      local sig = {event.pull(math.min(0.1, remaining), "timer", "interrupted", "modem_message")}
-      if not sig[1] then return end
+      local wait = remaining > 0 and math.min(0.1, remaining) or 0
+      local sig = {event.pull(wait, "timer", "interrupted", "modem_message")}
       if sig[1] == "interrupted" then
         FLAG = true
         return
@@ -62,6 +67,7 @@ M.install = function()
         if h then pcall(h, sig) end
       end
       -- "timer": 忽略（agent 无 event.timer 依赖）
+      if remaining <= 0 then return end
     end
   end
   M.installed = true
