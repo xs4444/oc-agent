@@ -63,7 +63,13 @@ M.install = function()
       -- pending 事件）再检查超时，os.sleep(0) 也能捕获中断。
       local remaining = deadline - computer.uptime()
       local wait = remaining > 0 and math.min(0.1, remaining) or 0
-      local sig = {event.pull(wait, "timer", "interrupted", "modem_message")}
+      -- 无过滤 pull + 自判事件名（v0.3.89 修复）: OpenOS 的
+      -- event.pull(wait, "a","b","c") 语义是"事件名 match 'a' 且 参数1
+      -- =='b' 且 参数2=='c'"（AND 位置匹配），不是匹配多个事件名——
+      -- 多过滤用法下 interrupted 事件永远被拒（probe_pullmulti 实证:
+      -- 单过滤/无过滤都能收到 interrupted，多过滤 nil）。改用无过滤
+      -- pull，非目标事件忽略继续循环。
+      local sig = {event.pull(wait)}
       if sig[1] == "interrupted" then
         FLAG = true
         return
@@ -71,7 +77,7 @@ M.install = function()
         local h = M.forward
         if h then pcall(h, sig) end
       end
-      -- "timer": 忽略（agent 无 event.timer 依赖）
+      -- 其他事件: 忽略继续循环; 超时（sig[1]==nil）由 remaining 兜底
       if remaining <= 0 then return end
     end
   end
