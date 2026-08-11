@@ -249,6 +249,23 @@ local function collect(config, history)
     else
       lines[#lines + 1] = "last chat: (never)"
     end
+    -- 进行中标记（v0.3.80）: chat_started 有值 = 卡在 chat 请求进行中
+    -- （未完成——last_chat 只有上一次成功的）；last_tool 有值 = 卡在
+    -- 工具执行中（subagent_call 240s / shell 60s 等长阻塞工具）。
+    -- 真机 gist dec2a65 现场（uptime 8.5h 卡死，快照只有上次成功的
+    -- 6.8s chat）暴露盲区——卡住的那次请求/工具从未完成，无记录。
+    if diag.chat_started then
+      local c = diag.chat_started
+      lines[#lines + 1] = ">> CHAT IN PROGRESS: started uptime=" .. string.format("%.1fs", c.uptime or 0)
+        .. " est_bytes=" .. tostring(c.est or 0)
+        .. "  <-- 卡在 chat 请求进行中（从未完成）"
+    end
+    if diag.last_tool then
+      local t = diag.last_tool
+      lines[#lines + 1] = ">> TOOL IN PROGRESS: " .. tostring(t.name or "?")
+        .. " started uptime=" .. string.format("%.1fs", t.uptime or 0)
+        .. "  <-- 卡在工具执行中（从未完成）"
+    end
   end
 
   return table.concat(lines, "\n")
