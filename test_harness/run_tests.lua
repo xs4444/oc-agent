@@ -988,6 +988,35 @@ test("file proxy: timeout path",
   "res=" .. tostring(res_proxy))
 os.remove("test_fsrv_tmp.txt")
 modem.close(sub_mod.FILE_PORT)
+
+-- wait_modem_message on_other 转发（v0.3.85 死锁修复）: 主代理
+-- subagent_call 等待回复期间，非回复端口的文件请求经 on_other 回调
+-- 处理，不丢弃——否则 explorer 子代理等文件回复 60s / 主代理等任务
+-- 回复 240s 互相等待死锁。
+do
+  local forwarded = 0
+  local handled_req = nil
+  local wm = sub_mod.wait_modem_message
+  local reply_open = modem.open(9097)
+  -- 入队一个"非回复端口"文件请求（模拟 explorer 子代理）
+  table.insert(oc_mock._event_queue, {"modem_message", modem.address(), modem.address(), 9092, 0,
+    json.encode({v = 1, op = "list_directory", path = "."})})
+  -- 入队"回复端口"消息（模拟子代理任务完成）
+  table.insert(oc_mock._event_queue, {"modem_message", modem.address(), modem.address(), 9097, 0,
+    "REPLY_DONE"})
+  local wm_s, wm_p, wm_payload = wm(5, 9097, function(sig)
+    forwarded = forwarded + 1
+    -- 文件请求: 用 fsrv_exec 处理（与主代理 FILE_EXEC 同语义）
+    handled_req = sub_mod.handle_file_message(fsrv_exec, sig[3], sig[4], sig[6])
+  end)
+  test("wait_modem_message on_other: file request forwarded",
+    forwarded == 1 and handled_req == true,
+    "forwarded=" .. tostring(forwarded) .. " handled=" .. tostring(handled_req))
+  test("wait_modem_message on_other: reply still received",
+    wm_p == 9097 and wm_payload == "REPLY_DONE",
+    "port=" .. tostring(wm_p) .. " payload=" .. tostring(wm_payload))
+  modem.close(9097)
+end
 end
 
 print("")

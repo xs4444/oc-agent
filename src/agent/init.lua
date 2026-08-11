@@ -113,20 +113,34 @@ session_mod.set_chat(chat)
 
 -- Cached deps injected into plugin tool modules; built once, reused
 -- for every execute_tool call (no per-call require or table allocation).
-local DEPS = {
-  json = json,
-  http_post = http_post,
-  load_config = load_config,
-  wait_modem_message = subagent_mod.wait_modem_message,
-  subagent_listen_port = SUBAGENT_LISTEN_PORT,
-  subagent_reply_port = SUBAGENT_REPLY_PORT,
-  subagent_timeout = SUBAGENT_TIMEOUT,
-  -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具依赖注入。
-  -- get_context/rebuild_current 由 process_exchange 每次调用时更新。
-  compact_history = session_mod.compact_history,
-  get_context = nil,
-  rebuild_current = nil,
-}
+-- 两段式声明（v0.3.85）: wait_modem_message 闭包引用 DEPS 自身（自引用
+-- 表构造在 Lua 中易踩作用域坑——表构造期 local 尚未完成初始化，闭包
+-- 解析可能落到全局）。先建空表再填字段，闭包引用的是已存在的表。
+local DEPS = {}
+DEPS.json = json
+DEPS.http_post = http_post
+DEPS.load_config = load_config
+-- wait_modem_message 包装（v0.3.85 死锁修复）: 主代理在 subagent_call
+-- 等待子代理回复的 240s 阻塞期内，把收到的非回复端口 modem 消息
+-- （explorer 文件服务请求）转发给 file_serve 处理——否则事件被
+-- event.pull 消费丢弃，子代理等文件回复 60s 超时，主代理等任务回复
+-- 240s，互相等待死锁（真机 gist 现场: explorer 子代理执行
+-- list_directory/read_file 卡 thinking）。file_serve 由 main() 设置。
+DEPS.wait_modem_message = function(timeout, port)
+  return subagent_mod.wait_modem_message(timeout, port, function(sig)
+    local h = DEPS.file_serve
+    if h then pcall(h, sig) end
+  end)
+end
+DEPS.file_serve = nil  -- main() 设置: explorer 文件服务 hook
+DEPS.subagent_listen_port = SUBAGENT_LISTEN_PORT
+DEPS.subagent_reply_port = SUBAGENT_REPLY_PORT
+DEPS.subagent_timeout = SUBAGENT_TIMEOUT
+-- 模型驱动压缩（opencode-acp 策略）: compact_history 工具依赖注入。
+-- get_context/rebuild_current 由 process_exchange 每次调用时更新。
+DEPS.compact_history = session_mod.compact_history
+DEPS.get_context = nil
+DEPS.rebuild_current = nil
 
 -- TUI 集成（agent.tui）: main() 检测 gpu+screen+keyboard 后设置。
 --   UI_INPUT:   输入函数（TUI readInput 或 nil → io.read）——ask_user /
@@ -1703,6 +1717,9 @@ local function main(config, ...)
       FILE_SERVE_HOOK = function(sig)
         return subagent_mod.handle_file_message(FILE_EXEC, sig[3], sig[4], sig[6])
       end
+      -- v0.3.85: 注入 DEPS.file_serve——subagent_call 等待回复期间的
+      -- 文件请求经 wait_modem_message 的 on_other 转发到这里（死锁修复）
+      DEPS.file_serve = FILE_SERVE_HOOK
     end
   end)
 

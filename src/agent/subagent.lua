@@ -103,7 +103,12 @@ end
 
 -- Wait for a modem_message event (with timeout). Returns
 -- (sender, port, arg1) or nil on timeout. Uses event.pull which yields.
-local function wait_modem_message(timeout, reply_port)
+-- on_other（v0.3.85）: 非 reply_port 的 modem 消息转发给回调（完整 sig
+-- 表）——主代理 subagent_call 等待回复期间，explorer 子代理的文件服务
+-- 请求经它处理。不转发就丢弃（event.pull 消费即失），形成死锁: 子代理
+-- 等文件回复 60s，主代理等任务回复 240s，互相等待直到超时（真机 gist
+-- 现场: explorer 子代理执行 list_directory/read_file 卡 thinking）。
+local function wait_modem_message(timeout, reply_port, on_other)
   local event = require("event")
   local waited = 0
   local step = 0.5
@@ -115,6 +120,9 @@ local function wait_modem_message(timeout, reply_port)
       -- sig[2] is receiver address, sig[3] sender, sig[4] port
       if reply_port == nil or port == reply_port then
         return sender, port, sig[6]
+      end
+      if on_other then
+        on_other(sig)
       end
     end
     waited = waited + step
