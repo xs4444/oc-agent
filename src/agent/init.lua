@@ -1549,7 +1549,16 @@ local function main(config, ...)
         local payload = sig[6]
         if port == listen_port and type(payload) == "string" then
           local ok_json, req = pcall(json.decode, payload)
-          if ok_json and type(req) == "table" and req.id then
+          -- 广播发现配对（v0.3.78）: 主 agent broadcast {v=1, op="discover"}
+          -- （无 id，非任务消息）→ 回自己的 modem 地址到主 agent 的
+          -- reply 端口。远端 modem 不在 component_list（OC 组件只列本机
+          -- 可见），address 文件也不跨机——发现回复是唯一可靠寻址方式。
+          if ok_json and type(req) == "table" and not req.id and req.op == "discover" then
+            local reply_payload = json.encode({v = 1, op = "discover_reply",
+              address = my_addr, model = config.model})
+            pcall(modem.send, sender, SUBAGENT_REPLY_PORT, reply_payload)
+            print("[subagent] discover reply sent to " .. tostring(sender))
+          elseif ok_json and type(req) == "table" and req.id then
             local session = req.session
             -- Busy guard: one task at a time per session (matches opencode's
             -- "Active sessions cannot receive new instructions" rule).

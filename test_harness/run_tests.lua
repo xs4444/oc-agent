@@ -635,7 +635,7 @@ local EXPECTED_TOOLS = {
   "read_file", "write_file", "edit_file", "append_file", "list_directory",
   "json_query", "calc", "text_ops",
   "component_list", "component_doc", "component_invoke",
-  "web_search", "shell_execute", "subagent_call", "ask_user",
+  "web_search", "shell_execute", "subagent_call", "subagent_discover", "ask_user",
   "compact_history", "search_files", "glob",
 }
 local tools_have = {}
