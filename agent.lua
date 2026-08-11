@@ -1745,7 +1745,11 @@ local function chat(messages, config, opts)
     end
   end
   local req_tools = nil
-  if not opts.skip_tools then req_tools = tools_mod.list() end
+  if not opts.skip_tools then
+    -- 工具集覆盖（v0.3.84, explorer 子代理）: opts.tools 显式传列表时
+    -- 用之（init.lua 子代理模式按 role 过滤后的只读集合），否则默认全量。
+    req_tools = opts.tools or tools_mod.list()
+  end
   -- tools normalize（2026-08-11 真机 chat 全挂根因，gist 现场 + ocvm probe）:
   -- OC json.lua 把空表 {} 编码为 []（数组）。端点严格校验
   -- parameters.properties=[] 直接 400——subagent_discover（v0.3.78 新增，
@@ -1863,6 +1867,86 @@ local session_mod = require("agent.session")
 local SUBAGENT_LISTEN_PORT = 9090  -- subagent's task intake port
 local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
 local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
+-- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
+-- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
+-- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
+local FILE_PORT = 9092
+local FILE_TIMEOUT = 60  -- 子代理等文件回复超时（主代理 chat 中时排队）
+
+-- 文件代理: 子代理 explorer 用它把文件工具转发到主代理执行。
+-- exec 签名与本地工具一致 (name, args, deps)。返回与本地工具同格式
+-- （read_file → 文件内容字符串; 错误 → "Error: ..."）。
+local function file_proxy(name, args, deps, master_addr)
+  local ok_m, modem = pcall(function()
+    local comp = require("component")
+    return comp.modem
+  end)
+  if not ok_m or not modem then return "Error: file proxy: no modem component" end
+  local req = {v = 1, op = name}
+  if type(args) == "table" then
+    for k, v in pairs(args) do req[k] = v end
+  end
+  local ok_open = pcall(modem.open, FILE_PORT)
+  local ok_send = pcall(modem.send, master_addr, FILE_PORT, deps.json.encode(req))
+  if not ok_send then return "Error: file proxy: send failed" end
+  local sender, port, payload = deps.wait_modem_message(FILE_TIMEOUT, FILE_PORT)
+  if not sender then return "Error: file proxy: no reply from master within " .. FILE_TIMEOUT .. "s" end
+  local ok_d, reply = pcall(deps.json.decode, payload)
+  if not ok_d or type(reply) ~= "table" then return "Error: file proxy: bad reply" end
+  if reply.ok then
+    return reply.content or ""
+  end
+  return "Error: " .. tostring(reply.error or "unknown")
+end
+
+-- 处理单条 modem 文件请求（推模式，TUI readInput 事件回调用）。
+-- exec_fn 由 init.lua 注入（execute_tool 包装），签名 exec_fn(name, args_table)
+-- 返回 (ok, result_string)。
+local function handle_file_message(exec_fn, sender, port, payload)
+  local ok_c, comp = pcall(require, "component")
+  if not ok_c or not comp.modem then return false end
+  local modem = comp.modem
+  local json = require("agent.json")
+  if port ~= FILE_PORT or type(payload) ~= "string" then return false end
+  local ok_j, req = pcall(json.decode, payload)
+  local reply
+  if not ok_j or type(req) ~= "table" or not req.op then
+    reply = json.encode({v = 1, ok = false, error = "bad file request"})
+  else
+    local op = req.op:match("^file:(.+)$") or req.op
+    -- 只服务只读文件工具（安全边界: 文件服务绝不执行写工具）
+    if op == "read_file" or op == "list_directory"
+        or op == "search_files" or op == "glob" then
+      local args = {}
+      for k, v in pairs(req) do
+        if k ~= "v" and k ~= "op" then args[k] = v end
+      end
+      local ok_exec, result = exec_fn(op, args)
+      if ok_exec and type(result) == "string" then
+        reply = json.encode({v = 1, ok = true, content = result})
+      else
+        reply = json.encode({v = 1, ok = false, error = tostring(result)})
+      end
+    else
+      reply = json.encode({v = 1, ok = false, error = "op not allowed: " .. tostring(op)})
+    end
+  end
+  pcall(modem.send, sender, FILE_PORT, reply)
+  return true
+end
+
+-- 主代理侧文件服务: 非阻塞处理所有 pending 文件请求（event.pull 0s 轮询，
+-- 在 REPL/TUI 空闲时调用；chat 阻塞期间请求排队，恢复空闲后处理）。
+local function serve_file_requests(exec_fn)
+  local ok_e, event = pcall(require, "event")
+  local ok_c, comp = pcall(require, "component")
+  if not ok_e or not ok_c or not comp.modem then return end
+  while true do
+    local sig = {event.pull(0, "modem_message")}
+    if not sig[1] then break end
+    handle_file_message(exec_fn, sig[3], sig[4], sig[6])
+  end
+end
 
 -- Wait for a modem_message event (with timeout). Returns
 -- (sender, port, arg1) or nil on timeout. Uses event.pull which yields.
@@ -1946,9 +2030,14 @@ return {
   load_session_history = load_session_history,
   append_session_history = append_session_history,
   rebuild_session_history = rebuild_session_history,
+  file_proxy = file_proxy,
+  serve_file_requests = serve_file_requests,
+  handle_file_message = handle_file_message,
   SUBAGENT_LISTEN_PORT = SUBAGENT_LISTEN_PORT,
   SUBAGENT_REPLY_PORT = SUBAGENT_REPLY_PORT,
   SUBAGENT_TIMEOUT = SUBAGENT_TIMEOUT,
+  FILE_PORT = FILE_PORT,
+  FILE_TIMEOUT = FILE_TIMEOUT,
 }
 end
 
@@ -2792,7 +2881,11 @@ end
 
 -- 事件驱动输入: 键盘编辑 + 历史浏览 + Tab 补全 + 滚动 + Ctrl+C。
 -- 无 keyboard 组件时回退 io.read（机器人）。
-function tui.readInput()
+function tui.readInput(on_event)
+  -- on_event（v0.3.84）: 可选回调，事件循环收到非键盘事件（如
+  -- modem_message——explorer 子代理的文件服务请求）时转发，避免事件被
+  -- readInput 消费丢弃。回调签名 on_event(ev, args_table)。返回 true
+  -- 表示事件已消费（不打断输入循环）。
   -- 键盘可用性检测（荒野大师/OCEmu 同款 OpenOS 库缺 keyboard.isAvailable，
   -- 但组件存在且事件驱动正常——真机探针实证 key_down 全键标准格式到达）：
   -- isAvailable 缺失时回退到组件检测；组件可用即走事件驱动分支，否则
@@ -2826,7 +2919,22 @@ function tui.readInput()
   pcall(tui.drawInput)
 
   while true do
-    local ev, _, char, code = event.pull(0.25)
+    local sig = {event.pull(0.25)}
+    local ev, _, char, code = sig[1], sig[2], sig[3], sig[4]
+
+    -- 非键盘事件转发（v0.3.84）: modem_message 等交给 on_event 回调
+    -- （主代理文件服务用——explorer 子代理读主代理硬盘）。不打断
+    -- 输入循环，事件不丢失。回调签名 on_event(sig_table)（sig[1]=ev,
+    -- sig[3]=sender, sig[4]=port, sig[6]=payload...），返回 true 表示
+    -- 已消费。
+    if on_event and ev ~= "key_down" and ev ~= "interrupted"
+        and ev ~= "key_up" and ev ~= "clipboard" then
+      local handled = on_event(sig)
+      if handled then
+        pcall(tui.drawInput)
+        -- fallthrough: 继续输入循环（事件已消费）
+      end
+    end
 
     -- 光标闪烁
     local now = now_seconds()
@@ -4216,8 +4324,8 @@ package.preload["agent.tools.subagent"] = function()
 local tools = {
   {type="function", ["function"]={
     name="subagent_call",
-    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from subagent_discover — the broadcast discovery tool — or from the address the subagent printed at startup; NOTE: component_list only shows LOCAL components, remote modems are NOT listed there), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate), a session id to continue a previous conversation on that subagent (same id = context preserved; omit for a fresh session), and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research.",
-    parameters={type="object", properties={address={type="string", description="Target modem address (use subagent_discover to find it; NOT from component_list — remote modems are invisible there)"}, task={type="string", description="Task description for the subagent"}, role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate"}, session={type="string", description="Optional session id: same id continues the previous conversation on that subagent; omit for fresh context"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
+    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from subagent_discover — the broadcast discovery tool — or from the address the subagent printed at startup; NOTE: component_list only shows LOCAL components, remote modems are NOT listed there), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate/explorer), a session id to continue a previous conversation on that subagent (same id = context preserved; omit for a fresh session), and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research. EXPLORER ROLE (v0.3.84): read-only reconnaissance — the subagent gets ONLY read-only tools, and its read_file/list_directory/search_files/glob are proxied over the modem to the MASTER computer, letting it read the master's hard drive (code/docs) over the LAN without any write access.",
+    parameters={type="object", properties={address={type="string", description="Target modem address (use subagent_discover to find it; NOT from component_list — remote modems are invisible there)"}, task={type="string", description="Task description for the subagent"},     role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate, explorer (explorer = read-only; file tools proxied to the master)"}, session={type="string", description="Optional session id: same id continues the previous conversation on that subagent; omit for fresh context"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
   }},
   {type="function", ["function"]={
     name="subagent_discover",
@@ -5496,7 +5604,7 @@ local function enforce_memory(messages, config, persist, session)
     .. " → " .. fmt_num(f_after) .. "）")
 end
 
-local function process_exchange(messages, config, user_input, persist, session)
+local function process_exchange(messages, config, user_input, persist, session, tools_override)
   messages[#messages + 1] = {role = "user", content = user_input}
 
   -- 模型驱动压缩（opencode-acp 策略）: compact_history 工具通过 DEPS
@@ -5620,7 +5728,7 @@ local function process_exchange(messages, config, user_input, persist, session)
       end
     end
     persist_diag()
-    local response = chat(messages, config)
+    local response = chat(messages, config, {tools = tools_override})
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
       uptime = t_start,
@@ -6067,6 +6175,51 @@ local function main(config, ...)
                 req_messages[#req_messages + 1] = {role = "user", content = "[来自主代理的上下文]\n" .. req.context}
               end
               local task_text = req.task or ""
+              -- explorer 角色（v0.3.84）: 只读探索子代理——工具集过滤为
+              -- 只读集合（物理不能写），且 file 工具代理到主代理执行
+              -- （内网读主代理硬盘代码/文档，经 modem FILE_PORT 9092）。
+              -- 工具集覆盖规则: TOOLS 声明里 name 在只读白名单 → 保留;
+              -- 写工具/shell/ask_user/subagent_call 等 → 剔除。
+              -- 执行拦截: execute_tool 全局替换——read_file/list_directory/
+              -- search_files/glob 转发到 subagent_mod.file_proxy(master=
+              -- sender)（任务发送者即主代理地址），其余走原 execute_mod.run。
+              local tools_override = nil
+              if req.role and req.role == "explorer" then
+                local READONLY = {
+                  read_file = true, list_directory = true,
+                  search_files = true, glob = true,
+                  component_list = true, component_doc = true,
+                  json_query = true, calc = true, text_ops = true,
+                  web_search = true, subagent_discover = true,
+                }
+                local FILE_PROXY_TOOLS = {
+                  read_file = true, list_directory = true,
+                  search_files = true, glob = true,
+                }
+                tools_override = {}
+                for _, t in ipairs(TOOLS) do
+                  local name = t and t["function"] and t["function"].name
+                  if name and READONLY[name] then
+                    tools_override[#tools_override + 1] = t
+                  end
+                end
+                local orig_execute = execute_tool
+                execute_tool = function(name, args_str)
+                  if FILE_PROXY_TOOLS[name] then
+                    local args = {}
+                    local ok_args = pcall(function()
+                      args = json.decode(args_str)
+                    end)
+                    local res = subagent_mod.file_proxy(name, type(args) == "table" and args or {}, DEPS, sender)
+                    if type(res) == "string" and res:sub(1, 6) == "Error:" then
+                      return nil, res
+                    end
+                    return res, nil
+                  end
+                  return orig_execute(name, args_str)
+                end
+                print("[subagent] explorer mode: " .. #tools_override .. " readonly tools, file ops proxied to " .. tostring(sender))
+              end
               if req.role and req.role ~= "" then
                 task_text = "[角色: " .. req.role .. "]\n" .. task_text
               end
@@ -6075,7 +6228,7 @@ local function main(config, ...)
               -- Guard against unexpected exceptions escaping process_exchange:
               -- busy_session must be released either way, or this session would
               -- be permanently stuck busy and reject all new tasks.
-              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil)
+              local ok_proc, result = pcall(process_exchange, req_messages, config, task_text, persist, persist and session or nil, tools_override)
               if not ok_proc then result = { error = tostring(result) } end
               busy_session = nil  -- release (opencode: Active → Reusable)
               local reply
@@ -6100,6 +6253,31 @@ local function main(config, ...)
 
   local messages = load_history()
   local term_history = {}
+
+  -- ── 文件服务（v0.3.84）: explorer 子代理经 modem 读主代理硬盘 ──
+  -- 主代理空闲时（TUI readInput 事件回调 / REPL 每轮对话间隙）处理
+  -- 只读文件请求（read_file/list_directory/search_files/glob，绝不写）。
+  -- chat 阻塞期间请求在事件队列排队，恢复空闲后处理。
+  -- 仅在有 modem 网卡时启用；失败静默（无网卡机器不受影响）。
+  local FILE_EXEC = function(name, args)
+    local ok, result = pcall(execute_tool, name, json.encode(args))
+    if not ok then return false, tostring(result) end
+    if type(result) == "string" and result:sub(1, 6) == "Error:" then
+      return false, result
+    end
+    return true, result
+  end
+  local FILE_SERVE_HOOK = nil  -- 由 TUI/REPL 分支设置（避免无 modem 时重复 require）
+  pcall(function()
+    local component = require("component")
+    if component.modem then
+      component.modem.open(subagent_mod.FILE_PORT)
+      -- 统一入口: TUI 回调推模式 / REPL 拉模式
+      FILE_SERVE_HOOK = function(sig)
+        return subagent_mod.handle_file_message(FILE_EXEC, sig[3], sig[4], sig[6])
+      end
+    end
+  end)
 
   -- ── TUI 模式（参考 DonChong2000/oc-ai 的 oc-code TUI）──
   -- gpu+screen+keyboard 齐全时启用; 否则回退传统 REPL。
@@ -6186,7 +6364,7 @@ local function main(config, ...)
     if ui then
       -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
       ui.setStatus("Ready")
-      local input = ui.readInput()
+      local input = ui.readInput(FILE_SERVE_HOOK)  -- 文件服务回调（modem 请求不丢失）
       if input == nil then
         ui.print("^C", ui.colors.dim)
         goto continue
@@ -6222,6 +6400,18 @@ local function main(config, ...)
     end
 
     io.write("> ")
+    if FILE_SERVE_HOOK then
+      -- REPL 模式: io.read 阻塞期间事件排队，回到主循环时集中处理
+      -- （文件服务请求——explorer 子代理读主代理硬盘）
+      local ok_e, event = pcall(require, "event")
+      if ok_e then
+        while true do
+          local sig = {event.pull(0, "modem_message")}
+          if not sig[1] then break end
+          FILE_SERVE_HOOK(sig)
+        end
+      end
+    end
     local input = io.read()
     if not input then break end
     input = input:gsub("\n", "")

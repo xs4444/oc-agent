@@ -20,6 +20,86 @@ local session_mod = require("agent.session")
 local SUBAGENT_LISTEN_PORT = 9090  -- subagent's task intake port
 local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
 local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
+-- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
+-- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
+-- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
+local FILE_PORT = 9092
+local FILE_TIMEOUT = 60  -- 子代理等文件回复超时（主代理 chat 中时排队）
+
+-- 文件代理: 子代理 explorer 用它把文件工具转发到主代理执行。
+-- exec 签名与本地工具一致 (name, args, deps)。返回与本地工具同格式
+-- （read_file → 文件内容字符串; 错误 → "Error: ..."）。
+local function file_proxy(name, args, deps, master_addr)
+  local ok_m, modem = pcall(function()
+    local comp = require("component")
+    return comp.modem
+  end)
+  if not ok_m or not modem then return "Error: file proxy: no modem component" end
+  local req = {v = 1, op = name}
+  if type(args) == "table" then
+    for k, v in pairs(args) do req[k] = v end
+  end
+  local ok_open = pcall(modem.open, FILE_PORT)
+  local ok_send = pcall(modem.send, master_addr, FILE_PORT, deps.json.encode(req))
+  if not ok_send then return "Error: file proxy: send failed" end
+  local sender, port, payload = deps.wait_modem_message(FILE_TIMEOUT, FILE_PORT)
+  if not sender then return "Error: file proxy: no reply from master within " .. FILE_TIMEOUT .. "s" end
+  local ok_d, reply = pcall(deps.json.decode, payload)
+  if not ok_d or type(reply) ~= "table" then return "Error: file proxy: bad reply" end
+  if reply.ok then
+    return reply.content or ""
+  end
+  return "Error: " .. tostring(reply.error or "unknown")
+end
+
+-- 处理单条 modem 文件请求（推模式，TUI readInput 事件回调用）。
+-- exec_fn 由 init.lua 注入（execute_tool 包装），签名 exec_fn(name, args_table)
+-- 返回 (ok, result_string)。
+local function handle_file_message(exec_fn, sender, port, payload)
+  local ok_c, comp = pcall(require, "component")
+  if not ok_c or not comp.modem then return false end
+  local modem = comp.modem
+  local json = require("agent.json")
+  if port ~= FILE_PORT or type(payload) ~= "string" then return false end
+  local ok_j, req = pcall(json.decode, payload)
+  local reply
+  if not ok_j or type(req) ~= "table" or not req.op then
+    reply = json.encode({v = 1, ok = false, error = "bad file request"})
+  else
+    local op = req.op:match("^file:(.+)$") or req.op
+    -- 只服务只读文件工具（安全边界: 文件服务绝不执行写工具）
+    if op == "read_file" or op == "list_directory"
+        or op == "search_files" or op == "glob" then
+      local args = {}
+      for k, v in pairs(req) do
+        if k ~= "v" and k ~= "op" then args[k] = v end
+      end
+      local ok_exec, result = exec_fn(op, args)
+      if ok_exec and type(result) == "string" then
+        reply = json.encode({v = 1, ok = true, content = result})
+      else
+        reply = json.encode({v = 1, ok = false, error = tostring(result)})
+      end
+    else
+      reply = json.encode({v = 1, ok = false, error = "op not allowed: " .. tostring(op)})
+    end
+  end
+  pcall(modem.send, sender, FILE_PORT, reply)
+  return true
+end
+
+-- 主代理侧文件服务: 非阻塞处理所有 pending 文件请求（event.pull 0s 轮询，
+-- 在 REPL/TUI 空闲时调用；chat 阻塞期间请求排队，恢复空闲后处理）。
+local function serve_file_requests(exec_fn)
+  local ok_e, event = pcall(require, "event")
+  local ok_c, comp = pcall(require, "component")
+  if not ok_e or not ok_c or not comp.modem then return end
+  while true do
+    local sig = {event.pull(0, "modem_message")}
+    if not sig[1] then break end
+    handle_file_message(exec_fn, sig[3], sig[4], sig[6])
+  end
+end
 
 -- Wait for a modem_message event (with timeout). Returns
 -- (sender, port, arg1) or nil on timeout. Uses event.pull which yields.
@@ -103,7 +183,12 @@ return {
   load_session_history = load_session_history,
   append_session_history = append_session_history,
   rebuild_session_history = rebuild_session_history,
+  file_proxy = file_proxy,
+  serve_file_requests = serve_file_requests,
+  handle_file_message = handle_file_message,
   SUBAGENT_LISTEN_PORT = SUBAGENT_LISTEN_PORT,
   SUBAGENT_REPLY_PORT = SUBAGENT_REPLY_PORT,
   SUBAGENT_TIMEOUT = SUBAGENT_TIMEOUT,
+  FILE_PORT = FILE_PORT,
+  FILE_TIMEOUT = FILE_TIMEOUT,
 }

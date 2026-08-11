@@ -223,7 +223,11 @@ local function chat(messages, config, opts)
     end
   end
   local req_tools = nil
-  if not opts.skip_tools then req_tools = tools_mod.list() end
+  if not opts.skip_tools then
+    -- 工具集覆盖（v0.3.84, explorer 子代理）: opts.tools 显式传列表时
+    -- 用之（init.lua 子代理模式按 role 过滤后的只读集合），否则默认全量。
+    req_tools = opts.tools or tools_mod.list()
+  end
   -- tools normalize（2026-08-11 真机 chat 全挂根因，gist 现场 + ocvm probe）:
   -- OC json.lua 把空表 {} 编码为 []（数组）。端点严格校验
   -- parameters.properties=[] 直接 400——subagent_discover（v0.3.78 新增，

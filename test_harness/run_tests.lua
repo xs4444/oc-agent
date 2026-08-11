@@ -929,6 +929,69 @@ test("subagent_call sends and times out (no real peer)", req_json:find("timeout"
 
 print("")
 print("═══════════════════════════════════════")
+print("File Service (explorer proxy) Tests")
+print("═══════════════════════════════════════")
+
+-- 文件服务协议（v0.3.84）: explorer 子代理把 read_file 等经 modem 代理到
+-- 主代理执行。serve 端（主代理）非阻塞轮询处理; proxy 端（子代理）发送
+-- 请求等回复。此处验证两端协议（loopback 分步模拟，不真并发）。
+do
+local sub_mod = require("agent.subagent")
+modem.open(sub_mod.FILE_PORT)
+local tmp_fsrv = io.open("test_fsrv_tmp.txt", "w")
+tmp_fsrv:write("FILE_SERVICE_TEST_CONTENT_12345")
+tmp_fsrv:close()
+-- 与 init.lua FILE_EXEC 同语义的包装（execute_tool 字符串结果 → ok,result）
+local fsrv_exec = function(name, args)
+  local ok2, res = pcall(execute_tool, name, json.encode(args))
+  if not ok2 then return false, tostring(res) end
+  if type(res) == "string" and res:sub(1, 6) == "Error:" then return false, res end
+  return true, res
+end
+-- 清空事件队列
+while true do
+  local sig = {mock_event.pull(0)}
+  if not sig[1] then break end
+end
+-- serve 端: handle_file_message 处理（TUI 推模式真实路径）→ 回传（入队
+-- 回复）。注意: 不能预先入队请求（会先被 pull 拉到）也不能用
+-- serve_file_requests 轮询——loopback 下回复事件会被它再当请求处理
+-- （真实双机无此问题: 回复发给子代理地址，不会回到主代理端口）。
+sub_mod.handle_file_message(fsrv_exec, modem.address(), sub_mod.FILE_PORT,
+  json.encode({v = 1, op = "read_file", path = "test_fsrv_tmp.txt"}))
+local sig = {mock_event.pull(0.5)}
+local okd, reply = pcall(json.decode, sig[6])
+test("file service: read_file proxied + replied",
+  okd and reply and reply.ok and reply.content:find("FILE_SERVICE_TEST_CONTENT", 1, true) ~= nil,
+  "reply=" .. tostring(sig[6]))
+-- 安全边界: 写工具必须被拒
+sub_mod.handle_file_message(fsrv_exec, modem.address(), sub_mod.FILE_PORT,
+  json.encode({v = 1, op = "write_file", path = "x", content = "evil"}))
+local sig2 = {mock_event.pull(0.5)}
+local okd2, reply2 = pcall(json.decode, sig2[6])
+test("file service: write op rejected",
+  okd2 and reply2 and not reply2.ok and tostring(reply2.error):find("not allowed", 1, true) ~= nil,
+  "reply=" .. tostring(sig2[6]))
+-- proxy 端编码: file_proxy 发送的请求格式（mock send 捕获; wait 注入超时）
+local sent = nil
+local orig_send = modem.send
+modem.send = function(addr, port, payload) sent = payload; return true end
+local res_proxy = sub_mod.file_proxy("read_file", {path = "test_fsrv_tmp.txt"},
+  {json = json, wait_modem_message = function() return nil end}, modem.address())
+modem.send = orig_send
+local okd3, preq = pcall(json.decode, sent)
+test("file proxy: request format",
+  okd3 and preq and preq.v == 1 and preq.op == "read_file" and preq.path == "test_fsrv_tmp.txt",
+  "sent=" .. tostring(sent))
+test("file proxy: timeout path",
+  type(res_proxy) == "string" and res_proxy:find("no reply", 1, true) ~= nil,
+  "res=" .. tostring(res_proxy))
+os.remove("test_fsrv_tmp.txt")
+modem.close(sub_mod.FILE_PORT)
+end
+
+print("")
+print("═══════════════════════════════════════")
 print("Subagent Session Persistence Tests")
 print("═══════════════════════════════════════")
 

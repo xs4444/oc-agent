@@ -370,6 +370,8 @@ local M = {
   serialization = mock_serialization,
   event = mock_event,
   thread = mock_thread,
+  -- 事件队列导出（文件服务协议测试用手动入队模拟远端请求）
+  _event_queue = OC._event_queue,
 }
 
 -- component.modem — real OC exposes primary component proxies like this

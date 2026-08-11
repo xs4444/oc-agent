@@ -479,7 +479,11 @@ end
 
 -- 事件驱动输入: 键盘编辑 + 历史浏览 + Tab 补全 + 滚动 + Ctrl+C。
 -- 无 keyboard 组件时回退 io.read（机器人）。
-function tui.readInput()
+function tui.readInput(on_event)
+  -- on_event（v0.3.84）: 可选回调，事件循环收到非键盘事件（如
+  -- modem_message——explorer 子代理的文件服务请求）时转发，避免事件被
+  -- readInput 消费丢弃。回调签名 on_event(ev, args_table)。返回 true
+  -- 表示事件已消费（不打断输入循环）。
   -- 键盘可用性检测（荒野大师/OCEmu 同款 OpenOS 库缺 keyboard.isAvailable，
   -- 但组件存在且事件驱动正常——真机探针实证 key_down 全键标准格式到达）：
   -- isAvailable 缺失时回退到组件检测；组件可用即走事件驱动分支，否则
@@ -513,7 +517,22 @@ function tui.readInput()
   pcall(tui.drawInput)
 
   while true do
-    local ev, _, char, code = event.pull(0.25)
+    local sig = {event.pull(0.25)}
+    local ev, _, char, code = sig[1], sig[2], sig[3], sig[4]
+
+    -- 非键盘事件转发（v0.3.84）: modem_message 等交给 on_event 回调
+    -- （主代理文件服务用——explorer 子代理读主代理硬盘）。不打断
+    -- 输入循环，事件不丢失。回调签名 on_event(sig_table)（sig[1]=ev,
+    -- sig[3]=sender, sig[4]=port, sig[6]=payload...），返回 true 表示
+    -- 已消费。
+    if on_event and ev ~= "key_down" and ev ~= "interrupted"
+        and ev ~= "key_up" and ev ~= "clipboard" then
+      local handled = on_event(sig)
+      if handled then
+        pcall(tui.drawInput)
+        -- fallthrough: 继续输入循环（事件已消费）
+      end
+    end
 
     -- 光标闪烁
     local now = now_seconds()
