@@ -400,6 +400,11 @@ local function copy_file_chunked(src, dst)
   return true
 end
 
+-- v0.3.107: TUI 引用（模块级）——ui 是 main() 局部变量，handle_command
+-- 看不到（/paste 误判 REPL 分支）。main() 初始化 TUI 后赋值；nil =
+-- REPL 模式（io.read 回退，无输入行可注入）。
+local UI_REF = nil
+
 local function handle_command(cmd, config, messages)
   local parts = {}
   for w in cmd:gmatch("%S+") do parts[#parts + 1] = w end
@@ -902,9 +907,10 @@ local function handle_command(cmd, config, messages)
       local content = f:read("*a")
       f:close()
       if content and #content > 0 then
-        if ui then
-          -- TUI 模式: 注入输入行
-          ui.setInputBuffer(content)
+        if UI_REF then
+          -- TUI 模式: 注入输入行（v0.3.107: 用 UI_REF——ui 是 main()
+          -- 局部变量 handle_command 看不到，原判断恒 REPL）
+          UI_REF.setInputBuffer(content)
           print("粘贴 " .. ulen(content) .. " 字符到输入行（回车发送）")
         else
           -- REPL 模式: 打印内容供复制（readInput 回退 io.read 时无输入行
@@ -1911,6 +1917,7 @@ local function main(config, ...)
     local ok_tui, tui_mod = pcall(require, "agent.tui")
     if ok_tui then
       ui = tui_mod
+      UI_REF = ui  -- v0.3.107: handle_command 的 /paste 用它（ui 局部不可见）
       local mono = config.monochrome
       if not mono then
         local ok_d, depth = pcall(component.gpu.getDepth)
