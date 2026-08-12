@@ -132,7 +132,6 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 ├── scripts/               # 构建与发版脚本 → scripts/README.md
 │   ├── build_all.py       # 构建+清单+234 项回归一键
 │   ├── release_check.py   # 发版安全检查（版本 bump/清单/字节/语法）
-│   ├── watch_release.py   # jsDelivr 索引监控（索引后提示可更新）
 │   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
 │   └── build_single.lua / make_manifest.lua
 ├── lua_portable/          # 便携 Lua 5.4（本地测试运行时）→ lua_portable/README.md
@@ -166,7 +165,7 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 - 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
 - LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
-- 发版链路：`build_all.py` → `release_check.py`（全 PASS 才能打 tag）→ `watch_release.py --tag vX.Y.Z`（监控 jsDelivr 索引，索引后服务器 `lua update.lua`）
+- 发版链路：`build_all.py` → `release_check.py`（全 PASS 才能打 tag）→ `git push --tags`；jsDelivr 索引无需监控，实机 `lua update.lua` 即拉新 tag
 - 远程诊断：游戏内 `/debug` 上传诊断报告到 Gist（`tools/gist.py latest` 拉取）
 
 ## 已知限制

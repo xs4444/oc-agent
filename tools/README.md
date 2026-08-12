@@ -14,7 +14,7 @@
 python scripts/build_all.py            # 构建 + 清单 + 234 项回归
 python scripts/release_check.py        # 安全检查（全 PASS 才能发）
 git commit ... && git tag v0.3.4 && git push origin master v0.3.4
-python scripts/watch_release.py --tag v0.3.4   # 挂机等 jsDelivr 索引
+# jsDelivr 索引无需监控——实机 lua update.lua 拉新 tag
 
 # 模拟器测试 + 结果
 EXTRA_FILES=../docs_pack/oc-docs.tar python tools/ocvm_test.py test_docs_lua.lua
