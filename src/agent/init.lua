@@ -732,6 +732,51 @@ local function handle_command(cmd, config, messages)
         print("(set /gist-token <github_token> to auto-upload; or paste the report content)")
       end
     end
+  elseif command == "/selftest" then
+    -- 实机自检（v0.3.90）: 跑嵌入式 selftest（env/json/fs/session/config/
+    -- net/interrupt/tools/mem）→ 结果写文件 + 可选 gist 上传回传。
+    -- 用途: 真机环境验证（2MB RAM、JVM internet、luajit 行为——ocvm
+    -- 与模拟层都覆盖不到的真机行为）。
+    local ok_st, st_mod = pcall(require, "agent.selftest")
+    if not ok_st then
+      print("Selftest module unavailable: " .. tostring(st_mod))
+    else
+      print("Running selftest (9 checks, ~30s)...")
+      local ok_run, report = pcall(st_mod.run)
+      if not ok_run then
+        print("Selftest crashed: " .. tostring(report))
+      else
+        print(report)
+        local out_path = WRITABLE_BASE .. "/selftest_report.txt"
+        local ok_w, werr = pcall(function()
+          local f = io.open(out_path, "w")
+          f:write(report)
+          f:close()
+        end)
+        if ok_w then
+          print("Selftest report written to " .. out_path .. " (" .. #report .. " bytes)")
+        else
+          print("Cannot write " .. out_path .. ": " .. tostring(werr))
+        end
+        local token = config.gist_token
+        if token and token ~= "" then
+          print("Uploading to GitHub gist (timeout 30s)...")
+          local ok_d, debug_mod = pcall(require, "agent.debug")
+          if ok_d and debug_mod and debug_mod.upload then
+            local url, err = debug_mod.upload(report, token)
+            if url then
+              print("Gist uploaded: " .. url)
+            else
+              print("Upload failed: " .. tostring(err))
+            end
+          else
+            print("(agent.debug unavailable — report saved locally)")
+          end
+        else
+          print("(set /gist-token <github_token> to auto-upload; or paste the report content)")
+        end
+      end
+    end
   elseif command == "/gist-token" then
     if parts[2] then
       config.gist_token = parts[2]
@@ -808,6 +853,7 @@ local function handle_command(cmd, config, messages)
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
+    print("  /selftest       Run on-device selftest (env/json/fs/session/config/net/interrupt/tools/mem), write + upload report")
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
     print("  /ctx            Show context usage (tokens + progress bar, like opencode TUI)")
