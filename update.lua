@@ -189,15 +189,30 @@ end
 -- @master 缓存过期已知问题，注释见文件头），与当前脚本对比，不同则
 -- 原子替换（先写 .new 再 rename）并提示重跑。返回 true = 已自更新
 -- （调用方应终止当前执行）。任何失败静默返回 false（不影响主流程）。
-local function self_update()
-  -- 定位当前脚本（install.lua 同款: arg[0] 含路径时截目录）
-  local script_path
-  if arg and arg[0] then
-    script_path = tostring(arg[0])
-  else
-    script_path = INSTALL_DIR:match("^(.*)/agent$") .. "/update.lua"
+-- v0.3.96 修复路径定位: 不用 arg[0]——用户通过启动器
+-- /home/bin/update.lua（loadfile + chunk()）执行时 arg[0] 是启动器
+-- 路径（/home/bin/update.lua），而真实脚本在 agent 同盘
+-- （/mnt/bb7/update.lua），自举会写错位置"没能直接 update"。
+-- 改用 debug.getinfo(1,"S").source——loadfile 的 chunk source 是
+-- "@真实路径"，与启动器无关。
+local function self_script_path()
+  local src = debug.getinfo(1, "S").source or ""
+  if src:sub(1, 1) == "@" then
+    local p = src:sub(2)
+    -- 排除 [C]/[string ".."]/空（真实文件路径才有意义）
+    if p ~= "" and not p:find("=") and not p:find("^[%[<]") then
+      return p
+    end
   end
-  if not script_path or script_path == "" or script_path:find("=lua") then
+  -- 回退: INSTALL_DIR 推导（update.lua 与 agent 同盘父目录）
+  local parent = INSTALL_DIR:match("^(.*)/agent$")
+  if parent then return parent .. "/update.lua" end
+  return nil
+end
+
+local function self_update()
+  local script_path = self_script_path()
+  if not script_path then
     return false  -- 无法定位自身（罕见），跳过自举
   end
   -- 双源下载 @master（GitHub raw 优先 = 实时最新; jsDelivr 回退）
