@@ -3445,6 +3445,9 @@ local function json_encode(v)
 end
 
 -- 重绘内容区（可见窗口 = 底部 h 行 - scrollOffset）
+-- v0.3.108: 统一走 drawRow 派生渲染——每行从 history 取文本 + 选中
+-- 区间实时着色。全量重绘自动带选中高亮（touch/复制/清除/滚动后
+-- 状态一致，无残留）。
 function tui.redrawContent()
   local g = component.gpu
   local x, y, w, h = getContentBounds()
@@ -3452,14 +3455,11 @@ function tui.redrawContent()
   g.fill(x - 1, y, w + 2, h, " ")
   local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
   local endIdx = math.min(#state.history, startIdx + h - 1)
-  local row = y
   for i = startIdx, endIdx do
-    local entry = state.history[i]
-    g.setForeground(entry.color or tui.colors.foreground)
-    g.set(x, row, usub(entry.text, 1, w))
-    row = row + 1
+    drawRow(g, x, y + (i - startIdx), startIdx, i)
   end
   g.setForeground(tui.colors.foreground)
+  g.setBackground(tui.colors.background)
   tui.drawStatus()
   tui.drawInput()
 end
@@ -3487,73 +3487,114 @@ local function isWideChar(ch)
   return type(ch) == "string" and #ch >= 3
 end
 
--- 从 history 重画内容区指定矩形区域（v0.3.106 增量更新——拖动不闪烁）:
--- 拖动时旧选中矩形的内容已反色覆盖，重画该区域行片段恢复原文本。
--- 参数为屏幕坐标（含边界裁剪）。
-local function redrawRectArea(xa, ya, xb, yb)
+-- ═══════════════════════════════════════════════════════════════
+-- 选中渲染（v0.3.108 重构——经典终端无状态派生模式，抄 tmux/vim）
+--
+-- exp-1 勘察结论（repos/tmux screen.c:28-42/533-634/642-657,
+-- repos/vim drawscreen.c:1461-1504）: 经典终端选中 = "无状态派生
+-- 渲染"——只存 (anchor, active) 两个坐标 + 活动标志，高亮样式
+-- 从不写进字符存储，每帧从选中区间实时计算每个 cell 是否被选中。
+-- 方向反转无残留的根本原因: 没有"之前反过色的格子"概念，就没有
+-- 需要恢复的状态（tmux screen_check_selection 三分支纯比较 /
+-- vim LTOREQ_POS 选 top/bot）。
+--
+-- 旧实现（逐格反色 + gpu.get 交错）违反此原则:
+--   1. 状态累积: 反色→再反色配对，方向反转重叠格反色两次 → 错色
+--   2. get 交错: 每格 get+set 4-5 次调用（80×40=16000 次/帧）→ 闪烁
+--
+-- 新实现（vim 行级整行重写模式在 OC 的适配）:
+--   - 渲染每行从 history 取文本（数据源），命中选中区间则整行
+--     分 3 段着色一次 set（前缀原色/选中段反色/后缀原色）
+--   - 无 gpu.get: 恢复 = 重新派生（重绘行即恢复原色，天然无残留）
+--   - 拖动只重绘受影响行区间 [min(old_y,new_y), max(old_y,new_y)]
+--     （tmux window_copy_redraw_selection 模式）
+-- ═══════════════════════════════════════════════════════════════
+
+-- 行命中选中区间? 返回该行选中列区间 (from, to) 或 nil。
+-- 纯比较（tmux screen_check_selection 思路）: 方向无关——anchor/active
+-- 顺序不影响命中判断（先归一化再三分支）。
+local function selectionSpan(row, x, w)
+  if not state.csel or not state.csel_active then return nil end
+  local a, b = normalizeCsel()
+  local xmax = x + w - 1
+  if row < a.y or row > b.y then return nil end
+  local from, to
+  if a.y == b.y then
+    from, to = a.x, b.x
+  elseif row == a.y then
+    from, to = a.x, xmax
+  elseif row == b.y then
+    from, to = x, b.x
+  else
+    from, to = x, xmax
+  end
+  from = math.max(x, from)
+  to = math.min(xmax, to)
+  if from > to then return nil end
+  return from, to
+end
+
+-- 派生渲染单行（vim win_line 模式）: 从 history 取文本，按选中
+-- 区间分 3 段整段 set（前缀原色/选中段反色/后缀原色）——每行 ≤3 次
+-- set，无 gpu.get。选中段反色: fg=背景色, bg=行原色（文字以原色为底
+-- 黑字，可见且与角色色一致）。
+local function drawRow(g, x, screenY, startIdx, idx)
+  local _, _, w = getContentBounds()
+  local entry = state.history[idx]
+  if not entry then
+    g.setForeground(tui.colors.foreground)
+    g.set(x, screenY, string.rep(" ", w))
+    return
+  end
+  local color = entry.color or tui.colors.foreground
+  local line = usub(entry.text, 1, w)
+  local selFrom, selTo = selectionSpan(screenY, x, w)
+  if not selFrom then
+    -- 非选中行: 原色整行
+    g.setForeground(color)
+    g.set(x, screenY, line)
+    return
+  end
+  -- 选中行: 3 段着色（前缀原色 / 选中段反色 / 后缀原色）
+  local preLen = selFrom - x
+  local selLen = selTo - selFrom + 1
+  local pre = usub(line, 1, preLen)
+  local sel = usub(line, preLen + 1, selLen)
+  local suf = usub(line, preLen + selLen + 1)
+  if pre ~= "" then
+    g.setForeground(color)
+    g.set(x, screenY, pre)
+  end
+  if sel ~= "" then
+    -- 反色: fg=背景, bg=行原色（文字以原色为底、黑字）
+    g.setForeground(tui.colors.background)
+    g.setBackground(color)
+    g.set(x + preLen, screenY, sel)
+  end
+  if suf ~= "" then
+    g.setForeground(color)
+    g.setBackground(tui.colors.background)
+    g.set(x + preLen + selLen, screenY, suf)
+  end
+end
+
+-- 重绘指定行区间（tmux window_copy_redraw_selection 模式）:
+-- 拖动只重绘 [y0, y1] 受影响行——每行派生渲染（含选中判断），
+-- 无残留（重绘即恢复原色）。
+local function redrawRowRange(y0, y1)
   local g = component.gpu
   local x, y, w, h = getContentBounds()
-  local from = math.max(x, math.min(xa, xb))
-  local to = math.min(x + w - 1, math.max(xa, xb))
-  local y0 = math.max(y, math.min(ya, yb))
-  local y1 = math.min(y + h - 1, math.max(ya, yb))
-  if from > to or y0 > y1 then return end
   local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
+  y0 = math.max(y, y0)
+  y1 = math.min(y + h - 1, y1)
+  if y0 > y1 then return end
   g.setBackground(tui.colors.background)
   for row = y0, y1 do
     local idx = startIdx + (row - y)
-    local entry = state.history[idx]
-    if entry then
-      g.setForeground(entry.color or tui.colors.foreground)
-      g.set(from, row, usub(entry.text, from - x + 1, to - from + 1))
-    else
-      g.set(from, row, string.rep(" ", to - from + 1))
-    end
+    drawRow(g, x, row, startIdx, idx)
   end
   g.setForeground(tui.colors.foreground)
-end
-
--- 反色高亮选中（v0.3.106 流式选择——非矩形框选）:
--- 起点行从起点列高亮到行尾 / 中间行整行 / 终点行从行首到终点列
--- （终端标准选择语义）。宽字符占 2 格: 高亮一格即覆盖（set 自动
--- padding），跳过第二格。
-local function drawContentSelection()
-  if not state.csel then return end
-  local g = component.gpu
-  local x, y, w, h = getContentBounds()
-  local a, b = normalizeCsel()
-  local xmax = x + w - 1
-  local function highlightSegment(row, from, to)
-    from = math.max(x, from)
-    to = math.min(xmax, to)
-    if from > to then return end
-    local col = from
-    while col <= to do
-      local ok_g, text, fg, bg = pcall(g.get, col, row)
-      if ok_g and type(text) == "string" and text ~= "" then
-        pcall(g.setForeground, bg or tui.colors.background)
-        pcall(g.setBackground, fg or tui.colors.foreground)
-        pcall(g.set, col, row, text)
-        col = col + (isWideChar(text) and 2 or 1)
-      else
-        pcall(g.setForeground, tui.colors.background)
-        pcall(g.setBackground, tui.colors.foreground)
-        pcall(g.set, col, row, " ")
-        col = col + 1
-      end
-    end
-  end
-  if a.y == b.y then
-    highlightSegment(a.y, a.x, b.x)
-  else
-    highlightSegment(a.y, a.x, xmax)
-    for row = a.y + 1, b.y - 1 do
-      highlightSegment(row, x, xmax)
-    end
-    highlightSegment(b.y, x, b.x)
-  end
-  pcall(g.setForeground, tui.colors.foreground)
-  pcall(g.setBackground, tui.colors.background)
+  g.setBackground(tui.colors.background)
 end
 
 -- 读回选中文本（v0.3.106 流式 + 中文支持）:
@@ -3644,7 +3685,10 @@ function tui.copyContentSelection()
   end
   state.csel = nil
   state.csel_active = nil
-  pcall(tui.drawInput)
+  -- v0.3.108: 清除选中后必须 redrawContent——派生模式下高亮是
+  -- 每帧从 csel 计算的，csel=nil 后重绘即恢复原色（无残留）。
+  -- 只 drawInput 会留下最后选中的反色行。
+  pcall(tui.redrawContent)
   return n
 end
 
@@ -4149,17 +4193,20 @@ function tui.readInput(on_event)
             state.sel_active = nil
             pcall(tui.redrawContent)
           elseif ev == "drag" and state.csel and state.csel_active then
-            -- 拖动: 更新终点 + 增量高亮（v0.3.106 不闪烁）——原实现
-            -- redrawContent 全量重绘 + 重画高亮（用户: "选时 tui 会
-            -- 闪烁"）。改为只恢复旧/新选中区域（redrawRectArea 按
-            -- history 原文本重画）再画新流式高亮——无全屏刷新。
-            redrawRectArea(state.csel.ax, state.csel.ay,
-              state.csel.bx, state.csel.by)
+            -- 拖动: 更新终点 + 派生重绘（v0.3.108 无状态模式，抄
+            -- tmux window_copy_redraw_selection）——只重绘受影响行区间
+            -- [min(old_y,new_y), max(old_y,new_y)]，每行从 history
+            -- 重新派生选中着色。无 gpu.get、无"恢复反色"逻辑——
+            -- 方向反转（向下再向上）时选中区间跨过锚点，重绘行
+            -- 重新计算命中与否，天然无残留、不闪烁。
+            local old_a, old_b = normalizeCsel()
             state.csel.bx = tx
             state.csel.by = ty
-            redrawRectArea(state.csel.ax, state.csel.ay,
-              state.csel.bx, state.csel.by)
-            drawContentSelection()
+            local new_a, new_b = normalizeCsel()
+            -- 受影响行区间 = 新旧选中行的并集
+            local y0 = math.min(old_a.y, new_a.y)
+            local y1 = math.max(old_b.y, new_b.y)
+            redrawRowRange(y0, y1)
             pcall(tui.drawInput)
           end
         end
