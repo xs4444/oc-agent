@@ -180,6 +180,67 @@ local function current_version()
   return install_info and install_info.version or "(未知)"
 end
 
+-- ── update.lua 自举（v0.3.95）──────────────────────────────────
+-- 痛点（2026-08-12 真机现场）: 用户机器上的 update.lua 是 v0.3.93
+-- （无迭代 pcall 保护），PKIX 证书错误在 fetch 迭代时崩溃；而旧版
+-- 只能靠 install 同步 update.lua——install 本身也可能网络失败，
+-- 形成"update 坏了 → 拿不到修 update 的新版"死循环。
+-- 本函数: 运行前下载 @master 版 update.lua（GitHub raw 优先——jsDelivr
+-- @master 缓存过期已知问题，注释见文件头），与当前脚本对比，不同则
+-- 原子替换（先写 .new 再 rename）并提示重跑。返回 true = 已自更新
+-- （调用方应终止当前执行）。任何失败静默返回 false（不影响主流程）。
+local function self_update()
+  -- 定位当前脚本（install.lua 同款: arg[0] 含路径时截目录）
+  local script_path
+  if arg and arg[0] then
+    script_path = tostring(arg[0])
+  else
+    script_path = INSTALL_DIR:match("^(.*)/agent$") .. "/update.lua"
+  end
+  if not script_path or script_path == "" or script_path:find("=lua") then
+    return false  -- 无法定位自身（罕见），跳过自举
+  end
+  -- 双源下载 @master（GitHub raw 优先 = 实时最新; jsDelivr 回退）
+  local body
+  for _, base in ipairs({
+    "https://raw.githubusercontent.com/" .. REPO .. "/master",
+    BASE .. "@master",
+  }) do
+    body = fetch_timeout(base .. "/update.lua")
+    if body and #body > 500 then break end
+    body = nil
+  end
+  if not body then return false end
+  -- 对比当前内容（相同 = 已最新，跳过）
+  local f = io.open(script_path, "r")
+  local cur = f and f:read("*a") or ""
+  if f then f:close() end
+  if cur == body then return false end
+  -- 原子替换: 先写 .new 再 rename（避免写一半崩坏留下残缺文件）
+  local ok_fs, fs = pcall(require, "filesystem")
+  local tmp = script_path .. ".new"
+  local tf = io.open(tmp, "w")
+  if not tf then return false end
+  tf:write(body)
+  tf:close()
+  if ok_fs and fs and fs.rename then
+    pcall(fs.rename, tmp, script_path)
+  else
+    pcall(os.remove, script_path)
+    pcall(os.rename, tmp, script_path)
+  end
+  print("")
+  print("  update.lua 已自更新到最新版（" .. #body .. " 字节）")
+  print("  请重新运行 update 完成版本检查/更新")
+  return true
+end
+
+-- 自举（v0.3.95）: 先确保自身是最新版（旧版无迭代保护会崩 PKIX）。
+-- 自更新成功 → 提示重跑并终止当前执行。
+if self_update() then
+  return
+end
+
 -- 确定目标 ref: 手动参数优先（2026-08-10: data API 索引滞后到 0.3.66、
 -- GitHub 不可达时自动检测拿不到 v0.3.69——用户实测 update 装不到最新；
 -- `update v0.3.69` 直接锁定目标，最可靠）。无参数时 jsDelivr data API
