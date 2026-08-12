@@ -197,7 +197,8 @@ end
 if not DEST_DIR or DEST_DIR == "" then DEST_DIR = "." end
 
 -- 拉取 URL 全文并返回 body（写入由调用方决定）
-local function fetch(url)
+-- 同步 fetch（迭代 pcall + deadline）; 线程包装见 fetch() 下方
+local function fetch_sync(url)
   local internet = require("internet")
   local ok, handle = pcall(function()
     return internet.request(url)
@@ -205,16 +206,38 @@ local function fetch(url)
   if not ok then return nil, "connection failed: " .. tostring(handle) end
 
   local chunks = {}
+  local deadline = os.clock() + 20  -- 迭代阶段超时（响应流永不结束保护）
   local iter_ok, iter_err = pcall(function()
     for chunk in handle do
       chunks[#chunks + 1] = chunk
       os.sleep(0.02)  -- yield: avoid "too long without yielding"
+      if os.clock() > deadline then return nil end
     end
   end)
   if not iter_ok then return nil, "read failed: " .. tostring(iter_err) end
   local body = table.concat(chunks)
   if #body == 0 then return nil, "empty response" end
   return body
+end
+
+-- fetch: 线程包装超时（v0.3.94）——OC internet.request 连接阶段无超时
+-- （连接挂起时 Lua 层不运行，v0.3.73 /debug 卡死同款教训），install
+-- 下载会整卡住。thread + waitForAll(20s) 兜底，超时返回 nil,err。
+-- thread 不可用（精简环境）回退同步（迭代 deadline 仍生效）。
+local function fetch(url)
+  local ok_th, thread = pcall(require, "thread")
+  if not ok_th or not thread or not thread.create or not thread.waitForAll then
+    return fetch_sync(url)
+  end
+  local result = {}
+  local t = thread.create(function()
+    result.body, result.err = fetch_sync(url)
+  end)
+  local ok_w, werr = pcall(thread.waitForAll, {t}, 20)
+  if not ok_w or not werr then
+    return nil, "timeout after 20s (connection hung)"
+  end
+  return result.body, result.err
 end
 
 -- 写文件（幂等覆盖）

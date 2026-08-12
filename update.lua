@@ -31,13 +31,22 @@ local function fetch(url)
   if not ok or not handle then return nil end
   local chunks = {}
   local deadline = os.clock() + READ_DEADLINE
-  for chunk in handle do
-    chunks[#chunks + 1] = chunk
-    os.sleep(0.02)
-    -- 迭代超时（响应流永不结束保护——挂起时提前放弃）
-    if os.clock() > deadline then return nil end
-  end
-  return table.concat(chunks)
+  -- 迭代 pcall 保护（v0.3.94）: OC 的 internet.request 迭代器在流读取
+  -- 中可能抛异常（真机实测 PKIX path validation failed——证书校验在
+  -- 迭代阶段触发，`for chunk in handle` 直接崩脚本并打印 stack
+  -- traceback）。pcall 包裹迭代循环，任何迭代错误 → nil（调用方
+  -- 按"该源失败"处理，走双源另一路/报错提示）。
+  local ok_iter, body = pcall(function()
+    for chunk in handle do
+      chunks[#chunks + 1] = chunk
+      os.sleep(0.02)
+      -- 迭代超时（响应流永不结束保护——挂起时提前放弃）
+      if os.clock() > deadline then return nil end
+    end
+    return table.concat(chunks)
+  end)
+  if not ok_iter then return nil end
+  return body
 end
 
 -- 线程包装: 连接阶段挂起（internet.request 无超时）用 thread +
