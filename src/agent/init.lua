@@ -747,6 +747,57 @@ local function handle_command(cmd, config, messages)
         print("(set /gist-token <github_token> to auto-upload; or paste the report content)")
       end
     end
+  elseif command == "/mouseprobe" then
+    -- 鼠标事件探针（v0.3.102）: 打印 30s 内所有 touch/drag/drop 原始事件
+    -- + 屏幕状态（分辨率/precisionMode）。用户操作: 跑命令后在屏幕上
+    -- 点击/按住拖动, 观察内容区输出。
+    -- 用途: 验证真机鼠标事件是否到达、坐标格式（整数格坐标 vs
+    -- precisionMode 浮点 0-1）、按钮参数、player 参数——定位"鼠标选中
+    -- 不生效"根因。模拟层/ocvm 无法覆盖真机输入链（MC 客户端 GUI →
+    -- TextBuffer.scala sendMouseEvent → computer.checked_signal →
+    -- OpenOS touch/drag/drop），必须真机实测。
+    local ok_p, patch_mod = pcall(require, "agent.patch")
+    if not ok_p then
+      print("mouseprobe: agent.patch unavailable")
+    else
+      local ok_c, component2 = pcall(require, "component")
+      local ok_e, event2 = pcall(require, "event")
+      if not (ok_c and ok_e) then
+        print("mouseprobe: component/event unavailable")
+      else
+        -- 屏幕状态: 分辨率 + precisionMode（浮点坐标开关——true 时
+        -- touch x/y 是 0-1 浮点, 现有 TUI 整数坐标处理会全失效!）
+        local ok_r, rw, rh = pcall(component2.gpu.getResolution)
+        local pm = "?"
+        pcall(function()
+          pm = tostring(component2.screen.getPrecisionMode())
+        end)
+        print("gpu resolution: " .. tostring(ok_r and (rw .. "x" .. rh) or "?"))
+        print("screen precisionMode: " .. tostring(pm)
+          .. (pm == "true" and "  <-- 浮点坐标! TUI 整数处理会失效" or ""))
+        print("watch 30s: click / drag on screen — Ctrl+C to exit early")
+        local deadline = os.clock() + 30
+        local count = 0
+        while true do
+          -- 无过滤 pull + 自判事件名（v0.3.89 教训: 多过滤是位置匹配）
+          local sig = {event2.pull(0.5)}
+          if not sig[1] then
+            if os.clock() >= deadline then break end
+          else
+            local ev = sig[1]
+            if ev == "touch" or ev == "drag" or ev == "drop" then
+              count = count + 1
+              print(string.format("[%d] %s x=%s y=%s button=%s player=%s",
+                count, tostring(ev), tostring(sig[3]), tostring(sig[4]),
+                tostring(sig[5]), tostring(sig[6])))
+            elseif ev == "interrupted" then
+              break
+            end
+          end
+        end
+        print("mouseprobe done: " .. count .. " mouse events" .. (count == 0 and " (无触摸事件到达!)" or ""))
+      end
+    end
   elseif command == "/selftest" then
     -- 实机自检（v0.3.90）: 跑嵌入式 selftest（env/json/fs/session/config/
     -- net/interrupt/tools/mem）→ 结果写文件 + 可选 gist 上传回传。
@@ -868,6 +919,7 @@ local function handle_command(cmd, config, messages)
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
+    print("  /mouseprobe     Print raw touch/drag/drop events for 30s (mouse input chain debug)")
     print("  /selftest       Run on-device selftest (env/json/fs/session/config/net/interrupt/tools/mem), write + upload report")
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
