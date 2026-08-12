@@ -1723,14 +1723,23 @@ local function main(config, ...)
                       args = json.decode(args_str)
                     end)
                     local res = subagent_mod.file_proxy(name, type(args) == "table" and args or {}, DEPS, sender)
-                    if type(res) == "string" and res:sub(1, 6) == "Error:" then
-                      return nil, res
-                    end
-                    return res, nil
+                    -- v0.3.92 修复: 单值返回（与 orig_execute 约定一致）——
+                    -- 调用方 pcall(execute_tool) 只取第一个返回值，
+                    -- (nil, err) 双值会丢失 err → 工具结果变空字符串。
+                    -- 真机 explorer 日志实证: "The tool calls returned
+                    -- empty results"——实际是 file_proxy 的 Error 串被
+                    -- 吞（read_file 相对路径不存在/超时/坏回复全变空）。
+                    -- 成功/失败都返回字符串本身（错误已是 "Error: ..."）。
+                    return res
                   end
                   return orig_execute(name, args_str)
                 end
                 print("[subagent] explorer mode: " .. #tools_override .. " readonly tools, file ops proxied to " .. tostring(sender))
+                -- v0.3.92: 提示文件工具作用于主代理文件系统——真机日志
+                -- 实证模型拿自己机器的路径（/home、src/agent/init.lua
+                -- 相对路径）去问主代理, 全空/报错。文件工具代理到主代理,
+                -- 路径必须按主代理文件系统理解（绝对路径）。
+                task_text = task_text .. "\n[EXPLORER MODE] file tools (read_file/list_directory/search_files/glob) are PROXIED over the modem to the MASTER computer — they read the MASTER's filesystem, not this machine's local disks. Use paths valid on the master (absolute paths like /home/... or /mnt/<id>/...), NOT paths on this machine."
               end
               if req.role and req.role ~= "" then
                 task_text = "[角色: " .. req.role .. "]\n" .. task_text
