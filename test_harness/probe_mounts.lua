@@ -1,0 +1,2 @@
+local fs=require("filesystem"); local f=io.open("/mnt/probe_out.txt","w"); for _,m in fs.mounts() do local ok,p=pcall(function() local w=io.open(m.."/wprobe.txt","w") if w then w:close() os.remove(m.."/wprobe.txt") return "W" else return "RO" end end); f:write(tostring(m).." ["..(p or "?").."]
+") end; f:close()

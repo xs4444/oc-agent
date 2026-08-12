@@ -99,9 +99,38 @@ python tools/ocvm_relocate_e2e.py    # 端到端（重启→迁移→重启 agen
 注意：ocvm_relocate_e2e.py 的 PASS 判断曾有 bug（匹配 "/mnt/" 即 PASS），
 真实验证要对比迁移前后 /relocate 显示的数据目录。
 
-## 排查备忘
+## 双实例互联测试（explorer 文件代理端到端，PASS 2026-08-12）
 
-- 挂载短名每次重启变（如 /mnt/b2f）——脚本自动探测，无需硬编码
+ocvm 多实例 modem 互联（源码实证 drivers/modem_drv.cpp + server_pool.cpp）:
+- 每实例 modem 连 `HostAddress:SystemPort`（默认 127.0.0.1:56000），
+  同 system port 即同网（星型：首个实例 ServerPool bind/listen 作 hub，
+  其余 Connection connect 上来）
+- client.cfg 内存加载不落盘——新实例自动继承根模板（无 client.cfg 文件）
+- 挂载盘 host 路径 = `~/oc-test/ocvm/<ENV_PATH>/<uuid>/`（每实例多个 uuid 目录）
+
+跑法（验证 v0.3.92 explorer 文件代理修复——双值返回 bug / modem 包长 / 路径提示）:
+
+```bash
+export OCVM_HOST=192.168.31.75 OCVM_USER=hcj OCVM_PASS=hcj2005
+cd "F:\mie agent"
+python tools/ocvm_dual_test.py
+```
+
+流程: 重启两实例 tmp_e2e_m（master/hub）+ tmp_e2e_s（sub/client）→ 上传
+agent.lua + explorer_e2e_master.lua/sub.lua → sub 预写 agent_config.txt
+（subagent=true）→ sub 跑 explorer_e2e_sub.lua（监听）→ master 跑
+explorer_e2e_master.lua（discover → explorer call）→ 轮询 master 结果断言
+回复含真实文件内容（PASS: file requests served: N, ok: N）。
+
+关键坑（PASS 前修的三处）:
+1. **config 必须写到 agent.lua 实际读的位置**: `find_writable_base()` 实测
+   ocvm 选 `/tmp`（fs.mounts() 第一个可写挂载），不是 /home 也不是 /mnt/<m>！
+   sub 脚本把所有候选位置都写一遍（/home + /tmp + 每个 /mnt/<m>）
+2. **sub 不进 subagent 模式** = load_config() nil → 卡 First Run Setup——
+   必须预写含 `subagent=true` 的 config（自动进监听，无需 --subagent 参数）
+3. **地址解析**用完整 UUID pattern（`[a-fA-F0-9%-]+` 会从错误文本 "found" 抠出 "f"）
+
+## 排查备忘- 挂载短名每次重启变（如 /mnt/b2f）——脚本自动探测，无需硬编码
 - `ls -d tmp_t/*/` 偶发 boot 时序失败 → upload 已加 find fallback
 - 结果文件在 `test_harness/results/<name>_result.txt`（VM 内写入，host 轮询）
 - 测试脚本首个参数固定传挂载路径（如 /mnt/xxxx）
