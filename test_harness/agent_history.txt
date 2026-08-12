@@ -1,0 +1,2 @@
+{"role":"user","content":"FIRST_LINE"}
+{"role":"user","content":"SECOND_LINE"}
