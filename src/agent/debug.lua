@@ -287,15 +287,25 @@ end
 -- （默认 30s，config.debug_upload_timeout 可调）；超时放弃线程返回
 -- 提示（报告已写本地）。thread 库不可用（测试/精简环境）时回退同步
 -- 调用（行为同旧版）。
-local function upload(report, token)
+-- extra_files（v0.3.100）: 附带文件 {文件名 = 内容}——内容区选中的
+-- selected.txt 随 debug 报告一起上传（"提交 gist 时可以附带该文件"）。
+local function upload(report, token, extra_files)
   if not token or token == "" then
     return nil, "no gist token configured (use /gist-token <token>)"
   end
   local http = require("agent.http")
+  local files = { ["debug_report.txt"] = { content = report } }
+  if type(extra_files) == "table" then
+    for name, content in pairs(extra_files) do
+      if type(name) == "string" and type(content) == "string" and #content > 0 then
+        files[name] = { content = content }
+      end
+    end
+  end
   local body = json.encode({
     description = "OC Agent debug report",
     public = false,
-    files = { ["debug_report.txt"] = { content = report } },
+    files = files,
   })
   local headers = {
     ["Content-Type"] = "application/json",

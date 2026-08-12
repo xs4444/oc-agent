@@ -722,9 +722,24 @@ local function handle_command(cmd, config, messages)
       if token and token ~= "" then
         print("Uploading to GitHub gist (timeout 30s)...")
         print("  (报告已保存本地: " .. out_path .. "——上传失败/超时不影响内容)")
-        local url, err = debug_mod.upload(report, token)
+        -- v0.3.100: 附带内容区选中的 selected.txt（若存在）——
+        -- 选中复制 → 写文件 → /debug 提交 gist 时一并上传
+        local extra = {}
+        local sel_path = WRITABLE_BASE .. "/selected.txt"
+        local ok_sel, sel_f = pcall(io.open, sel_path, "r")
+        if ok_sel and sel_f then
+          local content = sel_f:read("*a")
+          sel_f:close()
+          if content and #content > 0 and #content < 65536 then
+            extra["selected.txt"] = content
+          end
+        end
+        local url, err = debug_mod.upload(report, token, extra)
         if url then
           print("Gist uploaded: " .. url)
+          if extra["selected.txt"] then
+            print("  (附带 selected.txt: " .. #extra["selected.txt"] .. " bytes)")
+          end
         else
           print("Upload failed: " .. tostring(err))
         end
@@ -1823,6 +1838,18 @@ local function main(config, ...)
         mono = ok_d and depth == 1  -- 机器人 T1 GPU: 单色方案
       end
       ui.init(mono and {monochrome = true} or nil)
+      -- v0.3.100: 内容区选中复制回调——选中文本写 WRITABLE_BASE/selected.txt，
+      -- /debug 提交 gist 时附带（"选中→写文件→gist 附带"需求闭环）。
+      -- 防爆: 超过 64KB 截断（与 debug.upload 的 65536 上限一致）。
+      ui.onCopy = function(text)
+        if type(text) ~= "string" or #text == 0 then return end
+        if #text > 65536 then text = text:sub(1, 65536) .. "\n[truncated]" end
+        local f = io.open(WRITABLE_BASE .. "/selected.txt", "w")
+        if f then
+          f:write(text)
+          f:close()
+        end
+      end
       ui.print("OC Agent TUI ready. Model: " .. config.model)
       ui.print("Type /help for commands.", ui.colors.dim)
       -- 进入 TUI 显示当前会话历史（填充内容区——避免空屏/输入区占半屏感知）
