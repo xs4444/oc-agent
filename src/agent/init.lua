@@ -549,6 +549,27 @@ local function handle_command(cmd, config, messages)
   elseif command == "/bottom" then
     if UI_HOOKS.scrollToBottom then UI_HOOKS.scrollToBottom()
     else print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)") end
+  elseif command == "/browse" then
+    -- 键盘浏览/选择模式（v0.3.109, tmux copy-mode 移植）: 鼠标选中
+    -- 真机不精确（MC 客户端事件稀疏），键盘 hjkl/Space/y/q 可靠替代。
+    -- 进入后 readInput 事件循环接管按键（tui.browseMode 分支）。
+    if UI_HOOKS.enterBrowse then UI_HOOKS.enterBrowse()
+    else print("Browse mode is TUI-only (/browse)") end
+  elseif command == "/search" or command == "/find" then
+    -- 内容区搜索（v0.3.109 P1-3, tmux window_copy_search 移植）:
+    -- 在 history 纯文本数组找首匹配 → 跳到匹配行 + tool 色高亮;
+    -- /snext /sprev（n/N）循环重复。零组件调用（string.find）。
+    if UI_HOOKS.search then
+      UI_HOOKS.search(parts[2])
+    else
+      print("Search is TUI-only (/search <text>)")
+    end
+  elseif command == "/snext" then
+    if UI_HOOKS.searchNext then UI_HOOKS.searchNext(1)
+    else print("Search is TUI-only (/search <text>)") end
+  elseif command == "/sprev" then
+    if UI_HOOKS.searchNext then UI_HOOKS.searchNext(-1)
+    else print("Search is TUI-only (/search <text>)") end
   elseif command == "/hist" then
     local p = session_mod.current_path()
     local name = p:match("([^/\\]+)%.jsonl$") or "default"
@@ -949,6 +970,8 @@ local function handle_command(cmd, config, messages)
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
     print("  /preset-200k    One-shot: set context_window=200000 (+ memory check)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
+    print("  /browse         Keyboard browse/select mode (hjkl move, Space select, y copy, q quit)")
+    print("  /search <text>  Search content history (jump + highlight; /snext /sprev repeat)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
     print("  /mouseprobe     Print raw touch/drag/drop events for 30s (mouse input chain debug)")
@@ -1980,7 +2003,7 @@ local function main(config, ...)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
         "/sessions", "/session", "/relocate", "/preset-200k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
-        "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
+        "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
         comps[#comps + 1] = t["function"].name
@@ -2000,6 +2023,11 @@ local function main(config, ...)
       end
       UI_HOOKS.scrollToTop = function() ui.scrollToTop() end
       UI_HOOKS.scrollToBottom = function() ui.scrollToBottom() end
+      -- 键盘浏览/选择模式（v0.3.109 P1-1, tmux copy-mode 移植）
+      UI_HOOKS.enterBrowse = function() ui.enterBrowse() end
+      -- 内容区搜索（v0.3.109 P1-3, tmux window_copy_search 移植）
+      UI_HOOKS.search = function(pat) ui.search(pat) end
+      UI_HOOKS.searchNext = function(dir) ui.searchNext(dir) end
     end
   end
 

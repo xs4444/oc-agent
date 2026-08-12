@@ -43,8 +43,11 @@ local ok_tui, tui = pcall(require, "agent.tui")
 check("tui module available in build", ok_tui and type(tui) == "table", tostring(ok_tui))
 if not (ok_tui and type(tui) == "table") then log("RESULT: " .. PASS .. " pass, " .. FAIL .. " fail") return end
 
--- 硬件检测
-local component = require("component")
+-- 硬件检测（注入全局 component——tui.lua 内部引用全局 component;
+-- ocvm 直跑 lua 脚本不经 OpenOS shell 初始化, 全局不会自动注入。
+-- 注意: 必须无 local, 否则 tui.init 内部仍见 nil 而静默降级 80x25,
+-- "real gpu" 断言变成假阳性）
+component = require("component")
 local has_gpu = component.isAvailable and component.isAvailable("gpu")
 local has_screen = component.isAvailable and component.isAvailable("screen")
 local has_kb = component.isAvailable and component.isAvailable("keyboard")
