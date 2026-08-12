@@ -2212,6 +2212,15 @@ local results = {}
 local started = os.clock()
 
 local function record(name, ok, detail)
+  -- 同名覆盖（v0.3.91）: 线程超时放弃后线程可能仍在后台跑，迟到写入
+  -- 会重复——按 name 覆盖，最终保留最后一次结果。
+  for i, r in ipairs(results) do
+    if r.name == name then
+      results[i] = { name = name, ok = ok, detail = detail or "" }
+      collectgarbage("collect")
+      return
+    end
+  end
   results[#results + 1] = {
     name = name,
     ok = ok,
@@ -2223,10 +2232,26 @@ end
 -- 所有测试经 pcall 包裹——单个崩溃不中断后续。
 -- 成功路径: 测试函数内部自行 record（各函数只 record 一次）；
 -- 崩溃路径: 这里兜底 record（防止"崩溃后无记录"）。
-local function run_test(name, fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    record(name, false, "CRASH: " .. tostring(err))
+-- 线程化 + 超时（v0.3.91）: OC internet.request 连接阶段无超时
+-- （v0.3.73 /debug 卡死教训: 连接挂起时 Lua 层不运行，Ctrl+C 补丁
+-- 也无机会）——同步跑 net 测试会把整个 selftest 卡死只能重启。每项
+-- 测试跑在 thread 里 + waitForAll(timeout) 超时 → 超时记 FAIL 继续
+-- 下一项，任何一项卡住不影响整体。thread 不可用（测试/精简环境）
+-- 回退同步执行。
+local function run_test(name, fn, timeout_sec)
+  local ok_th, thread = pcall(require, "thread")
+  timeout_sec = timeout_sec or 30
+  if not ok_th or not thread or not thread.create or not thread.waitForAll then
+    local ok, err = pcall(fn)
+    if not ok then
+      record(name, false, "CRASH: " .. tostring(err))
+    end
+    return
+  end
+  local t = thread.create(fn)
+  local ok_w, werr = pcall(thread.waitForAll, {t}, timeout_sec)
+  if not ok_w or not werr then
+    record(name, false, "TIMEOUT after " .. timeout_sec .. "s (线程卡住已放弃)")
   end
 end
 
@@ -2503,15 +2528,18 @@ end
 -- ════════════════════════════════════════
 M.run = function()
   results = {}
-  run_test("env", test_env)
-  run_test("json", test_json)
-  run_test("fs", test_fs)
-  run_test("session", test_session)
-  run_test("config", test_config)
-  run_test("net", test_net)
-  run_test("interrupt", test_interrupt)
-  run_test("tools", test_tools)
-  run_test("mem", test_mem)
+  -- 每项超时（线程化，v0.3.91）: 单项卡住（如 net 连接挂起）30s 自动
+  -- FAIL 继续，不再需要重启。interrupt 项含 os.sleep(2) 预期耗时，给
+  -- 15s 裕量。
+  run_test("env", test_env, 15)
+  run_test("json", test_json, 15)
+  run_test("fs", test_fs, 15)
+  run_test("session", test_session, 15)
+  run_test("config", test_config, 15)
+  run_test("net", test_net, 30)
+  run_test("interrupt", test_interrupt, 15)
+  run_test("tools", test_tools, 15)
+  run_test("mem", test_mem, 15)
   -- 组装报告（最后才拼大字符串）
   local lines = {
     "OC Agent selftest — " .. os.date("%Y-%m-%d %H:%M"),
