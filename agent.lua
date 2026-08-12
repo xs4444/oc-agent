@@ -3279,6 +3279,25 @@ function tui.init(config)
     pcall(gpu0.fill, 1, 1, 1, h, " ")  -- 清理探测痕迹（init 末尾 term.clear 再清一次）
   end
   state.history = {}
+  -- 行缓存 + 脏行集合（v0.3.109, vim ScreenAttrs 比较移植）:
+  -- lineCache[screenY] = {text=上次set串, color=fg, sel=选中态}——
+  -- drawRow 前比较相同则跳过（组件调用 120/帧→个位数）;
+  -- dirtyRows = {[screenY]=true}——redrawContent 只重画标记行，
+  -- 全量重绘（print/滚动/缩放）标记全部可见行，增量（选中拖动/
+  -- 光标闪烁）只标记受影响行。
+  state.lineCache = {}
+  state.dirtyRows = {}
+  -- 键盘浏览/选择模式（v0.3.109, tmux copy-mode 移植）:
+  -- /browse 进入 → hjkl 移动虚拟光标（映射 scrollOffset+屏幕坐标）、
+  -- Space 开始选中（csel anchor=当前）、移动扩展选中（csel active 实时
+  -- 派生渲染）、y 复制、q 退出。鼠标选中不精确时键盘可靠替代。
+  state.browseMode = false
+  state.browsePos = nil  -- {x, y} 屏幕坐标
+  -- 搜索（v0.3.109 P1-3, tmux window_copy_search + vim hlsearch 移植）:
+  -- state.search = {pattern=关键词, idx=匹配行历史索引, from,to=匹配段
+  -- 列区间}。search() 从顶部找首匹配并跳转; searchNext(dir) n/N 循环。
+  -- 匹配行 drawRow 派生高亮（tool 色，与选中反色互斥）。
+  state.search = nil
   state.inputBuffer = ""
   state.inputCursor = 0
   state.cmdHistory = {}
@@ -3402,12 +3421,39 @@ local function wrapText(str, width)
   return lines
 end
 
+-- 历史上限（v0.3.109, tmux history-limit 移植）: 2MB 真机内存约束下
+-- 纯显示缓冲无上限 = OOM 风险源（长对话几十轮 assistant+工具结果
+-- 可达几千行 × 每行 ~100B = 几百 KB）。历史只是显示缓冲（压缩后的
+-- 真实对话在 session 文件），屏幕同时最多看 ~40 行。
+-- 1000 行（约 100-150KB）: 覆盖典型 /hist dump（30 条消息 × 平均
+-- 30 行 = 900 行）+ 正常运行余量——2MB 内存可承受，且不阉割回顾
+-- 命令。超限从头部裁（tmux grid_trim_history 模式）并同步 scrollOffset。
+local MAX_HISTORY = 1000
+
+-- 追加历史行（含上限裁剪 + scrollOffset 联动）
+local function appendHistory(entry)
+  state.history[#state.history + 1] = entry
+  if #state.history > MAX_HISTORY then
+    -- 从头部裁（tmux grid_trim_history）; 已滚动时 offset 同步 -1
+    table.remove(state.history, 1)
+    if state.scrollOffset > 0 then state.scrollOffset = state.scrollOffset - 1 end
+    -- 选中坐标若在移除行内 → 清除选中（选中区随内容上移失效）
+    if state.csel and state.csel.ay <= 2 then
+      state.csel = nil
+      state.csel_active = nil
+    elseif state.csel then
+      state.csel.ay = state.csel.ay - 1
+      state.csel.by = state.csel.by - 1
+    end
+  end
+end
+
 -- 输出到内容区（自动滚动到底）
 function tui.print(msg, color)
   local _, _, w = getContentBounds()
   color = color or tui.colors.foreground
   for _, line in ipairs(wrapText(msg, w)) do
-    state.history[#state.history + 1] = {text = line, color = color}
+    appendHistory({text = line, color = color})
   end
   state.scrollOffset = 0
   pcall(tui.redrawContent)
@@ -3444,20 +3490,50 @@ local function json_encode(v)
   return ok and out or tostring(v)
 end
 
--- 重绘内容区（可见窗口 = 底部 h 行 - scrollOffset）
--- v0.3.108: 统一走 drawRow 派生渲染——每行从 history 取文本 + 选中
--- 区间实时着色。全量重绘自动带选中高亮（touch/复制/清除/滚动后
--- 状态一致，无残留）。
+-- 标记脏行区间（vim mod_top/mod_bot 模式）: 只记录行号集合，
+-- 不立即重画——flushDirty 统一处理。
+local function markDirty(y0, y1)
+  local _, y, _, h = getContentBounds()
+  y0 = math.max(y, y0 or 0)
+  y1 = math.min(y + h - 1, y1 or 0)
+  if y0 > y1 then return end
+  for row = y0, y1 do
+    state.dirtyRows[row] = true
+  end
+end
+
+-- 增量重绘（v0.3.109）: 只重画 dirtyRows 标记的行（drawRow 内部行缓存
+-- 二次跳过——内容未变的行即使标记也不写屏）。重画后清标记。
+-- 不 fill 整区（增量场景无残留——每行整行 set 覆盖）。
+local function flushDirty()
+  local g = component.gpu
+  local x, y, w, h = getContentBounds()
+  local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
+  g.setBackground(tui.colors.background)
+  for row, _ in pairs(state.dirtyRows) do
+    if row >= y and row <= y + h - 1 then
+      local idx = startIdx + (row - y)
+      drawRow(g, x, row, startIdx, idx)
+    end
+  end
+  g.setForeground(tui.colors.foreground)
+  g.setBackground(tui.colors.background)
+  state.dirtyRows = {}
+end
+
+-- 重绘内容区（v0.3.108: 统一走 drawRow 派生渲染——每行从 history 取
+-- 文本 + 选中区间实时着色。全量重绘自动带选中高亮）
+-- v0.3.109: 全量 = fill 清区 + 清行缓存（fill 已抹掉屏幕，缓存比较
+-- 会跳过未变行 → 空白残留——必须全清）+ 标记全部可见行脏 + flushDirty。
 function tui.redrawContent()
   local g = component.gpu
   local x, y, w, h = getContentBounds()
   g.setBackground(tui.colors.background)
   g.fill(x - 1, y, w + 2, h, " ")
-  local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
-  local endIdx = math.min(#state.history, startIdx + h - 1)
-  for i = startIdx, endIdx do
-    drawRow(g, x, y + (i - startIdx), startIdx, i)
-  end
+  -- fill 后所有行缓存作废（屏幕已被抹掉，drawRow 缓存命中=跳过=空白）
+  state.lineCache = {}
+  markDirty(y, y + h - 1)
+  flushDirty()
   g.setForeground(tui.colors.foreground)
   g.setBackground(tui.colors.background)
   tui.drawStatus()
@@ -3538,22 +3614,85 @@ end
 -- 区间分 3 段整段 set（前缀原色/选中段反色/后缀原色）——每行 ≤3 次
 -- set，无 gpu.get。选中段反色: fg=背景色, bg=行原色（文字以原色为底
 -- 黑字，可见且与角色色一致）。
+-- v0.3.109 行缓存（vim ScreenAttrs 比较, screen.c:371）: drawRow 前
+-- 比较 lineCache[screenY]（上次 set 的 text/color/sel 态），相同则
+-- 跳过整行 set——gpu.set 是 JVM 桥接调用，跳过节省大量往返。
+-- 注意: 缓存必须存**选中段具体范围**（{from,to} 或 nil）而非布尔——
+-- 拖动时行可能一直在选中区间内但选中段位置变了（anchor 移动使
+-- 选中段列区间变化），布尔比较相同会跳过 → 屏幕残留旧选中段。
+-- v0.3.109 P1-3 搜索高亮: 命中 state.search 匹配行时，匹配段用
+-- tool 色（tui.colors.tool）着色——与选中反色互斥（选中优先，
+-- 匹配段在非选中部分显示）。缓存键加 srch 段（匹配段位置），
+-- 搜索变化时行缓存失配 → 重画。
+-- 返回是否实际写屏（false = 缓存命中跳过）。
 local function drawRow(g, x, screenY, startIdx, idx)
   local _, _, w = getContentBounds()
   local entry = state.history[idx]
   if not entry then
+    -- 空行: 缓存命中跳过（含选中段 nil）
+    local cached = state.lineCache[screenY]
+    if cached and cached.text == "" and cached.sel == nil and cached.srch == nil then
+      return false
+    end
     g.setForeground(tui.colors.foreground)
     g.set(x, screenY, string.rep(" ", w))
-    return
+    state.lineCache[screenY] = {text = "", color = tui.colors.foreground, sel = nil, srch = nil}
+    return true
   end
   local color = entry.color or tui.colors.foreground
   local line = usub(entry.text, 1, w)
   local selFrom, selTo = selectionSpan(screenY, x, w)
+  local selRange = selFrom and {selFrom, selTo} or nil
+  -- 搜索高亮段（v0.3.109 P1-3）: 当前匹配行且匹配段在可见宽度内
+  local srchRange = nil
+  if state.search and state.search.idx == idx then
+    local sf, st = state.search.from, state.search.to
+    -- 屏幕列 = x-1 + 字符索引（history 存的是字符索引——OC 屏 1 列起，
+    -- 但 x 是内容区左边界（=2），字符索引与列差 x-1）
+    local scf = x - 1 + sf
+    local sct = x - 1 + st
+    if sct >= x and scf <= x + w - 1 then
+      scf = math.max(x, scf)
+      sct = math.min(x + w - 1, sct)
+      if scf <= sct then srchRange = {scf, sct} end
+    end
+  end
+  -- 缓存比较（text/color/sel/srch 段全同 → 跳过）
+  local cached = state.lineCache[screenY]
+  local function rangeEq(a, b)
+    if a == nil and b == nil then return true end
+    return a and b and a[1] == b[1] and a[2] == b[2] or false
+  end
+  if cached and cached.text == line and cached.color == color
+      and rangeEq(cached.sel, selRange) and rangeEq(cached.srch, srchRange) then
+    return false
+  end
+  state.lineCache[screenY] = {text = line, color = color, sel = selRange, srch = srchRange}
   if not selFrom then
-    -- 非选中行: 原色整行
-    g.setForeground(color)
-    g.set(x, screenY, line)
-    return
+    -- 非选中行: 原色整行 + 可选搜索高亮段（3 段: 前缀/匹配/tool 色/后缀）
+    if not srchRange then
+      g.setForeground(color)
+      g.set(x, screenY, line)
+      return true
+    end
+    local preLen = srchRange[1] - x
+    local srchLen = srchRange[2] - srchRange[1] + 1
+    local pre = usub(line, 1, preLen)
+    local srch = usub(line, preLen + 1, srchLen)
+    local suf = usub(line, preLen + srchLen + 1)
+    if pre ~= "" then
+      g.setForeground(color)
+      g.set(x, screenY, pre)
+    end
+    if srch ~= "" then
+      g.setForeground(tui.colors.tool)
+      g.set(x + preLen, screenY, srch)
+    end
+    if suf ~= "" then
+      g.setForeground(color)
+      g.set(x + preLen + srchLen, screenY, suf)
+    end
+    return true
   end
   -- 选中行: 3 段着色（前缀原色 / 选中段反色 / 后缀原色）
   local preLen = selFrom - x
@@ -3576,25 +3715,20 @@ local function drawRow(g, x, screenY, startIdx, idx)
     g.setBackground(tui.colors.background)
     g.set(x + preLen + selLen, screenY, suf)
   end
+  return true
 end
 
 -- 重绘指定行区间（tmux window_copy_redraw_selection 模式）:
 -- 拖动只重绘 [y0, y1] 受影响行——每行派生渲染（含选中判断），
 -- 无残留（重绘即恢复原色）。
+-- v0.3.109: 走 markDirty+flushDirty——行缓存二次跳过未变行。
 local function redrawRowRange(y0, y1)
-  local g = component.gpu
-  local x, y, w, h = getContentBounds()
-  local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
+  local _, y, _, h = getContentBounds()
   y0 = math.max(y, y0)
   y1 = math.min(y + h - 1, y1)
   if y0 > y1 then return end
-  g.setBackground(tui.colors.background)
-  for row = y0, y1 do
-    local idx = startIdx + (row - y)
-    drawRow(g, x, row, startIdx, idx)
-  end
-  g.setForeground(tui.colors.foreground)
-  g.setBackground(tui.colors.background)
+  markDirty(y0, y1)
+  flushDirty()
 end
 
 -- 读回选中文本（v0.3.106 流式 + 中文支持）:
@@ -3722,24 +3856,112 @@ function tui.scrollUp(lines)
   local _, _, _, h = getContentBounds()
   local maxScroll = math.max(0, #state.history - h)
   state.scrollOffset = math.min(maxScroll, state.scrollOffset + lines)
+  -- 滚动后行内容移动: 行缓存作废（vim LineOffset 失效同语义）
+  state.lineCache = {}
   pcall(tui.redrawContent)
 end
 
 function tui.scrollDown(lines)
   lines = lines or 1
   state.scrollOffset = math.max(0, state.scrollOffset - lines)
+  state.lineCache = {}  -- 滚动后行缓存作废
   pcall(tui.redrawContent)
 end
 
 function tui.scrollToBottom()
   state.scrollOffset = 0
+  state.lineCache = {}  -- 滚动后行缓存作废
   pcall(tui.redrawContent)
 end
 
 function tui.scrollToTop()
   local _, _, _, h = getContentBounds()
   state.scrollOffset = math.max(0, #state.history - h)
+  state.lineCache = {}  -- 滚动后行缓存作废
   pcall(tui.redrawContent)
+end
+
+-- 进入键盘浏览/选择模式（v0.3.109 P1-1, tmux copy-mode 移植）:
+-- /browse 命令进入。hjkl 移动虚拟光标（复用派生选中渲染——
+-- Space 设置 csel anchor 为当前浏览位置，移动扩展选中，
+-- y 复制选中文本并退出，q/Escape/Enter 退出）。鼠标真机不精确
+-- （MC 客户端事件稀疏），键盘是可靠替代且选中渲染零改动。
+function tui.enterBrowse()
+  local x, y, w, h = getContentBounds()
+  if #state.history == 0 then
+    tui.setStatus("Nothing to browse (history empty)")
+    return
+  end
+  state.browseMode = true
+  -- 初始位置: 视口中部（用户当前看到的位置）
+  state.browsePos = {x = x + math.floor(w / 2), y = y + math.floor(h / 2)}
+  pcall(tui.redrawContent)
+  tui.setStatus("Browse: hjkl move  Space select  y copy  q quit")
+end
+
+-- 搜索定位（v0.3.109 P1-3, tmux window_copy_search 移植）:
+-- history 是内存纯文本数组——string.find 线性扫零组件调用（对比 tmux
+-- 要渲染临时 screen 再匹配 grid，我们数据结构天然适合）。找到匹配行后
+-- 设置 scrollOffset 使其可见（居视口中部）+ 记录匹配段供 drawRow 高亮。
+-- 返回匹配行数（0 = 未找到）。
+local function findMatch(pattern, startIdx, dir)
+  local n = #state.history
+  if n == 0 or pattern == "" then return nil end
+  local i = startIdx
+  while true do
+    if i < 1 or i > n then return nil end
+    local text = state.history[i].text or ""
+    local f, t = text:find(pattern, 1, true)
+    if f then return i, f, t end
+    i = i + dir
+  end
+end
+
+function tui.search(pattern)
+  if not pattern or pattern == "" then
+    tui.setStatus("Usage: /search <text>")
+    return 0
+  end
+  local idx, f, t = findMatch(pattern, 1, 1)  -- 顶部 → 底部
+  if not idx then
+    state.search = nil
+    tui.setStatus("No match: " .. pattern)
+    return 0
+  end
+  state.search = {pattern = pattern, idx = idx, from = f, to = t}
+  -- 跳到匹配行: 使其位于视口中部（除非行数不足）
+  local _, y, _, h = getContentBounds()
+  local maxScroll = math.max(0, #state.history - h)
+  local target = #state.history - idx
+  state.scrollOffset = math.max(0, math.min(maxScroll, target - math.floor(h / 2)))
+  state.lineCache = {}
+  pcall(tui.redrawContent)
+  tui.setStatus("Match " .. idx .. "/" .. #state.history .. ": " .. pattern)
+  return 1
+end
+
+-- 重复搜索（n 下一个 / N 上一个）: 从当前匹配行向 dir 方向找
+function tui.searchNext(dir)
+  dir = dir or 1
+  if not state.search then
+    tui.setStatus("No active search (/search <text> first)")
+    return 0
+  end
+  local pattern = state.search.pattern
+  local idx, f, t = findMatch(pattern, state.search.idx + dir, dir)
+  if not idx then
+    tui.setStatus("No more match: " .. pattern)
+    return 0
+  end
+  state.search = {pattern = pattern, idx = idx, from = f, to = t}
+  local _, y, _, h = getContentBounds()
+  local maxScroll = math.max(0, #state.history - h)
+  local target = #state.history - idx
+  state.scrollOffset = math.max(0, math.min(maxScroll, target - math.floor(h / 2)))
+  state.lineCache = {}
+  pcall(tui.redrawContent)
+  tui.setStatus("Match " .. idx .. "/" .. #state.history .. ": " .. pattern)
+  return 1
 end
 
 -- 翻页步长（半屏）——/up /down 命令与 PgUp/PgDn 失效时的兜底
@@ -3957,6 +4179,88 @@ function tui.readInput(on_event)
       end
     elseif ev == "key_down" then
       local ch = char or 0
+
+      -- 键盘浏览/选择模式（v0.3.109, tmux copy-mode 移植）:
+      -- /browse 进入。hjkl 移动虚拟光标（复用派生选中渲染——
+      -- Space 设置 csel anchor 为当前浏览位置，移动扩展选中，
+      -- y 复制选中文本，q/Escape 退出浏览）。
+      -- 浏览模式下所有按键只做浏览/选择操作，不碰输入行。
+      if state.browseMode then
+        local _, _, _, bh = getContentBounds()
+        if ch == 104 then -- h: 左移
+          state.browsePos.x = math.max(1, state.browsePos.x - 1)
+        elseif ch == 108 then -- l: 右移
+          state.browsePos.x = math.min(state.width - 2, state.browsePos.x + 1)
+        elseif ch == 106 then -- j: 下移
+          local maxScroll = math.max(0, #state.history - bh)
+          if state.browsePos.y >= state.height - 2 then
+            -- 到底: 滚动内容（视口下移），浏览位置保持
+            if state.scrollOffset > 0 then
+              state.scrollOffset = state.scrollOffset - 1
+              state.lineCache = {}
+              pcall(tui.redrawContent)
+            end
+          else
+            state.browsePos.y = state.browsePos.y + 1
+          end
+        elseif ch == 107 then -- k: 上移
+          if state.browsePos.y <= 2 then
+            -- 到顶: 滚动内容（视口上移）
+            local maxScroll = math.max(0, #state.history - bh)
+            if state.scrollOffset < maxScroll then
+              state.scrollOffset = state.scrollOffset + 1
+              state.lineCache = {}
+              pcall(tui.redrawContent)
+            end
+          else
+            state.browsePos.y = state.browsePos.y - 1
+          end
+        elseif ch == 32 then -- Space: 开始/结束选中
+          if not state.csel then
+            -- 开始选中（anchor = 当前浏览位置）
+            state.csel = {ax = state.browsePos.x, ay = state.browsePos.y,
+              bx = state.browsePos.x, by = state.browsePos.y}
+            state.csel_active = true
+            pcall(tui.redrawContent)
+          else
+            -- 已有选中: 结束（保持选中，光标移动不取消）
+          end
+        elseif ch == 121 then -- y: 复制选中
+          if state.csel then
+            tui.copyContentSelection()
+            -- 复制后退出浏览（tmux copy-pipe-and-cancel）
+            state.browseMode = false
+            state.browsePos = nil
+            state.csel = nil
+            state.csel_active = nil
+            pcall(tui.redrawContent)
+            return nil
+          end
+        elseif ch == 113 or ch == 27 then -- q / Escape: 退出浏览
+          state.browseMode = false
+          state.browsePos = nil
+          state.csel = nil
+          state.csel_active = nil
+          pcall(tui.redrawContent)
+          pcall(tui.setStatus, "Ready")
+          -- 继续输入循环（返回 nil 会退出 readInput 主循环——用 continue 语义）
+        elseif ch == 13 then -- Enter: 退出浏览（回到输入）
+          state.browseMode = false
+          state.browsePos = nil
+          state.csel = nil
+          state.csel_active = nil
+          pcall(tui.redrawContent)
+        end
+        -- 选中激活时移动 → 扩展选中终点
+        if state.csel and state.csel_active and ch ~= 32 then
+          state.csel.bx = state.browsePos.x
+          state.csel.by = state.browsePos.y
+        end
+        -- 浏览模式重绘（h/l/j/k 移动后派生选中或光标移动）
+        pcall(tui.redrawContent)
+        goto continue_browse
+      end
+
       local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
       if ch == 13 then -- Enter
         local line = state.inputBuffer
@@ -4184,21 +4488,47 @@ function tui.readInput(on_event)
           -- v0.3.104 坐标修复回数字后又不执行 = 用户"仍然不成功"根因）。
           -- 正确: 数字坐标分支内、ty~=inputY（内容区）时执行。
           local _, cy, cw, ch = getContentBounds()
-        if ty >= cy and ty <= cy + ch - 1 and tx >= 2 and tx <= state.width - 1 then
-          if ev == "touch" then
+        if ev == "touch" then
+          if ty >= cy and ty <= cy + ch - 1 and tx >= 2 and tx <= state.width - 1 then
             -- 按下: 起点 = 终点 = 点击位（清除旧选中 + 输入行选中）
             state.csel = {ax = tx, ay = ty, bx = tx, by = ty}
             state.csel_active = true
             state.sel = nil
             state.sel_active = nil
             pcall(tui.redrawContent)
-          elseif ev == "drag" and state.csel and state.csel_active then
-            -- 拖动: 更新终点 + 派生重绘（v0.3.108 无状态模式，抄
-            -- tmux window_copy_redraw_selection）——只重绘受影响行区间
-            -- [min(old_y,new_y), max(old_y,new_y)]，每行从 history
-            -- 重新派生选中着色。无 gpu.get、无"恢复反色"逻辑——
-            -- 方向反转（向下再向上）时选中区间跨过锚点，重绘行
-            -- 重新计算命中与否，天然无残留、不闪烁。
+          end
+        elseif ev == "drag" and state.csel and state.csel_active then
+          -- 拖动: 更新终点 + 派生重绘（v0.3.108 无状态模式，抄
+          -- tmux window_copy_redraw_selection）——只重绘受影响行区间
+          -- [min(old_y,new_y), max(old_y,new_y)]，每行从 history
+          -- 重新派生选中着色。无 gpu.get、无"恢复反色"逻辑——
+          -- 方向反转（向下再向上）时选中区间跨过锚点，重绘行
+          -- 重新计算命中与否，天然无残留、不闪烁。
+          -- v0.3.109 P1-2 拖选自动滚动（tmux window-copy.c:7123-7131
+          -- 模式）: 拖到内容区顶/底边缘外时视口自动滚动（scrollOffset
+          -- 平移）——选中矩形跟随内容整体平移（内容下移选中下移），
+          -- 终点 clamp 到边缘行。跨屏选中可达（此前选中只能拖到屏内，
+          -- 历史超一屏时跨屏选中不可达）。
+          local maxScroll = math.max(0, #state.history - ch)
+          tx = math.max(2, math.min(state.width - 1, tx))
+          if ty < cy and state.scrollOffset < maxScroll then
+            -- 顶部之上: 视口向更早历史滚（scrollOffset+1，内容下移1行）
+            state.scrollOffset = state.scrollOffset + 1
+            state.lineCache = {}
+            state.csel.ay = math.min(cy + ch - 1, state.csel.ay + 1)
+            state.csel.by = math.min(cy + ch - 1, state.csel.by + 1)
+            ty = cy
+            pcall(tui.redrawContent)
+          elseif ty > cy + ch - 1 and state.scrollOffset > 0 then
+            -- 底部之下: 视口向更晚历史滚（scrollOffset-1，内容上移1行）
+            state.scrollOffset = state.scrollOffset - 1
+            state.lineCache = {}
+            state.csel.ay = math.max(cy, state.csel.ay - 1)
+            state.csel.by = math.max(cy, state.csel.by - 1)
+            ty = cy + ch - 1
+            pcall(tui.redrawContent)
+          else
+            -- 常规拖动（视口内）: 增量重绘受影响行区间
             local old_a, old_b = normalizeCsel()
             state.csel.bx = tx
             state.csel.by = ty
@@ -4242,6 +4572,10 @@ function tui.readInput(on_event)
         tui.scrollDown(3)
       end
     end
+    -- 浏览模式 continue（v0.3.109 P1-1）: browse 分支按键处理后
+    -- goto 跳到这里——跳过本事件周期剩余处理（正常输入分支等），
+    -- 直接进入下一轮事件循环（goto 跳出局部变量作用域，Lua 合法）。
+    ::continue_browse::
   end
 end
 
@@ -6182,6 +6516,27 @@ local function handle_command(cmd, config, messages)
   elseif command == "/bottom" then
     if UI_HOOKS.scrollToBottom then UI_HOOKS.scrollToBottom()
     else print("Scroll commands are TUI-only (PgUp/PgDn or /up /down)") end
+  elseif command == "/browse" then
+    -- 键盘浏览/选择模式（v0.3.109, tmux copy-mode 移植）: 鼠标选中
+    -- 真机不精确（MC 客户端事件稀疏），键盘 hjkl/Space/y/q 可靠替代。
+    -- 进入后 readInput 事件循环接管按键（tui.browseMode 分支）。
+    if UI_HOOKS.enterBrowse then UI_HOOKS.enterBrowse()
+    else print("Browse mode is TUI-only (/browse)") end
+  elseif command == "/search" or command == "/find" then
+    -- 内容区搜索（v0.3.109 P1-3, tmux window_copy_search 移植）:
+    -- 在 history 纯文本数组找首匹配 → 跳到匹配行 + tool 色高亮;
+    -- /snext /sprev（n/N）循环重复。零组件调用（string.find）。
+    if UI_HOOKS.search then
+      UI_HOOKS.search(parts[2])
+    else
+      print("Search is TUI-only (/search <text>)")
+    end
+  elseif command == "/snext" then
+    if UI_HOOKS.searchNext then UI_HOOKS.searchNext(1)
+    else print("Search is TUI-only (/search <text>)") end
+  elseif command == "/sprev" then
+    if UI_HOOKS.searchNext then UI_HOOKS.searchNext(-1)
+    else print("Search is TUI-only (/search <text>)") end
   elseif command == "/hist" then
     local p = session_mod.current_path()
     local name = p:match("([^/\\]+)%.jsonl$") or "default"
@@ -6582,6 +6937,8 @@ local function handle_command(cmd, config, messages)
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
     print("  /preset-200k    One-shot: set context_window=200000 (+ memory check)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
+    print("  /browse         Keyboard browse/select mode (hjkl move, Space select, y copy, q quit)")
+    print("  /search <text>  Search content history (jump + highlight; /snext /sprev repeat)")
     print("  /version        Show installed agent version")
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
     print("  /mouseprobe     Print raw touch/drag/drop events for 30s (mouse input chain debug)")
@@ -7613,7 +7970,7 @@ local function main(config, ...)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
         "/sessions", "/session", "/relocate", "/preset-200k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
-        "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
+        "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
         comps[#comps + 1] = t["function"].name
@@ -7633,6 +7990,11 @@ local function main(config, ...)
       end
       UI_HOOKS.scrollToTop = function() ui.scrollToTop() end
       UI_HOOKS.scrollToBottom = function() ui.scrollToBottom() end
+      -- 键盘浏览/选择模式（v0.3.109 P1-1, tmux copy-mode 移植）
+      UI_HOOKS.enterBrowse = function() ui.enterBrowse() end
+      -- 内容区搜索（v0.3.109 P1-3, tmux window_copy_search 移植）
+      UI_HOOKS.search = function(pat) ui.search(pat) end
+      UI_HOOKS.searchNext = function(dir) ui.searchNext(dir) end
     end
   end
 
