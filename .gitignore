@@ -38,3 +38,4 @@ test_harness/results/
 
 # 但项目级 skill 需要提交
 !.opencode/skills/
+test_harness/agent_history.txt
