@@ -11,6 +11,12 @@
 
 local json = require("agent.json")
 local interrupt = require("agent.interrupt")  -- v0.3.86: Ctrl+C 中断支持
+local patch = require("agent.patch")  -- v0.3.99: 墙钟 now()（uptime 优先）
+
+-- 墙钟（v0.3.99）: os.clock 是 CPU 时间——等待网络/退避期间不走，
+-- deadline 永不触发（v0.3.88 教训残留: 连接挂起时读超时失效）。
+-- patch.now() = computer.uptime()（世界墙钟）优先，回退 os.clock。
+local now = patch.now
 
 -- ═══════════════════════════════════════════════════════════════
 -- Retry policy（参考 opencode src/session/retry.ts 指数退避重试:
@@ -68,7 +74,9 @@ local function http_post_once(url, headers, body)
     -- 建立后流可能永不结束，无超时则无限等（重试预算检查不到——预算在
     -- once 返回后才执行）。保持每 chunk os.sleep(0.02) yield——OC 调度器
     -- 看到进展，避免 "too long without yielding" 崩溃。
-    local read_deadline = os.clock() + MAX_RESPONSE_WAIT
+    -- v0.3.99: 用 patch.now()（uptime 墙钟）——os.clock 是 CPU 时间，
+    -- 等待流数据期间不走 → deadline 永不触发（v0.3.88 教训）。
+    local read_deadline = now() + MAX_RESPONSE_WAIT
     local total = 0
     for chunk in handle do
       -- v0.3.86: Ctrl+C 中断——interrupt.install() 补丁的 os.sleep 检测到
@@ -77,7 +85,7 @@ local function http_post_once(url, headers, body)
         interrupted = true
         return
       end
-      if os.clock() >= read_deadline then
+      if now() >= read_deadline then
         timed_out = true
         return
       end
@@ -137,7 +145,9 @@ end
 -- POST with automatic retry（指数退避 + 总预算上限）
 local function http_post(url, headers, body)
   local attempt = 0
-  local deadline = os.clock() + retry_budget
+  -- v0.3.99: patch.now() 墙钟——os.clock 是 CPU 时间，os.sleep 退避期间
+  -- 不走 → 预算 deadline 永不触发（v0.3.88 教训）
+  local deadline = now() + retry_budget
   while true do
     attempt = attempt + 1
     local code, resp, err = http_post_once(url, headers, body)
@@ -149,14 +159,14 @@ local function http_post(url, headers, body)
     if not transient then
       return code, resp, err
     end
-    local now = os.clock()
-    if now >= deadline then
+    local now_t = now()
+    if now_t >= deadline then
       -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
       return code, resp, err
     end
     local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
     if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
-    local remaining = deadline - now
+    local remaining = deadline - now_t
     if wait > remaining then wait = remaining end
     os.sleep(wait)
   end

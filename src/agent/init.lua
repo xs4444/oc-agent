@@ -1603,13 +1603,16 @@ local function main(config, ...)
     return
   end
 
-  -- ── 中断补丁（v0.3.86）: 可中断 os.sleep——chat/工具阻塞期间 Ctrl+C
-  -- 生效。原版 os.sleep 内部 event.pull("timer") 单过滤, interrupted
-  -- 事件被丢弃。补丁多过滤 ("timer","interrupted","modem_message"),
-  -- interrupted 设标志; modem_message 转发文件服务（chat 期间 explorer
-  -- 请求实时处理, 不排队不丢——与 v0.3.85 的 wait_modem_message on_other
-  -- 同路）。install() 幂等。
-  require("agent.interrupt").install()
+  -- ── OpenOS 运行时补丁（v0.3.99, agent.patch）: 基于 OpenOS 架构
+  -- 勘察（GTNH fork 源码行号实测）的统一修补——不碰模组 jar，随 agent
+  -- 分发。install() 幂等，一次装齐:
+  --   P0 可中断 os.sleep（agent.interrupt 正式化——原版 boot/02_os.lua
+  --      os.sleep 用无过滤 event.pull，Ctrl+C 的 interrupted 被消费不
+  --      中断 sleep，非 Ready 状态无法中断）
+  --   P1 internet.request 连接超时（InternetCard.scala:511 DNS 无超时
+  --      + setReadTimeout 仅 POST + requestTimeout:0 无限——thread 包装
+  --      30s 兜底抛错）
+  require("agent.patch").install()
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the
