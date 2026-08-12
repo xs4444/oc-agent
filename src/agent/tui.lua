@@ -337,52 +337,142 @@ end
 -- 与输入行选中（state.sel）互斥: 输入行 touch 优先。
 -- ════════════════════════════════════════
 
--- 反色高亮选中矩形（调用前应先 redrawContent 恢复画面——逐格读原
--- 字符反色重写，覆盖旧选中/普通文本均安全）
+-- 选中归一化（v0.3.106 流式选择）: 起点 = 按 (y, x) 字典序的较小角。
+-- 返回 (a, b) 两个 {x, y}——a.y <= b.y 且同 y 时 a.x <= b.x。
+local function normalizeCsel()
+  local a = {x = state.csel.ax, y = state.csel.ay}
+  local b = {x = state.csel.bx, y = state.csel.by}
+  if b.y < a.y or (b.y == a.y and b.x < a.x) then a, b = b, a end
+  return a, b
+end
+
+-- 宽字符判定（v0.3.106 中文支持）: CJK 等宽字符 UTF-8 编码 >= 3 字节，
+-- OC 屏幕占 2 格（第二格 padding）。ASCII 1 字节、拉丁扩展 2 字节。
+local function isWideChar(ch)
+  return type(ch) == "string" and #ch >= 3
+end
+
+-- 从 history 重画内容区指定矩形区域（v0.3.106 增量更新——拖动不闪烁）:
+-- 拖动时旧选中矩形的内容已反色覆盖，重画该区域行片段恢复原文本。
+-- 参数为屏幕坐标（含边界裁剪）。
+local function redrawRectArea(xa, ya, xb, yb)
+  local g = component.gpu
+  local x, y, w, h = getContentBounds()
+  local from = math.max(x, math.min(xa, xb))
+  local to = math.min(x + w - 1, math.max(xa, xb))
+  local y0 = math.max(y, math.min(ya, yb))
+  local y1 = math.min(y + h - 1, math.max(ya, yb))
+  if from > to or y0 > y1 then return end
+  local startIdx = math.max(1, #state.history - h + 1 - state.scrollOffset)
+  g.setBackground(tui.colors.background)
+  for row = y0, y1 do
+    local idx = startIdx + (row - y)
+    local entry = state.history[idx]
+    if entry then
+      g.setForeground(entry.color or tui.colors.foreground)
+      g.set(from, row, usub(entry.text, from - x + 1, to - from + 1))
+    else
+      g.set(from, row, string.rep(" ", to - from + 1))
+    end
+  end
+  g.setForeground(tui.colors.foreground)
+end
+
+-- 反色高亮选中（v0.3.106 流式选择——非矩形框选）:
+-- 起点行从起点列高亮到行尾 / 中间行整行 / 终点行从行首到终点列
+-- （终端标准选择语义）。宽字符占 2 格: 高亮一格即覆盖（set 自动
+-- padding），跳过第二格。
 local function drawContentSelection()
   if not state.csel then return end
   local g = component.gpu
   local x, y, w, h = getContentBounds()
-  local x0 = math.max(x, math.min(state.csel.ax, state.csel.bx))
-  local x1 = math.min(x + w - 1, math.max(state.csel.ax, state.csel.bx))
-  local y0 = math.max(y, math.min(state.csel.ay, state.csel.by))
-  local y1 = math.min(y + h - 1, math.max(state.csel.ay, state.csel.by))
-  if x0 > x1 or y0 > y1 then return end
-  for row = y0, y1 do
-    for col = x0, x1 do
+  local a, b = normalizeCsel()
+  local xmax = x + w - 1
+  local function highlightSegment(row, from, to)
+    from = math.max(x, from)
+    to = math.min(xmax, to)
+    if from > to then return end
+    local col = from
+    while col <= to do
       local ok_g, text, fg, bg = pcall(g.get, col, row)
-      if ok_g and type(text) == "string" then
+      if ok_g and type(text) == "string" and text ~= "" then
         pcall(g.setForeground, bg or tui.colors.background)
         pcall(g.setBackground, fg or tui.colors.foreground)
         pcall(g.set, col, row, text)
+        col = col + (isWideChar(text) and 2 or 1)
+      else
+        pcall(g.setForeground, tui.colors.background)
+        pcall(g.setBackground, tui.colors.foreground)
+        pcall(g.set, col, row, " ")
+        col = col + 1
       end
     end
+  end
+  if a.y == b.y then
+    highlightSegment(a.y, a.x, b.x)
+  else
+    highlightSegment(a.y, a.x, xmax)
+    for row = a.y + 1, b.y - 1 do
+      highlightSegment(row, x, xmax)
+    end
+    highlightSegment(b.y, x, b.x)
   end
   pcall(g.setForeground, tui.colors.foreground)
   pcall(g.setBackground, tui.colors.background)
 end
 
--- 读回选中矩形文本（gpu.get 逐格; 每行 trim 尾部空格; 空行保留）
+-- 读回选中文本（v0.3.106 流式 + 中文支持）:
+-- 按文本流拼接（起点行起点列起 → 中间行整行 → 终点行到终点列），
+-- 行间 \n 连接。宽字符读回: 跳 padding 格（前一格宽字符的后续格）；
+-- 选中列起点落在宽字符第二格时前移一格包含完整字符。
 -- 返回字符串或 nil（无选中/全空）
 local function readContentSelection()
   if not state.csel then return nil end
   local g = component.gpu
   local x, y, w, h = getContentBounds()
-  local x0 = math.max(x, math.min(state.csel.ax, state.csel.bx))
-  local x1 = math.min(x + w - 1, math.max(state.csel.ax, state.csel.bx))
-  local y0 = math.max(y, math.min(state.csel.ay, state.csel.by))
-  local y1 = math.min(y + h - 1, math.max(state.csel.ay, state.csel.by))
-  if x0 > x1 or y0 > y1 then return nil end
-  local lines = {}
-  for row = y0, y1 do
-    local parts = {}
-    for col = x0, x1 do
-      local ok_g, text = pcall(g.get, col, row)
-      parts[#parts + 1] = ok_g and type(text) == "string" and text or " "
+  local a, b = normalizeCsel()
+  local xmax = x + w - 1
+  local function readSegment(row, from, to)
+    from = math.max(x, from)
+    to = math.min(xmax, to)
+    if from > to then return "" end
+    -- 宽字符边界校正: from 若是前一格宽字符的 padding → 前移包含整字符
+    if from > x then
+      local ok_prev, prev = pcall(g.get, from - 1, row)
+      if ok_prev and isWideChar(prev) then from = from - 1 end
     end
-    -- trim 尾部空白（OC 屏幕填充空格）
-    local line = table.concat(parts):gsub("[ \t]+$", "")
-    lines[#lines + 1] = line
+    local parts = {}
+    local col = from
+    local prevWide = false
+    while col <= to do
+      if prevWide then
+        -- padding 格: 跳过（前一格是宽字符）
+        prevWide = false
+        col = col + 1
+      else
+        local ok_g, text = pcall(g.get, col, row)
+        local ch = ok_g and type(text) == "string" and text or ""
+        if isWideChar(ch) then
+          parts[#parts + 1] = ch
+          prevWide = true
+          col = col + 1
+        else
+          parts[#parts + 1] = (ch == "" and " " or ch)
+          col = col + 1
+        end
+      end
+    end
+    return table.concat(parts):gsub("[ \t]+$", "")
+  end
+  local lines = {}
+  if a.y == b.y then
+    lines[1] = readSegment(a.y, a.x, b.x)
+  else
+    lines[1] = readSegment(a.y, a.x, xmax)
+    for row = a.y + 1, b.y - 1 do
+      lines[#lines + 1] = readSegment(row, x, xmax)
+    end
+    lines[#lines + 1] = readSegment(b.y, x, b.x)
   end
   -- 全空（每行都空）→ nil
   local all_empty = true
@@ -393,9 +483,12 @@ local function readContentSelection()
   return table.concat(lines, "\n")
 end
 
--- 复制内容区选中: 读回文本 → state.clipboard（进程内 Ctrl+V 粘贴）+
--- onCopy 回调（init.lua 注入: 写 WRITABLE_BASE/selected.txt 供 /debug
--- gist 附带）→ 清除选中。返回复制字符数或 nil。
+-- 复制内容区选中: 读回文本 → state.clipboard + onCopy 回调（写
+-- WRITABLE_BASE/selected.txt 供 /paste 命令与 /debug gist 附带）→
+-- 清除选中。返回复制字符数或 nil。
+-- v0.3.106 改: 不再把 state.clipboard 当"优先粘贴源"——那抢占游戏
+-- 剪贴板（用户: "占用了正常的从游戏外粘贴到游戏内操作"）。复制选中
+-- 走 /paste 命令（读 selected.txt）粘贴，Ctrl+V 恢复游戏剪贴板粘贴。
 function tui.copyContentSelection()
   local text = readContentSelection()
   if not text then
@@ -403,22 +496,37 @@ function tui.copyContentSelection()
     state.csel_active = nil
     return nil
   end
-  state.clipboard = text
   local n = ulen(text)
   if tui.onCopy then
     local ok, err = pcall(tui.onCopy, text)
     if not ok then
       tui.setStatus("Copied " .. n .. " chars (file write failed: " .. tostring(err) .. ")")
     else
-      tui.setStatus("Copied " .. n .. " chars → selected.txt (Ctrl+V paste; /debug 附带)")
+      tui.setStatus("Copied " .. n .. " chars → selected.txt (/paste 粘贴; /debug 附带)")
     end
   else
-    tui.setStatus("Copied " .. n .. " chars (Ctrl+V to paste)")
+    tui.setStatus("Copied " .. n .. " chars (/paste 粘贴)")
   end
   state.csel = nil
   state.csel_active = nil
   pcall(tui.drawInput)
   return n
+end
+
+-- 设置输入缓冲区（v0.3.106）: /paste 命令把选中内容注入输入行
+-- （readInput 主循环的输入行）。仅事件驱动分支有效; io.read 回退
+-- 分支忽略（REPL 场景用 /paste 写文件 + 手动粘贴）。
+function tui.setInputBuffer(text)
+  if type(text) ~= "string" then return end
+  -- 注入到当前输入行（覆盖多行选中为单行——内容区选中可能含 \n,
+  -- 输入行不支持多行编辑; 换行转空格保持可编辑）
+  local single = tostring(text):gsub("[\r\n]+", " ")
+  state.inputBuffer = single
+  state.inputCursor = ulen(single)
+  state.completionCycle = nil
+  state.sel = nil
+  state.sel_active = nil
+  pcall(tui.drawInput)
 end
 
 -- 清除内容区选中（无复制）
@@ -824,11 +932,11 @@ function tui.readInput(on_event)
       pcall(tui.drawInput)
     elseif ev == "clipboard" then
       if char then
-        -- v0.3.72: 优先粘贴进程内剪贴板（Ctrl+C 复制的选中文本）——
-        -- 有内部剪贴板时用它（避免游戏剪贴板覆盖刚复制的文本）；
-        -- 否则用游戏剪贴板内容（原有 Ctrl+V 行为）。
-        local paste = state.clipboard and #state.clipboard > 0
-          and state.clipboard or char
+        -- v0.3.106 改: Ctrl+V 恢复游戏剪贴板粘贴（用户: 选中复制
+        -- "占用了正常的从游戏外粘贴到游戏内操作"）。原实现优先
+        -- state.clipboard（选中复制）——抢占游戏剪贴板。现在选中复制
+        -- 走 /paste 命令（读 selected.txt），Ctrl+V 永远是游戏剪贴板。
+        local paste = char
         state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
           .. paste
           .. usub(state.inputBuffer, state.inputCursor + 1)
@@ -906,10 +1014,16 @@ function tui.readInput(on_event)
             state.sel_active = nil
             pcall(tui.redrawContent)
           elseif ev == "drag" and state.csel and state.csel_active then
-            -- 拖动: 更新终点 + 实时高亮（先恢复画面再画新矩形）
+            -- 拖动: 更新终点 + 增量高亮（v0.3.106 不闪烁）——原实现
+            -- redrawContent 全量重绘 + 重画高亮（用户: "选时 tui 会
+            -- 闪烁"）。改为只恢复旧/新选中区域（redrawRectArea 按
+            -- history 原文本重画）再画新流式高亮——无全屏刷新。
+            redrawRectArea(state.csel.ax, state.csel.ay,
+              state.csel.bx, state.csel.by)
             state.csel.bx = tx
             state.csel.by = ty
-            pcall(tui.redrawContent)
+            redrawRectArea(state.csel.ax, state.csel.ay,
+              state.csel.bx, state.csel.by)
             drawContentSelection()
             pcall(tui.drawInput)
           end

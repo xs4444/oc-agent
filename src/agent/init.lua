@@ -892,6 +892,32 @@ local function handle_command(cmd, config, messages)
     end
   elseif command == "/ctx" then
     cmd_ctx(config, messages)
+  elseif command == "/paste" then
+    -- 粘贴选中内容（v0.3.106）: 内容区选中复制写 selected.txt（onCopy
+    -- 回调），本命令读回注入输入行。Ctrl+V 已恢复游戏剪贴板粘贴——
+    -- 选中复制不再抢占游戏剪贴板通道。
+    local sel_path = WRITABLE_BASE .. "/selected.txt"
+    local ok_f, f = pcall(io.open, sel_path, "r")
+    if ok_f and f then
+      local content = f:read("*a")
+      f:close()
+      if content and #content > 0 then
+        if ui then
+          -- TUI 模式: 注入输入行
+          ui.setInputBuffer(content)
+          print("粘贴 " .. ulen(content) .. " 字符到输入行（回车发送）")
+        else
+          -- REPL 模式: 打印内容供复制（readInput 回退 io.read 时无输入行
+          -- 可注入——打印让用户手动复制）
+          print("(REPL 模式无输入行可注入——selected.txt 内容:)")
+          print(content)
+        end
+      else
+        print("selected.txt 为空——先在内容区选中复制（鼠标拖动）")
+      end
+    else
+      print("未找到 selected.txt——先在内容区选中复制（鼠标拖动）")
+    end
   elseif command == "/ml" then
     -- 多行输入（粘贴多行代码场景）: 收集到 EOF 后作为一条消息发送
     local text = collect_multiline()
@@ -925,6 +951,7 @@ local function handle_command(cmd, config, messages)
     print("  /tools          List available tools the AI can use")
     print("  /ctx            Show context usage (tokens + progress bar, like opencode TUI)")
     print("  /ml             Multi-line input (paste code: collect until EOF line)")
+    print("  /paste          Paste selected content (selected.txt) into input line — mouse-select then /paste")
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
   elseif command == "/exit" then
