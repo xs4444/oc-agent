@@ -4025,11 +4025,13 @@ function tui.readInput(on_event)
           local len = ulen(state.inputBuffer)
           state.sel.b = ty < inputY and line_start or len
           pcall(tui.drawInput)
-        end
-      else
-        -- 内容区选中（v0.3.100）: 非输入行 touch/drag →
-        -- 选中矩形（屏幕坐标）+ 反色高亮。
-        local _, cy, cw, ch = getContentBounds()
+        else
+          -- 内容区选中（v0.3.105 修复）: 原结构误放在"坐标非数字"的
+          -- else 分支——真机坐标是数字 → 内容区选中永不执行（v0.3.100
+          -- 引入; v0.3.103 字符串坐标恰好走进来但 896 行崩溃;
+          -- v0.3.104 坐标修复回数字后又不执行 = 用户"仍然不成功"根因）。
+          -- 正确: 数字坐标分支内、ty~=inputY（内容区）时执行。
+          local _, cy, cw, ch = getContentBounds()
         if ty >= cy and ty <= cy + ch - 1 and tx >= 2 and tx <= state.width - 1 then
           if ev == "touch" then
             -- 按下: 起点 = 终点 = 点击位（清除旧选中 + 输入行选中）
@@ -4048,6 +4050,8 @@ function tui.readInput(on_event)
           end
         end
       end
+      end  -- 关闭 if type(tx)（v0.3.105 结构修复）——else 内容区选中
+           -- 挂在 if ty == inputY 分支，外层 if type 的 end 独立补回
     elseif ev == "drop" then
       -- 内容区拖选结束（button 抬起）: 复制选中文本
       -- （touch 按下 → drag 拖动 → drop 结束——gpu.get 读回矩形）
