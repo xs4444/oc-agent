@@ -546,8 +546,20 @@ if manifest then
       lf:close()
       launcher_ok = true
     end
-    -- update 启动器（更新脚本本体由安装流程下载到 AGENT_DIR 父目录）
-    local up_dir = AGENT_DIR:match("^(.*)/agent$") or "/home"
+    -- update 启动器（更新脚本本体由安装流程下载——v0.3.98: 默认落
+    -- /home/update.lua 便于手动更新；/home 不可写（如 ocvm 只读
+    -- /home）时回退 agent 同盘父目录）
+    local up_dir
+    do
+      local probe = io.open("/home/up_probe.txt", "w")
+      if probe then
+        probe:close()
+        os.remove("/home/up_probe.txt")
+        up_dir = "/home"
+      else
+        up_dir = AGENT_DIR:match("^(.*)/agent$") or "/home"
+      end
+    end
     local up_script = up_dir .. "/update.lua"
     local up_launcher = "/home/bin/update.lua"
     local uf = io.open(up_launcher, "w")
