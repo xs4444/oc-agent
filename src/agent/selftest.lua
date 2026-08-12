@@ -300,7 +300,28 @@ local function test_interrupt()
 end
 
 -- ════════════════════════════════════════
--- 8. tools — TOOLS 清单齐全（19 项）
+-- 8. patch — OpenOS 运行时补丁在位检查（v0.3.99）
+--    P0 可中断 os.sleep（agent.interrupt.installed）
+--    P1 internet.request 连接超时（CONNECT_TIMEOUT 常量存在 + 包装已装）
+--    P2 墙钟 now() 可用（uptime 优先——os.clock CPU 时间残留修复）
+-- ════════════════════════════════════════
+local function test_patch()
+  local ok_p, patch = pcall(require, "agent.patch")
+  if not ok_p then record("patch", false, "no agent.patch: " .. tostring(patch)); return end
+  -- P2: now() 可用且返回数字
+  local ok_n, n = pcall(patch.now)
+  -- P0: interrupt 补丁已安装（os.sleep 已替换）
+  local ok_i, interrupt = pcall(require, "agent.interrupt")
+  local installed = ok_i and interrupt and interrupt.installed == true
+  -- P1: 连接超时常量在位（包装在 install 时装配，常量是模块级）
+  local has_ct = type(patch.CONNECT_TIMEOUT) == "number"
+  record("patch", ok_n and type(n) == "number" and installed and has_ct,
+    "now=" .. tostring(ok_n and n) .. " interrupt_installed=" .. tostring(installed)
+    .. " connect_timeout=" .. tostring(has_ct))
+end
+
+-- ════════════════════════════════════════
+-- 9. tools — TOOLS 清单齐全（19 项）
 -- ════════════════════════════════════════
 local function test_tools()
   local ok_t, tools = pcall(require, "agent.tools")
@@ -360,6 +381,7 @@ M.run = function()
   run_test("config", test_config, 15)
   run_test("net", test_net, 30)
   run_test("interrupt", test_interrupt, 15)
+  run_test("patch", test_patch, 15)
   run_test("tools", test_tools, 15)
   run_test("mem", test_mem, 15)
   -- 组装报告（最后才拼大字符串）

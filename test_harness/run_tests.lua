@@ -1020,6 +1020,53 @@ do
   int_mod.clear()
 end
 
+print("")
+print("═══════════════════════════════════════")
+print("OpenOS Patch Layer Tests")
+print("═══════════════════════════════════════")
+
+-- OpenOS 运行时补丁层（v0.3.99, agent.patch）: 统一修补 OpenOS 缺陷。
+-- 单测覆盖: P2 now() 墙钟（uptime 优先——os.clock CPU 时间残留修复）、
+-- P3 pull_any 多事件匹配（OpenOS 多参=位置匹配的收敛包装）、
+-- P1 install() 幂等（thread 可用时包装 internet.request，替换动作
+-- 本身安全——不触发请求调用）。
+do
+  local patch_mod = require("agent.patch")
+  -- P2: now() 可用且为数字（oc_mock computer.uptime 随时间前进）
+  local ok_n, n = pcall(patch_mod.now)
+  test("patch: now() returns number (uptime-based wall clock)",
+    ok_n and type(n) == "number", "now=" .. tostring(ok_n and n))
+  -- P3: pull_any 多事件名匹配（入队 modem_message → 应返回它;
+  -- 入队 interrupted → 也应匹配）
+  table.insert(oc_mock._event_queue, {"modem_message", "addr1", "addr2", 1234, 0, "payload"})
+  local ev, a1, a2 = patch_mod.pull_any(2, {"interrupted", "modem_message"})
+  test("patch: pull_any matches second event name",
+    ev == "modem_message" and a1 == "addr1" and a2 == "addr2",
+    "ev=" .. tostring(ev) .. " a1=" .. tostring(a1) .. " a2=" .. tostring(a2))
+  table.insert(oc_mock._event_queue, {"interrupted"})
+  local ev2 = patch_mod.pull_any(2, {"interrupted", "modem_message"})
+  test("patch: pull_any matches first event name", ev2 == "interrupted",
+    "ev=" .. tostring(ev2))
+  -- 不匹配事件被消费（pull 即消费语义）: 入队 key_down + 入队 interrupted，
+  -- pull_any(events=interrupted) 应跳过 key_down 拿到 interrupted
+  table.insert(oc_mock._event_queue, {"key_down", 0, 1, 2})
+  table.insert(oc_mock._event_queue, {"interrupted"})
+  local ev3 = patch_mod.pull_any(2, {"interrupted"})
+  test("patch: pull_any skips non-matching events", ev3 == "interrupted",
+    "ev=" .. tostring(ev3))
+  -- P1: install() 幂等（mock 下 thread 可用——包装动作安全，不触发请求）
+  local ok_i1, r1 = pcall(patch_mod.install)
+  local ok_i2, r2 = pcall(patch_mod.install)
+  local ok_int2, int2 = pcall(require, "agent.interrupt")
+  test("patch: install() idempotent + interrupt installed",
+    ok_i1 and ok_i2 and ok_int2 and int2.installed == true,
+    "i1=" .. tostring(ok_i1) .. " i2=" .. tostring(ok_i2)
+    .. " interrupt=" .. tostring(ok_int2 and int2.installed))
+  -- P1 常量在位
+  test("patch: CONNECT_TIMEOUT constant", type(patch_mod.CONNECT_TIMEOUT) == "number",
+    "ct=" .. tostring(patch_mod.CONNECT_TIMEOUT))
+end
+
 -- wait_modem_message on_other 转发（v0.3.85 死锁修复）: 主代理
 -- subagent_call 等待回复期间，非回复端口的文件请求经 on_other 回调
 -- 处理，不丢弃——否则 explorer 子代理等文件回复 60s / 主代理等任务
