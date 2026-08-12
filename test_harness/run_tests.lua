@@ -1771,6 +1771,37 @@ end
 
 print("")
 print("═══════════════════════════════════════")
+print("Content Selection (v0.3.100) Tests")
+print("═══════════════════════════════════════")
+
+-- 内容区选中（v0.3.100）: touch/drag 内容区 → 选中矩形 → 反色高亮 →
+-- Ctrl+C / drop 复制 → gpu.get 读回 → state.clipboard + onCopy 回调
+-- （写 selected.txt，/debug gist 附带）。mock gpu 无缓冲（get 返回 0），
+-- 验证安全路径 + onCopy 注入 + 空选区 nil。
+do
+  local ok_tui2, tui_mod2 = pcall(require, "agent.tui")
+  -- 1. onCopy 注入: config.onCopy → tui.onCopy
+  local captured = nil
+  local copy_fn = function(text) captured = text end
+  pcall(tui_mod2.init, {onCopy = copy_fn})
+  test("csel: onCopy injected from config", tui_mod2.onCopy == copy_fn,
+    "onCopy=" .. tostring(tui_mod2.onCopy == copy_fn))
+  -- 2. 无选中时 copyContentSelection 安全返回 nil（不崩）
+  local ok_ccs, ccs_res = pcall(tui_mod2.copyContentSelection)
+  test("csel: copy without selection returns nil safely",
+    ok_ccs and ccs_res == nil,
+    "ok=" .. tostring(ok_ccs) .. " res=" .. tostring(ccs_res))
+  -- 3. 清除无选中安全
+  local ok_clr = pcall(tui_mod2.clearContentSelection)
+  test("csel: clear without selection safe", ok_clr)
+  -- 4. mock gpu 无缓冲: 强制设 csel 后 copy → readContentSelection 全空
+  --    → nil（安全路径，不崩）。通过 init 后直接操作（内部 state 不可
+  --    直接访问——用 readInput 事件模拟不可行，验证对外 API 安全即可）
+  pcall(tui_mod2.cleanup)
+end
+
+print("")
+print("═══════════════════════════════════════")
 print("Tool Loop Guards (chat 层借鉴) Tests")
 print("═══════════════════════════════════════")
 

@@ -3040,15 +3040,25 @@ end
 -- （默认 30s，config.debug_upload_timeout 可调）；超时放弃线程返回
 -- 提示（报告已写本地）。thread 库不可用（测试/精简环境）时回退同步
 -- 调用（行为同旧版）。
-local function upload(report, token)
+-- extra_files（v0.3.100）: 附带文件 {文件名 = 内容}——内容区选中的
+-- selected.txt 随 debug 报告一起上传（"提交 gist 时可以附带该文件"）。
+local function upload(report, token, extra_files)
   if not token or token == "" then
     return nil, "no gist token configured (use /gist-token <token>)"
   end
   local http = require("agent.http")
+  local files = { ["debug_report.txt"] = { content = report } }
+  if type(extra_files) == "table" then
+    for name, content in pairs(extra_files) do
+      if type(name) == "string" and type(content) == "string" and #content > 0 then
+        files[name] = { content = content }
+      end
+    end
+  end
   local body = json.encode({
     description = "OC Agent debug report",
     public = false,
-    files = { ["debug_report.txt"] = { content = report } },
+    files = files,
   })
   local headers = {
     ["Content-Type"] = "application/json",
@@ -3217,6 +3227,12 @@ function tui.init(config)
   state.width, state.height = w, h
   state.running = true
   state.scrollOffset = 0
+  -- 内容区选中（v0.3.100）: 屏幕坐标矩形 {ax,ay,bx,by} + 激活标志;
+  -- 与输入行选中（state.sel）互斥。onCopy 由 init.lua 注入（写
+  -- selected.txt 供 /debug gist 附带）。
+  state.csel = nil
+  state.csel_active = nil
+  tui.onCopy = config.onCopy
   -- 滚动型渲染探测（荒野大师等终端滚动型模拟器）：写入最底行 y=h 会触发
   -- 整屏上滚（帧缓冲模拟器如 ocvm/OCEmu 无此行为）。探测：先在 y=1 写
   -- 标记再写 y=h，标记被顶走即滚动型。**旧版先读后写是 bug——启动时
@@ -3431,6 +3447,107 @@ function tui.redrawContent()
   g.setForeground(tui.colors.foreground)
   tui.drawStatus()
   tui.drawInput()
+end
+
+-- ════════════════════════════════════════
+-- 内容区选中（v0.3.100）: touch/drag 在内容区（非输入行）按下拖动 →
+-- 选中矩形 state.csel = {ax,ay,bx,by}（屏幕坐标）→ 反色高亮实时重绘;
+-- Ctrl+C / 拖选结束复制 → gpu.get 读回矩形文本 → 进程内剪贴板 +
+-- onCopy 回调（init.lua 写 selected.txt，/debug gist 可附带）。
+-- 与输入行选中（state.sel）互斥: 输入行 touch 优先。
+-- ════════════════════════════════════════
+
+-- 反色高亮选中矩形（调用前应先 redrawContent 恢复画面——逐格读原
+-- 字符反色重写，覆盖旧选中/普通文本均安全）
+local function drawContentSelection()
+  if not state.csel then return end
+  local g = component.gpu
+  local x, y, w, h = getContentBounds()
+  local x0 = math.max(x, math.min(state.csel.ax, state.csel.bx))
+  local x1 = math.min(x + w - 1, math.max(state.csel.ax, state.csel.bx))
+  local y0 = math.max(y, math.min(state.csel.ay, state.csel.by))
+  local y1 = math.min(y + h - 1, math.max(state.csel.ay, state.csel.by))
+  if x0 > x1 or y0 > y1 then return end
+  for row = y0, y1 do
+    for col = x0, x1 do
+      local ok_g, text, fg, bg = pcall(g.get, col, row)
+      if ok_g and type(text) == "string" then
+        pcall(g.setForeground, bg or tui.colors.background)
+        pcall(g.setBackground, fg or tui.colors.foreground)
+        pcall(g.set, col, row, text)
+      end
+    end
+  end
+  pcall(g.setForeground, tui.colors.foreground)
+  pcall(g.setBackground, tui.colors.background)
+end
+
+-- 读回选中矩形文本（gpu.get 逐格; 每行 trim 尾部空格; 空行保留）
+-- 返回字符串或 nil（无选中/全空）
+local function readContentSelection()
+  if not state.csel then return nil end
+  local g = component.gpu
+  local x, y, w, h = getContentBounds()
+  local x0 = math.max(x, math.min(state.csel.ax, state.csel.bx))
+  local x1 = math.min(x + w - 1, math.max(state.csel.ax, state.csel.bx))
+  local y0 = math.max(y, math.min(state.csel.ay, state.csel.by))
+  local y1 = math.min(y + h - 1, math.max(state.csel.ay, state.csel.by))
+  if x0 > x1 or y0 > y1 then return nil end
+  local lines = {}
+  for row = y0, y1 do
+    local parts = {}
+    for col = x0, x1 do
+      local ok_g, text = pcall(g.get, col, row)
+      parts[#parts + 1] = ok_g and type(text) == "string" and text or " "
+    end
+    -- trim 尾部空白（OC 屏幕填充空格）
+    local line = table.concat(parts):gsub("[ \t]+$", "")
+    lines[#lines + 1] = line
+  end
+  -- 全空（每行都空）→ nil
+  local all_empty = true
+  for _, l in ipairs(lines) do
+    if l ~= "" then all_empty = false break end
+  end
+  if all_empty then return nil end
+  return table.concat(lines, "\n")
+end
+
+-- 复制内容区选中: 读回文本 → state.clipboard（进程内 Ctrl+V 粘贴）+
+-- onCopy 回调（init.lua 注入: 写 WRITABLE_BASE/selected.txt 供 /debug
+-- gist 附带）→ 清除选中。返回复制字符数或 nil。
+function tui.copyContentSelection()
+  local text = readContentSelection()
+  if not text then
+    state.csel = nil
+    state.csel_active = nil
+    return nil
+  end
+  state.clipboard = text
+  local n = ulen(text)
+  if tui.onCopy then
+    local ok, err = pcall(tui.onCopy, text)
+    if not ok then
+      tui.setStatus("Copied " .. n .. " chars (file write failed: " .. tostring(err) .. ")")
+    else
+      tui.setStatus("Copied " .. n .. " chars → selected.txt (Ctrl+V paste; /debug 附带)")
+    end
+  else
+    tui.setStatus("Copied " .. n .. " chars (Ctrl+V to paste)")
+  end
+  state.csel = nil
+  state.csel_active = nil
+  pcall(tui.drawInput)
+  return n
+end
+
+-- 清除内容区选中（无复制）
+function tui.clearContentSelection()
+  if state.csel then
+    state.csel = nil
+    state.csel_active = nil
+    pcall(tui.redrawContent)
+  end
 end
 
 function tui.scrollUp(lines)
@@ -3657,7 +3774,10 @@ function tui.readInput(on_event)
       -- 输入行有选中文本 → 复制到进程内剪贴板 + 清除选中 + 继续输入
       -- （不中断——用户意图是复制，不是中断）；
       -- 无选中 → 原有中断行为（return nil 退出输入循环）。
-      if state.sel and state.sel.a ~= state.sel.b then
+      -- v0.3.100: 内容区有选中（state.csel）→ 同样复制（优先于输入行）。
+      if state.csel and state.csel_active then
+        tui.copyContentSelection()
+      elseif state.sel and state.sel.a ~= state.sel.b then
         local sa, sb = math.min(state.sel.a, state.sel.b),
           math.max(state.sel.a, state.sel.b)
         state.clipboard = usub(state.inputBuffer, sa + 1, sb)
@@ -3886,6 +4006,42 @@ function tui.readInput(on_event)
           local len = ulen(state.inputBuffer)
           state.sel.b = ty < inputY and line_start or len
           pcall(tui.drawInput)
+        end
+      else
+        -- 内容区选中（v0.3.100）: 非输入行 touch/drag →
+        -- 选中矩形（屏幕坐标）+ 反色高亮。
+        local _, cy, cw, ch = getContentBounds()
+        if ty >= cy and ty <= cy + ch - 1 and tx >= 2 and tx <= state.width - 1 then
+          if ev == "touch" then
+            -- 按下: 起点 = 终点 = 点击位（清除旧选中 + 输入行选中）
+            state.csel = {ax = tx, ay = ty, bx = tx, by = ty}
+            state.csel_active = true
+            state.sel = nil
+            state.sel_active = nil
+            pcall(tui.redrawContent)
+          elseif ev == "drag" and state.csel and state.csel_active then
+            -- 拖动: 更新终点 + 实时高亮（先恢复画面再画新矩形）
+            state.csel.bx = tx
+            state.csel.by = ty
+            pcall(tui.redrawContent)
+            drawContentSelection()
+            pcall(tui.drawInput)
+          end
+        end
+      end
+    elseif ev == "drop" then
+      -- 内容区拖选结束（button 抬起）: 复制选中文本
+      -- （touch 按下 → drag 拖动 → drop 结束——gpu.get 读回矩形）
+      local tx, ty = char, code
+      if type(tx) == "number" and type(ty) == "number" then
+        if state.csel and state.csel_active then
+          -- 终点更新为释放点（若在内容区内）或保持最后 drag 点
+          local _, cy, _, ch = getContentBounds()
+          if ty >= cy and ty <= cy + ch - 1 then
+            state.csel.bx = tx
+            state.csel.by = ty
+          end
+          tui.copyContentSelection()
         end
       end
     elseif ev == "scroll" then
@@ -6009,9 +6165,24 @@ local function handle_command(cmd, config, messages)
       if token and token ~= "" then
         print("Uploading to GitHub gist (timeout 30s)...")
         print("  (报告已保存本地: " .. out_path .. "——上传失败/超时不影响内容)")
-        local url, err = debug_mod.upload(report, token)
+        -- v0.3.100: 附带内容区选中的 selected.txt（若存在）——
+        -- 选中复制 → 写文件 → /debug 提交 gist 时一并上传
+        local extra = {}
+        local sel_path = WRITABLE_BASE .. "/selected.txt"
+        local ok_sel, sel_f = pcall(io.open, sel_path, "r")
+        if ok_sel and sel_f then
+          local content = sel_f:read("*a")
+          sel_f:close()
+          if content and #content > 0 and #content < 65536 then
+            extra["selected.txt"] = content
+          end
+        end
+        local url, err = debug_mod.upload(report, token, extra)
         if url then
           print("Gist uploaded: " .. url)
+          if extra["selected.txt"] then
+            print("  (附带 selected.txt: " .. #extra["selected.txt"] .. " bytes)")
+          end
         else
           print("Upload failed: " .. tostring(err))
         end
@@ -7110,6 +7281,18 @@ local function main(config, ...)
         mono = ok_d and depth == 1  -- 机器人 T1 GPU: 单色方案
       end
       ui.init(mono and {monochrome = true} or nil)
+      -- v0.3.100: 内容区选中复制回调——选中文本写 WRITABLE_BASE/selected.txt，
+      -- /debug 提交 gist 时附带（"选中→写文件→gist 附带"需求闭环）。
+      -- 防爆: 超过 64KB 截断（与 debug.upload 的 65536 上限一致）。
+      ui.onCopy = function(text)
+        if type(text) ~= "string" or #text == 0 then return end
+        if #text > 65536 then text = text:sub(1, 65536) .. "\n[truncated]" end
+        local f = io.open(WRITABLE_BASE .. "/selected.txt", "w")
+        if f then
+          f:write(text)
+          f:close()
+        end
+      end
       ui.print("OC Agent TUI ready. Model: " .. config.model)
       ui.print("Type /help for commands.", ui.colors.dim)
       -- 进入 TUI 显示当前会话历史（填充内容区——避免空屏/输入区占半屏感知）
