@@ -19,20 +19,51 @@ local REPO = "xs4444/oc-agent"
 local DATA_API = "https://data.jsdelivr.com/v1/packages/gh/" .. REPO
 local BASE = "https://cdn.jsdelivr.net/gh/" .. REPO
 
+-- 超时常量（v0.3.93 双源+超时）:
+-- OC internet.request 连接阶段无超时（v0.3.73 /debug 卡死教训: 连接
+-- 挂起时 Lua 层不运行）——单源整体用 thread + waitForAll 兜底，迭代
+-- 阶段用 deadline 双保险。检测阶段两源并行，最坏耗时 ~FETCH_TIMEOUT。
+local FETCH_TIMEOUT = 15   -- 单源整体超时（连接+读取）
+local READ_DEADLINE = 20   -- 迭代阶段 deadline（秒，兜底线程不可用时）
+
 local function fetch(url)
   local ok, handle = pcall(internet.request, url)
   if not ok or not handle then return nil end
   local chunks = {}
+  local deadline = os.clock() + READ_DEADLINE
   for chunk in handle do
     chunks[#chunks + 1] = chunk
     os.sleep(0.02)
+    -- 迭代超时（响应流永不结束保护——挂起时提前放弃）
+    if os.clock() > deadline then return nil end
   end
   return table.concat(chunks)
 end
 
+-- 线程包装: 连接阶段挂起（internet.request 无超时）用 thread +
+-- waitForAll 兜底——超时放弃该线程（后台继续，不影响主流程; 结果
+-- 由 http 层迭代 deadline 最终兜底）。thread 不可用时回退同步
+-- （迭代 deadline 仍生效）。
+local function fetch_timeout(url)
+  local ok_th, thread = pcall(require, "thread")
+  if not ok_th or not thread or not thread.create or not thread.waitForAll then
+    return fetch(url)
+  end
+  local result = {}
+  local t = thread.create(function()
+    result.body = fetch(url)
+  end)
+  local ok_w, werr = pcall(thread.waitForAll, {t}, FETCH_TIMEOUT)
+  if not ok_w or not werr then
+    -- 超时: 放弃（线程后台继续, 连接最终由响应超时兜底）
+    return nil
+  end
+  return result.body
+end
+
 -- 从 jsDelivr data API JSON 提取最新版本 tag（versions 数组里排前的 "version" 值）
 local function latest_tag()
-  local body = fetch(DATA_API)
+  local body = fetch_timeout(DATA_API)
   if not body then return nil end
   -- {"versions":[{"version":"0.2.0",...},...]}
   local ver = body:match('"versions"%s*:%s*%[%s*{%s*"version"%s*:%s*"([^"]+)"')
@@ -43,10 +74,52 @@ end
 -- 从 GitHub tags API 提取最新 tag（实时权威源；jsDelivr data API 索引
 -- 滞后是已知问题——v0.3.19~29 连续多版 watch 未检出，必须双源检测）
 local function github_tag()
-  local body = fetch("https://api.github.com/repos/" .. REPO .. "/tags")
+  local body = fetch_timeout("https://api.github.com/repos/" .. REPO .. "/tags")
   if not body then return nil end
   -- [{"name":"v0.3.29","zipball_url":...},...] 第一个即最新（按时间倒序）
   return body:match('"name"%s*:%s*"([^"]+)"')
+end
+
+-- 双源并行版本检测（v0.3.93）: jsDelivr 会滞后（索引更新慢），GitHub
+-- 有时可达——两个源都查，取较新者。并行（thread）最坏耗时 = 单源
+-- 超时 FETCH_TIMEOUT；thread 不可用回退串行（每源仍各自超时）。
+-- 返回两源 tag（js, gh），由调用方比较取新。
+local function parallel_latest_tags()
+  local ok_th, thread = pcall(require, "thread")
+  if not ok_th or not thread or not thread.create or not thread.waitForAll then
+    -- 串行回退（各源内部已有超时）
+    return latest_tag(), github_tag()
+  end
+  local r1, r2 = {}, {}
+  local t1 = thread.create(function() r1.v = latest_tag() end)
+  local t2 = thread.create(function() r2.v = github_tag() end)
+  local ok_w, werr = pcall(thread.waitForAll, {t1, t2}, FETCH_TIMEOUT)
+  return r1.v, r2.v
+end
+
+-- tag 归一化比较（v0.3.93）: jsDelivr 返回 "0.3.66"（无 v 前缀），
+-- GitHub 返回 "v0.3.70"（有 v）——去 v 前缀 + 数字分段比较取新者。
+local function norm_tag(t)
+  if not t then return nil end
+  local n = tostring(t):gsub("^v", ""):gsub("%s", "")
+  return n ~= "" and n or nil
+end
+local function tag_parts(s)
+  local t = {}
+  for x in s:gmatch("%d+") do t[#t + 1] = tonumber(x) end
+  return t
+end
+-- 返回较新的 tag（相等取 a）
+local function newer_tag(a, b)
+  local na, nb = norm_tag(a), norm_tag(b)
+  if not na then return b end
+  if not nb then return a end
+  local pa, pb = tag_parts(na), tag_parts(nb)
+  for i = 1, math.max(#pa, #pb) do
+    local x, y = pa[i] or 0, pb[i] or 0
+    if x ~= y then return (x > y) and a or b end
+  end
+  return a
 end
 
 -- 定位实际安装目录 + 当前版本（四盘场景: 扫描各挂载盘的
@@ -109,19 +182,19 @@ if ref_arg and ref_arg ~= "" then
   ref = ref_arg
   print("  手动指定: " .. ref)
 else
-  local tag_js = latest_tag()
+  -- 双源并行（v0.3.93）: jsDelivr 滞后 + GitHub 可达时取 GitHub 新值
+  local tag_js, tag_gh = parallel_latest_tags()
   print("  jsDelivr 源: " .. tostring(tag_js or "?"))
-  local tag = tag_js
-  if not tag_js then
-    print("  (jsDelivr 无结果，尝试 GitHub 源...)")
-    local tag_gh = github_tag()
-    print("  GitHub 源: " .. tostring(tag_gh or "?"))
-    tag = tag_gh
-  end
+  print("  GitHub 源: " .. tostring(tag_gh or "?"))
+  local tag = newer_tag(tag_js, tag_gh)
   if not tag then
-    print("  ⚠️  无法自动获取最新版本（网络受限）。")
-    print("  用法: lua update.lua <ref>   例如: lua update.lua v0.3.69")
+    print("  ⚠️  无法自动获取最新版本（两源均超时/不可达，各 15s）。")
+    print("  用法: lua update.lua <ref>   例如: lua update.lua v0.3.70")
     return
+  end
+  -- 两源都通且不一致时提示（信息性）
+  if tag_js and tag_gh and norm_tag(tag_js) ~= norm_tag(tag_gh) then
+    print("  双源不一致，取较新: " .. tostring(tag))
   end
   ref = tag
 end
@@ -129,7 +202,7 @@ print("  ref: " .. ref)
 
 local latest
 do
-  local manifest_body = fetch(BASE .. "@" .. ref .. "/files.json")
+  local manifest_body = fetch_timeout(BASE .. "@" .. ref .. "/files.json")
   if manifest_body then
     latest = manifest_body:match('"version"%s*:%s*"([^"]+)"') or "?"
   end
@@ -163,13 +236,15 @@ end
 print("")
 
 print("下载最新安装器...")
--- 双源: jsDelivr CDN 优先，GitHub raw 回退（jsDelivr 索引滞后时 GitHub 仍可达）
+-- 双源（v0.3.93）: jsDelivr CDN 优先，GitHub raw 回退（jsDelivr 索引
+-- 滞后时 GitHub 仍可达）。每源 fetch_timeout 超时保护（15s），
+-- 不会卡住。
 local code, code_err
 for _, base in ipairs({
   BASE .. "@" .. ref,
   "https://raw.githubusercontent.com/" .. REPO .. "/" .. ref,
 }) do
-  local body = fetch(base .. "/install.lua")
+  local body = fetch_timeout(base .. "/install.lua")
   if body and #body >= 100 then
     code = body
     print("  来源: " .. base .. "/install.lua")
