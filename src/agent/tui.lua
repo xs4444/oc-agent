@@ -841,12 +841,14 @@ function tui.readInput(on_event)
     elseif ev == "touch" or ev == "drag" then
       -- 指针定位 + 拖选（v0.3.68 点击定位；v0.3.72 拖选高亮+Ctrl+C
       -- 复制）: screen 组件发 touch/drag (x, y, button, player)。
-      -- 输入行内:
-      --   touch 按下 → 起点 + 定位光标（清除旧选中）
-      --   drag 拖动 → 更新终点（起点保持）→ 高亮实时重绘
-      -- GTNH 无 setClipboard API → 复制目标为 state.clipboard（进程内
-      -- 剪贴板，Ctrl+V 粘贴优先），跨游戏剪贴板不可行。
-      local tx, ty = char, code
+      -- v0.3.103 修复【参数解包错位——实现从未生效】: OpenOS 鼠标事件
+      -- 参数 = (x, y, button, player)，即 sig[2]=x, sig[3]=y,
+      -- sig[4]=button（TextBuffer.scala:887-907 sendMouseEvent 实证）。
+      -- 旧代码用键盘字段解包（char=sig[3]=y, code=sig[4]=button）→
+      -- tx 拿到 y、ty 拿到 button(0) → `ty == inputY`（0==屏幕高）
+      -- 与 `ty >= cy`（0>=2）恒 false → 输入行点击/内容区选中/滚轮
+      -- 全部静默失效（真机"鼠标选中没实现"根因）。
+      local tx, ty, button = sig[2], sig[3], sig[4]
       if type(tx) == "number" and type(ty) == "number" then
         local inputY = state.height - (state.scrollSafe and 1 or 0)
         if ty == inputY then
@@ -912,7 +914,9 @@ function tui.readInput(on_event)
     elseif ev == "drop" then
       -- 内容区拖选结束（button 抬起）: 复制选中文本
       -- （touch 按下 → drag 拖动 → drop 结束——gpu.get 读回矩形）
-      local tx, ty = char, code
+      -- v0.3.103: 正确参数 (x, y, button) → sig[2]=x, sig[3]=y（旧代码
+      -- 用 char/code 键盘字段解包 = 错位, drop 复制从未触发）
+      local tx, ty = sig[2], sig[3]
       if type(tx) == "number" and type(ty) == "number" then
         if state.csel and state.csel_active then
           -- 终点更新为释放点（若在内容区内）或保持最后 drag 点
@@ -925,10 +929,13 @@ function tui.readInput(on_event)
         end
       end
     elseif ev == "scroll" then
-      -- 鼠标滚轮: char == 1 上滚 3 行, -1 下滚 3 行（oc-ai 同）
-      if char == 1 then
+      -- 鼠标滚轮: 事件参数 (x, y, delta) → sig[4]=delta（v0.3.103 修正:
+      -- 旧代码用 char==1/-1 判断 = 实际是 y==1/-1 错位, 滚轮从未生效;
+      -- 只有滚轮在 y==1 行时才可能碰巧触发）
+      local delta = sig[4]
+      if delta == 1 then
         tui.scrollUp(3)
-      elseif char == -1 then
+      elseif delta == -1 then
         tui.scrollDown(3)
       end
     end
