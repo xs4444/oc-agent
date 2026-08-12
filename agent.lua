@@ -2303,13 +2303,23 @@ local function wrap_internet_request()
   internet.request = function(url, data, headers, method)
     local result = {}
     local t = thread.create(function()
-      result.handle = orig(url, data, headers, method)
+      -- 线程内 pcall: orig 连接失败抛错会杀死线程——捕获转 err，
+      -- 主线程拿 err 明确报"连接失败"而非迭代 nil 崩溃。
+      local ok_r, h = pcall(orig, url, data, headers, method)
+      if ok_r then
+        result.handle = h
+      else
+        result.err = tostring(h)
+      end
     end)
     local ok_w, werr = pcall(thread.waitForAll, {t}, CONNECT_TIMEOUT)
     if not ok_w or not werr then
       -- 超时: 抛错让 pcall 调用方走错误路径（如 http.lua
       -- "connection failed"）。线程后台继续，不阻塞主流程。
       error("connection timeout after " .. CONNECT_TIMEOUT .. "s", 0)
+    end
+    if result.err then
+      error("connection failed: " .. result.err, 0)
     end
     return result.handle
   end
