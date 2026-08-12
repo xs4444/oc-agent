@@ -25,6 +25,11 @@ local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
 -- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
 local FILE_PORT = 9092
 local FILE_TIMEOUT = 60  -- 子代理等文件回复超时（主代理 chat 中时排队）
+-- 文件服务回复最大字节（v0.3.92）: 无线 modem 最大包 8192B——超过则
+-- modem.send 抛错（被 pcall 吞）→ 子代理等超时 → 显示空结果。回复前
+-- 截断到安全长度 + truncated 标记（子代理侧可提示"结果已截断"）。
+-- 留 512B 余量给 JSON 结构（{v,ok,content,truncated} + 转义膨胀）。
+local FILE_REPLY_MAX = 8192 - 512
 
 -- 文件代理: 子代理 explorer 用它把文件工具转发到主代理执行。
 -- exec 签名与本地工具一致 (name, args, deps)。返回与本地工具同格式
@@ -47,7 +52,14 @@ local function file_proxy(name, args, deps, master_addr)
   local ok_d, reply = pcall(deps.json.decode, payload)
   if not ok_d or type(reply) ~= "table" then return "Error: file proxy: bad reply" end
   if reply.ok then
-    return reply.content or ""
+    -- 截断标记（v0.3.92）: 主代理侧回复超 modem 包长上限时已截断——
+    -- 附标记让模型知道结果不完整（可缩小范围重试），避免误判"目录
+    -- 就这样/文件就这些内容"。
+    local content = reply.content or ""
+    if reply.truncated then
+      return content .. "\n[truncated: 结果超过 modem 包长上限, 已截断——缩小范围重试 (如 read_file 用 offset/limit)]"
+    end
+    return content
   end
   return "Error: " .. tostring(reply.error or "unknown")
 end
@@ -76,7 +88,16 @@ local function handle_file_message(exec_fn, sender, port, payload)
       end
       local ok_exec, result = exec_fn(op, args)
       if ok_exec and type(result) == "string" then
-        reply = json.encode({v = 1, ok = true, content = result})
+        -- 包长保护（v0.3.92）: 无线 modem 最大包 8192B——list_directory /
+        -- 大目录/read_file 大文件结果超限时 modem.send 抛错被 pcall 吞
+        -- → 子代理等 60s 超时。回复前截断到安全长度 + 标记。
+        local content = result
+        local truncated = false
+        if #content > FILE_REPLY_MAX then
+          content = content:sub(1, FILE_REPLY_MAX)
+          truncated = true
+        end
+        reply = json.encode({v = 1, ok = true, content = content, truncated = truncated})
       else
         reply = json.encode({v = 1, ok = false, error = tostring(result)})
       end
