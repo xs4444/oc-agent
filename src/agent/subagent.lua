@@ -19,7 +19,11 @@ local session_mod = require("agent.session")
 -- Subagent protocol constants (used by the subagent_call tool)
 local SUBAGENT_LISTEN_PORT = 9090  -- subagent's task intake port
 local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
-local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
+-- 默认任务超时（v0.3.104: 240→300s）: explorer 任务含多轮 chat（每轮
+-- 30-60s）+ 多次工具调用（文件代理经 modem 往返），240s 完不成——
+-- 真机 gist 三次 subagent_call 全 240s 超时（用户: "始终在执行，也没
+-- 超时"——实为任务确实没跑完）。300s 给足 explorer 探索任务余量。
+local SUBAGENT_TIMEOUT = 300       -- seconds to wait for a subagent reply
 -- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
 -- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
 -- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
@@ -135,9 +139,20 @@ end
 local function wait_modem_message(timeout, reply_port, on_other)
   local event = require("event")
   local interrupt = require("agent.interrupt")
+  -- 超时基准（v0.3.104 修复）: 原实现用 waited 累计（每轮 +step），
+  -- 非目标事件到达时 event.pull 立即返回但 waited 仍 +0.5——事件稀疏
+  -- 时 waited 落后真实时间 → 实际超时 >> 配置值（用户实证 subagent_call
+  -- 240s 配置但"始终在执行，也没超时"）。改用 computer.uptime()
+  -- deadline（与 OpenOS event.pullFiltered 同基准）——事件到达不重置
+  -- deadline，真实墙钟超时准时生效。uptime 不可用时回退 waited 累计。
+  local ok_c, comp = pcall(require, "computer")
+  local use_uptime = ok_c and comp and comp.uptime ~= nil
+  local deadline = use_uptime and (comp.uptime() + (timeout or math.huge)) or nil
   local waited = 0
   local step = 0.5
-  while timeout == nil or waited < timeout do
+  while timeout == nil
+      or (use_uptime and comp.uptime() < deadline)
+      or (not use_uptime and waited < timeout) do
     -- 无过滤 pull + 自判事件名（v0.3.89 修复）: OpenOS event.pull 的
     -- 多过滤语义是"事件名 match 参数1 且 参数N 匹配事件第 N 参数"（AND
     -- 位置匹配），不是匹配多个事件名——("modem_message","interrupted")

@@ -1897,7 +1897,11 @@ local session_mod = require("agent.session")
 -- Subagent protocol constants (used by the subagent_call tool)
 local SUBAGENT_LISTEN_PORT = 9090  -- subagent's task intake port
 local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
-local SUBAGENT_TIMEOUT = 240       -- seconds to wait for a subagent reply
+-- 默认任务超时（v0.3.104: 240→300s）: explorer 任务含多轮 chat（每轮
+-- 30-60s）+ 多次工具调用（文件代理经 modem 往返），240s 完不成——
+-- 真机 gist 三次 subagent_call 全 240s 超时（用户: "始终在执行，也没
+-- 超时"——实为任务确实没跑完）。300s 给足 explorer 探索任务余量。
+local SUBAGENT_TIMEOUT = 300       -- seconds to wait for a subagent reply
 -- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
 -- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
 -- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
@@ -2013,9 +2017,20 @@ end
 local function wait_modem_message(timeout, reply_port, on_other)
   local event = require("event")
   local interrupt = require("agent.interrupt")
+  -- 超时基准（v0.3.104 修复）: 原实现用 waited 累计（每轮 +step），
+  -- 非目标事件到达时 event.pull 立即返回但 waited 仍 +0.5——事件稀疏
+  -- 时 waited 落后真实时间 → 实际超时 >> 配置值（用户实证 subagent_call
+  -- 240s 配置但"始终在执行，也没超时"）。改用 computer.uptime()
+  -- deadline（与 OpenOS event.pullFiltered 同基准）——事件到达不重置
+  -- deadline，真实墙钟超时准时生效。uptime 不可用时回退 waited 累计。
+  local ok_c, comp = pcall(require, "computer")
+  local use_uptime = ok_c and comp and comp.uptime ~= nil
+  local deadline = use_uptime and (comp.uptime() + (timeout or math.huge)) or nil
   local waited = 0
   local step = 0.5
-  while timeout == nil or waited < timeout do
+  while timeout == nil
+      or (use_uptime and comp.uptime() < deadline)
+      or (not use_uptime and waited < timeout) do
     -- 无过滤 pull + 自判事件名（v0.3.89 修复）: OpenOS event.pull 的
     -- 多过滤语义是"事件名 match 参数1 且 参数N 匹配事件第 N 参数"（AND
     -- 位置匹配），不是匹配多个事件名——("modem_message","interrupted")
@@ -3960,15 +3975,17 @@ function tui.readInput(on_event)
       end
     elseif ev == "touch" or ev == "drag" then
       -- 指针定位 + 拖选（v0.3.68 点击定位；v0.3.72 拖选高亮+Ctrl+C
-      -- 复制）: screen 组件发 touch/drag (x, y, button, player)。
-      -- v0.3.103 修复【参数解包错位——实现从未生效】: OpenOS 鼠标事件
-      -- 参数 = (x, y, button, player)，即 sig[2]=x, sig[3]=y,
-      -- sig[4]=button（TextBuffer.scala:887-907 sendMouseEvent 实证）。
-      -- 旧代码用键盘字段解包（char=sig[3]=y, code=sig[4]=button）→
-      -- tx 拿到 y、ty 拿到 button(0) → `ty == inputY`（0==屏幕高）
-      -- 与 `ty >= cy`（0>=2）恒 false → 输入行点击/内容区选中/滚轮
-      -- 全部静默失效（真机"鼠标选中没实现"根因）。
-      local tx, ty, button = sig[2], sig[3], sig[4]
+      -- 复制）。
+      -- 事件布局（源码实证 TextBuffer.scala:887-909 sendMouseEvent +
+      -- Machine.scala:633 信号首参数=源组件地址）:
+      --   (touch, screenAddr, x, y, button, [player])
+      --   → sig[1]=touch, sig[2]=screen地址(字符串), sig[3]=x,
+      --     sig[4]=y, sig[5]=button
+      -- v0.3.103 曾误改成 sig[2]=x, sig[3]=y——tx 拿到 screen 地址字符串
+      -- → 'tx <= state.width-1' 字符串比数字崩溃（真机 tui.lua:896
+      -- attempt to compare number with string）。v0.3.68 的 sig[3]/sig[4]
+      -- 位置才是对的。加类型防御: 非数字直接忽略（不崩溃）。
+      local tx, ty, button = sig[3], sig[4], sig[5]
       if type(tx) == "number" and type(ty) == "number" then
         local inputY = state.height - (state.scrollSafe and 1 or 0)
         if ty == inputY then
@@ -4034,9 +4051,10 @@ function tui.readInput(on_event)
     elseif ev == "drop" then
       -- 内容区拖选结束（button 抬起）: 复制选中文本
       -- （touch 按下 → drag 拖动 → drop 结束——gpu.get 读回矩形）
-      -- v0.3.103: 正确参数 (x, y, button) → sig[2]=x, sig[3]=y（旧代码
-      -- 用 char/code 键盘字段解包 = 错位, drop 复制从未触发）
-      local tx, ty = sig[2], sig[3]
+      -- 事件布局同 touch/drag: sig[2]=screen地址, sig[3]=x, sig[4]=y
+      -- （v0.3.103 误用 sig[2]/sig[3]——tx 拿到地址字符串, 修正回
+      -- sig[3]/sig[4]）
+      local tx, ty = sig[3], sig[4]
       if type(tx) == "number" and type(ty) == "number" then
         if state.csel and state.csel_active then
           -- 终点更新为释放点（若在内容区内）或保持最后 drag 点
@@ -4049,10 +4067,10 @@ function tui.readInput(on_event)
         end
       end
     elseif ev == "scroll" then
-      -- 鼠标滚轮: 事件参数 (x, y, delta) → sig[4]=delta（v0.3.103 修正:
-      -- 旧代码用 char==1/-1 判断 = 实际是 y==1/-1 错位, 滚轮从未生效;
-      -- 只有滚轮在 y==1 行时才可能碰巧触发）
-      local delta = sig[4]
+      -- 鼠标滚轮: 事件布局同 touch——sig[2]=screen地址, sig[3]=x,
+      -- sig[4]=y, sig[5]=delta（TextBuffer.scala:862 sendMouseEvent
+      -- 传 delta; v0.3.103 误用 sig[4]=delta 实为 y——修正 sig[5]）
+      local delta = sig[5]
       if delta == 1 then
         tui.scrollUp(3)
       elseif delta == -1 then

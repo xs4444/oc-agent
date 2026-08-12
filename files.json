@@ -11,7 +11,7 @@
     "patch.lua": 6458,
     "selftest.lua": 19395,
     "session.lua": 31523,
-    "subagent.lua": 10685,
+    "subagent.lua": 11842,
     "tools.lua": 5730,
     "tools/compact.lua": 3277,
     "tools/component.lua": 4960,
@@ -21,8 +21,8 @@
     "tools/search.lua": 4566,
     "tools/shell.lua": 6988,
     "tools/subagent.lua": 9195,
-    "tui.lua": 43080,
+    "tui.lua": 43129,
     "docs.lua": 14689
   },
-  "version": "2026-08-12T1352"
+  "version": "2026-08-12T1417"
 }
