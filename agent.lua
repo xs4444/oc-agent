@@ -3377,6 +3377,13 @@ function tui.init(config)
   -- selected.txt 供 /debug gist 附带）。
   state.csel = nil
   state.csel_active = nil
+  -- v0.3.115 双击/三击连击检测（内容区）: 同位置(|dx|,|dy|<=1)且间隔
+  -- <500ms → clickCount 递增（1→2 选词, 2→3 选行, 3 后复位）。时间源
+  -- now_seconds()（computer.uptime, mock 可 debug_advance_uptime 推进）。
+  state.lastClickTime = nil
+  state.lastClickX = nil
+  state.lastClickY = nil
+  state.clickCount = 0
   -- v0.3.114: 输入行选中同样随会话复位（Enter 提交不清 sel——上一会话
   -- 残留的选中会在新会话的粘贴/输入里触发错误的"替换选中"）
   state.sel = nil
@@ -3744,6 +3751,32 @@ local function applyShiftSelect(oldCursor)
     state.sel = nil
     state.sel_active = nil
   end
+end
+
+-- 命令历史上翻/下翻（v0.3.115 抽出复用: bash 标准 ↑↓——光标在顶/底行时
+-- 翻历史; 单行 buffer 恒翻历史）。buffer 整体替换 → 旧选中索引失效 → 清选中。
+local function historyUp()
+  if #state.cmdHistory == 0 then return end
+  state.sel = nil
+  state.sel_active = nil
+  if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
+  if state.cmdHistoryIndex < #state.cmdHistory then
+    state.cmdHistoryIndex = state.cmdHistoryIndex + 1
+    setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
+    state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
+  end
+end
+local function historyDown()
+  if state.cmdHistoryIndex == 0 then return end
+  state.sel = nil
+  state.sel_active = nil
+  state.cmdHistoryIndex = state.cmdHistoryIndex - 1
+  if state.cmdHistoryIndex == 0 then
+    setInputBufferText(state.savedInput)
+  else
+    setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
+  end
+  state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
 end
 
 -- 历史上限（v0.3.109, tmux history-limit 移植）: 2MB 真机内存约束下
@@ -4147,6 +4180,75 @@ local function readContentSelection()
   return table.concat(lines, "\n")
 end
 
+-- ════════════════════════════════════════
+-- 双击选词 / 三击选行（v0.3.115 功能2, 经典终端语义）:
+--   词 = 连续非空白/非标点段（半角标点 + 常用中文标点都是边界）;
+--   宽字符整字符归属（padding 格不切开）; 列↔字符换算按列语义。
+-- ════════════════════════════════════════
+
+-- 词边界判定: 空白 / ASCII 标点 / 常用中文标点
+local function isWordBoundary(ch)
+  if not ch or ch == "" then return true end
+  if ch:match("%s") then return true end
+  if ch:match("[%p]") then return true end
+  if ch:match("[，。；：！？、（）【】《》“”‘’…—·]") then return true end
+  return false
+end
+
+-- 读取一行的字符 + 列位置映射（宽字符首格存完整字符, padding 格跳过;
+-- 空屏幕格 → 空格）。返回 (chars, cols): cols[i] = chars[i] 的首列。
+local function rowCharMap(row)
+  local g = component.gpu
+  local x, _, w = getContentBounds()
+  local xmax = x + w - 1
+  local chars, cols = {}, {}
+  local col = x
+  local prevWide = false
+  while col <= xmax do
+    if prevWide then
+      prevWide = false
+      col = col + 1
+    else
+      local ok_g, text = pcall(g.get, col, row)
+      local ch = ok_g and type(text) == "string" and text or ""
+      if isWideChar(ch) then
+        chars[#chars + 1] = ch
+        cols[#cols + 1] = col
+        prevWide = true
+        col = col + 1
+      else
+        chars[#chars + 1] = (ch == "" and " " or ch)
+        cols[#cols + 1] = col
+        col = col + 1
+      end
+    end
+  end
+  return chars, cols
+end
+
+-- 点击列 → 该行词的列区间 [start, end]（屏幕列, 1 基）; 点击在非词字符
+-- （空白/标点）或空区 → 返回 nil（调用方退回单格选中）。
+local function wordSpanAt(clickX, row)
+  local chars, cols = rowCharMap(row)
+  if #chars == 0 then return nil end
+  -- 找点击列命中的字符（宽字符覆盖 [col, col+1]）
+  local idx = nil
+  for i = 1, #chars do
+    local cw = isWideChar(chars[i]) and 2 or 1
+    if clickX >= cols[i] and clickX < cols[i] + cw then
+      idx = i
+      break
+    end
+  end
+  if not idx or isWordBoundary(chars[idx]) then return nil end
+  local lo, hi = idx, idx
+  while lo > 1 and not isWordBoundary(chars[lo - 1]) do lo = lo - 1 end
+  while hi < #chars and not isWordBoundary(chars[hi + 1]) do hi = hi + 1 end
+  local startCol = cols[lo]
+  local endCol = cols[hi] + (isWideChar(chars[hi]) and 2 or 1) - 1
+  return startCol, endCol
+end
+
 -- 复制内容区选中: 读回文本 → state.clipboard + onCopy 回调（写
 -- WRITABLE_BASE/selected.txt 供 /paste 命令与 /debug gist 附带）→
 -- 清除选中。返回复制字符数或 nil。
@@ -4218,8 +4320,19 @@ end
 local function scrollView(newOffset)
   newOffset = math.max(0, newOffset or 0)
   if newOffset == state.scrollOffset then return end
+  local delta = newOffset - state.scrollOffset  -- +1 = 视口向更早历史滚 = 内容下移 1 行
   state.scrollOffset = newOffset
-  local _, y, _, h = getContentBounds()
+  local x, y, w, h = getContentBounds()
+  -- v0.3.115 Bug3（问题2 选中不跟随滚轮）: csel 是屏幕坐标 {ax,ay,bx,by},
+  -- 滚动改 scrollOffset 后内容平移但 csel 不动 → 选中高亮固定在原屏幕
+  -- 位置（内容跑了高亮没跑）。修复: 滚动时 csel 按 delta 平移跟随内容
+  -- （delta>0 内容下移 → 选中下移 delta 行），clamp 到内容区（选中内容
+  -- 滚出视口 → 视觉选中压到顶/底边界）。copyContentSelection 读回的是
+  -- 当前 csel 对应视口内容（滚出部分 = 视口内剩余部分）。
+  if state.csel and state.csel_active then
+    state.csel.ay = math.max(y, math.min(y + h - 1, state.csel.ay + delta))
+    state.csel.by = math.max(y, math.min(y + h - 1, state.csel.by + delta))
+  end
   redrawRowRange(y, y + h - 1)
   pcall(tui.drawStatus)
 end
@@ -4441,10 +4554,10 @@ function tui.drawInput()
             g.setBackground(tui.colors.foreground)
             g.setForeground(tui.colors.background)
             g.set(x0, sy, usub(text, lo + 1, hi))
-            -- 填充剩余宽度（选中到行尾）
-            if x0 + w < state.width - 1 then
-              g.fill(x0 + w, sy, state.width - 1 - x0 - w, 1, " ")
-            end
+            -- v0.3.115 Bug1: 删除"选中终点到行尾的 fill"——旧代码在此处
+            -- 处于 setBackground(白) 状态, fill 把选中段之后整行染成白块
+            -- （shift 选中中间段后整行变白的根因）。整框已在 1270 擦除,
+            -- 选中段之后保持步骤 1 的原色即可。
             g.setBackground(tui.colors.background)
             g.setForeground(tui.colors.foreground)
           end
@@ -4764,48 +4877,38 @@ function tui.readInput(on_event)
           end
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 多行 → 光标上移一行（shift 扩展选中）; 单行 → 历史上翻
+      elseif code == 200 then -- Up: Ctrl=上滚 1 行; bash 标准——多行时光标在顶行（首行）↑ = 历史上翻，否则跨行上移; 单行恒历史上翻（v0.3.115）
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollUp(1)
-        elseif multiline then
+        elseif multiline and line_start > 0 then
           -- v0.3.112 多行编辑: 列保持上移一个显示行（clamp 到目标行宽）
           local oldCursor = state.inputCursor
           moveCursorByDisplayLine(-1)
           applyShiftSelect(oldCursor)  -- v0.3.114
-        elseif #state.cmdHistory > 0 then
-          -- 历史翻页: buffer 整体替换 → 旧选中索引失效 → 清选中
-          state.sel = nil
-          state.sel_active = nil
-          if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
-          if state.cmdHistoryIndex < #state.cmdHistory then
-            state.cmdHistoryIndex = state.cmdHistoryIndex + 1
-            setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
-            state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
-          end
+        else
+          historyUp()
         end
-      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 多行 → 光标下移一行（shift 扩展选中）; 单行 → 历史下翻
+      elseif code == 208 then -- Down: Ctrl=下滚 1 行; bash 标准——多行时光标在底行（末行）↓ = 历史下翻，否则跨行下移; 单行恒历史下翻（v0.3.115）
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollDown(1)
-        elseif multiline then
+        elseif multiline and line_end < charCount(state.inputBuffer) then
           -- v0.3.112 多行编辑: 列保持下移一个显示行
           local oldCursor = state.inputCursor
           moveCursorByDisplayLine(1)
           applyShiftSelect(oldCursor)  -- v0.3.114
-        elseif state.cmdHistoryIndex > 0 then
-          state.sel = nil
-          state.sel_active = nil
-          state.cmdHistoryIndex = state.cmdHistoryIndex - 1
-          if state.cmdHistoryIndex == 0 then
-            setInputBufferText(state.savedInput)
-          else
-            setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
-          end
-          state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
+        else
+          historyDown()
         end
       elseif code == 201 then -- PgUp: 上滚
         tui.scrollUp(tui.pageStep())
       elseif code == 209 then -- PgDn: 下滚
         tui.scrollDown(tui.pageStep())
+      elseif ch == 1 then -- Ctrl+A: 全选输入缓冲（v0.3.115 功能1; ch==1=SOH,
+        -- 无既有绑定——原落入 else 诊断分支）。0 基 [0, charCount) 字符区间,
+        -- 与 shift 选中/Backspace 删整段/输入替换共用 state.sel 语义。
+        state.sel = {a = 0, b = charCount(state.inputBuffer)}
+        state.sel_active = true
+        state.completionCycle = nil
       elseif ch == 27 then -- Esc: 关闭补全循环（oc-ai 同）
         state.completionCycle = nil
       elseif ch == 9 or code == 15
@@ -4966,12 +5069,47 @@ function tui.readInput(on_event)
           local _, cy, cw, ch = getContentBounds()
         if ev == "touch" then
           if ty >= cy and ty <= cy + ch - 1 and tx >= 2 and tx <= state.width - 1 then
-            -- 按下: 起点 = 终点 = 点击位（清除旧选中 + 输入行选中）
-            state.csel = {ax = tx, ay = ty, bx = tx, by = ty}
-            state.csel_active = true
+            -- v0.3.115 功能2: 连击检测（双击选词 / 三击选行）——同位置
+            -- （|dx|,|dy|<=1，宽容误点）且间隔 <500ms 递增计数; 否则复位 1。
+            local t = now_seconds()
+            local samePos = state.lastClickX and state.lastClickY
+              and math.abs(tx - state.lastClickX) <= 1
+              and math.abs(ty - state.lastClickY) <= 1
+            local quick = state.lastClickTime and (t - state.lastClickTime) < 0.5
+            if samePos and quick then
+              state.clickCount = (state.clickCount or 0) + 1
+            else
+              state.clickCount = 1
+            end
+            state.lastClickTime = t
+            state.lastClickX = tx
+            state.lastClickY = ty
             state.sel = nil
             state.sel_active = nil
-            pcall(tui.redrawContent)
+            if state.clickCount >= 3 then
+              -- 三击: 选整行（x..xmax, 同 y）; 复位计数（下次点击重新计）
+              state.csel = {ax = 2, ay = ty, bx = 2 + cw - 1, by = ty}
+              state.csel_active = true
+              state.clickCount = 0
+              pcall(tui.redrawContent)
+            elseif state.clickCount == 2 then
+              -- 双击: 选词（点中词内 → 扩到词起止列; 点空白/标点 → 单格）
+              local ws, we = wordSpanAt(tx, ty)
+              if ws then
+                state.csel = {ax = ws, ay = ty, bx = we, by = ty}
+                state.csel_active = true
+                pcall(tui.redrawContent)
+              else
+                state.csel = {ax = tx, ay = ty, bx = tx, by = ty}
+                state.csel_active = true
+                pcall(tui.redrawContent)
+              end
+            else
+              -- 单击: 起点 = 终点 = 点击位（清除旧选中 + 输入行选中）
+              state.csel = {ax = tx, ay = ty, bx = tx, by = ty}
+              state.csel_active = true
+              pcall(tui.redrawContent)
+            end
           end
         elseif ev == "drag" and state.csel and state.csel_active then
           -- 拖动: 更新终点 + 派生重绘（v0.3.108 无状态模式，抄
@@ -4989,15 +5127,13 @@ function tui.readInput(on_event)
           tx = math.max(2, math.min(state.width - 1, tx))
           if ty < cy and state.scrollOffset < maxScroll then
             -- 顶部之上: 视口向更早历史滚（scrollOffset+1，内容下移1行）
-            -- v0.3.112: 先平移选中坐标再 scrollView（无 fill 全屏擦除）
-            state.csel.ay = math.min(cy + ch - 1, state.csel.ay + 1)
-            state.csel.by = math.min(cy + ch - 1, state.csel.by + 1)
+            -- v0.3.115: csel 平移统一由 scrollView 内完成（delta 跟随内容
+            -- + clamp）——这里不再手动平移（会与 scrollView 双重平移）;
+            -- 终点 clamp 到边缘行保持拖动延续
             ty = cy
             scrollView(state.scrollOffset + 1)
           elseif ty > cy + ch - 1 and state.scrollOffset > 0 then
             -- 底部之下: 视口向更晚历史滚（scrollOffset-1，内容上移1行）
-            state.csel.ay = math.max(cy, state.csel.ay - 1)
-            state.csel.by = math.max(cy, state.csel.by - 1)
             ty = cy + ch - 1
             scrollView(state.scrollOffset - 1)
           else
@@ -5175,6 +5311,12 @@ function tui.debug_input_sel()
   local s = state.sel
   if not (s and state.sel_active) then return nil end
   return {a = s.a, b = s.b}
+end
+-- v0.3.115: 内容区选中只读钩子（滚动跟随/双击选词/三击选行断言用）
+function tui.debug_csel()
+  local c = state.csel
+  if not (c and state.csel_active) then return nil end
+  return {ax = c.ax, ay = c.ay, bx = c.bx, by = c.by}
 end
 function tui.debug_input_buffer()
   return state.inputBuffer or ""

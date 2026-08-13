@@ -587,6 +587,11 @@ keyboard_proxy.isAltDown = function() return false end
 function mock_component.debug_set_shift(v)
   _shiftDown = not not v
 end
+-- v0.3.115 双击/三击测试: uptime 前推（真实时钟在事件间只走微秒,
+-- 连击永远"快"——需要手动推进模拟"慢点击"复位连击计数）。
+function mock_component.debug_advance_uptime(seconds)
+  OC._uptime = OC._uptime + (seconds or 0)
+end
 mock_component.keyboard = keyboard_proxy
 OC.keyboard = keyboard_proxy
 

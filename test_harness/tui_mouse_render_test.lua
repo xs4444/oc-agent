@@ -499,6 +499,162 @@ test("cjk 6l: multi-row cjk selection == 世界ab\\nabcd", l_copied == "世界ab
   "copied=" .. tostring(l_copied):gsub("\n", "\\n"))
 
 -- ════════════════════════════════════════════════════════════════
+-- 7. 中文+半角符号混排选中（v0.3.115 问题1 复现）: 纯中文/英文盲区——
+--    中文宽字符与半角 - 空格 数字 混排时列↔字符换算可能错位。
+--    行 "- 第 1-16 行是 banner 注释" 列布局（x=2 起）:
+--      -@2 sp@3 第@4-5 sp@6 1@7 -@8 1@9 6@10 sp@11 行@12-13 ...
+--    touch(2,2)+drag(8,2) 选中前 7 列 "- 第 1-"（列 2-8）。
+--    断言: ①复制文本精确 == "- 第 1-"（无空格混入/无截断）
+--          ②高亮反色只覆盖列 2-8（9 列起是原色）
+-- ════════════════════════════════════════════════════════════════
+local mixed_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) mixed_copied = t end})
+tui.print("- 第 1-16 行是 banner 注释", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 2, 2, 0)
+q("drag", "screen-addr", 8, 2, 0)
+q("drop", "screen-addr", 8, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("mix 7: copy of mixed line == '- 第 1-'", mixed_copied == "- 第 1-",
+  "copied=" .. tostring(mixed_copied))
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("- 第 1-16 行是 banner 注释", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 2, 2, 0)
+q("drag", "screen-addr", 8, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local m2 = cell(2, 2)  -- '-' 选中段起点: 反色
+test("mix 7: col2 selected inverted", m2.fg == 0 and m2.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", m2.fg, m2.bg))
+local m4 = cell(4, 2)  -- 第 首格: 反色
+test("mix 7: col4 (第 first cell) inverted", m4.fg == 0 and m4.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", m4.fg, m4.bg))
+local m8 = cell(8, 2)  -- 选中段末列 '-': 反色
+test("mix 7: col8 (last -) inverted", m8.fg == 0 and m8.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", m8.fg, m8.bg))
+local m9 = cell(9, 2)  -- 选中段之后 '1': 原色（不得反色/花屏）
+test("mix 7: col9 after selection original color", m9.fg == tui.colors.user and m9.bg == 0,
+  string.format("fg=%x bg=%x ch=%q", m9.fg, m9.bg, m9.ch))
+
+-- ════════════════════════════════════════════════════════════════
+-- 8. 选中跟随滚动（v0.3.115 Bug3 问题2）: csel 是屏幕坐标, scrollView
+--    改 scrollOffset 后内容平移但 csel 不动 → 选中高亮固定原屏幕位置。
+--    修复: scrollView 内 delta 平移 csel（+clamp 到内容区）。
+--    30 行历史 h=22: 选中 (4,5)-(8,5)（= "e 12", line 12 的列 4-8）,
+--    scrollUp(2) → 内容下移 2 行 → csel.ay 5→7, 高亮跟随到 y=7。
+-- ════════════════════════════════════════════════════════════════
+component.debug_gpu_reset()
+pcall(tui.init, {})
+for i = 1, 30 do tui.print("line " .. i, tui.colors.user) end
+tui.redrawContent()
+q("touch", "screen-addr", 4, 5, 0)
+q("drag", "screen-addr", 8, 5, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local cs0 = tui.debug_csel()
+test("sc8a: selection at y=5 before scroll", cs0 and cs0.ay == 5 and cs0.by == 5,
+  "ay=" .. tostring(cs0 and cs0.ay))
+local s5 = cell(5, 5)
+test("sc8a: highlight visible at y=5", s5.fg == 0 and s5.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", s5.fg, s5.bg))
+tui.scrollUp(2)  -- offset 0 → 2: 内容下移 2 行
+local cs1 = tui.debug_csel()
+test("sc8b: csel translated down by delta (ay 5 -> 7)", cs1 and cs1.ay == 7 and cs1.by == 7,
+  "ay=" .. tostring(cs1 and cs1.ay))
+local s7 = cell(5, 7)
+test("sc8b: highlight followed content to y=7", s7.fg == 0 and s7.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", s7.fg, s7.bg))
+local s5b = cell(5, 5)
+test("sc8b: old position y=5 cleared", s5b.fg == tui.colors.user and s5b.bg == 0,
+  string.format("fg=%x bg=%x", s5b.fg, s5b.bg))
+-- 滚动后 drop 复制 = 视口内选中内容（line 12 的 "e 12"）。
+-- 用滚轮事件滚动（同 run 内完成——不再用 Enter 退出, 避免 "> x" 回显
+-- 污染历史导致行号偏移; 滚动后 csel.ay 5→8 = line 12 仍在视口 y=8）。
+local sc_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) sc_copied = t end})
+for i = 1, 30 do tui.print("line " .. i, tui.colors.user) end
+tui.redrawContent()
+q("touch", "screen-addr", 4, 5, 0)
+q("drag", "screen-addr", 8, 5, 0)
+q("scroll", "screen-addr", 4, 5, 1)   -- 滚轮上滚 ×3 行: 内容下移 + csel 跟随 (ay 5→8)
+q("drop", "screen-addr", 8, 8, 0)
+q("interrupted")  -- csel 已被 drop 清除 → 干净退出
+pcall(tui.readInput, nil)
+test("sc8c: copy after scroll == same content (ne 12)", sc_copied == "ne 12",
+  "copied=" .. tostring(sc_copied))
+
+-- ════════════════════════════════════════════════════════════════
+-- 9. 双击选词 / 三击选行（v0.3.115 功能2）: 同位置快速 touch 递增连击
+--    计数——2 次 → 选词（扩到词边界, 宽字符整归属）; 3 次 → 选整行。
+--    "hello world foo": h@2..o@6 sp@7 w@8 o@9 r@10 l@11 d@12 sp@13 f@14..
+-- ════════════════════════════════════════════════════════════════
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("hello world foo", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 9, 2, 0)  -- 'o' of world
+q("touch", "screen-addr", 9, 2, 0)  -- 双击（微秒间隔 < 500ms）→ 选词
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local csd = tui.debug_csel()
+test("dbl 9a: double-click selects word cols 8-12", csd and csd.ax == 8 and csd.bx == 12,
+  "ax=" .. tostring(csd and csd.ax) .. " bx=" .. tostring(csd and csd.bx))
+-- 三击 → 选整行
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("hello world foo", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 9, 2, 0)
+q("touch", "screen-addr", 9, 2, 0)
+q("touch", "screen-addr", 9, 2, 0)  -- 三击 → 选行
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local cst = tui.debug_csel()
+test("tri 9b: triple-click selects whole line", cst and cst.ax == 2 and cst.bx == 79 and cst.ay == 2 and cst.by == 2,
+  "ax=" .. tostring(cst and cst.ax) .. " bx=" .. tostring(cst and cst.bx))
+-- 双击复制正确（无词边界字符混入）
+local dw_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) dw_copied = t end})
+tui.print("hello world foo", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 9, 2, 0)
+q("touch", "screen-addr", 9, 2, 0)
+q("drop", "screen-addr", 12, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("dbl 9c: double-click copy == world", dw_copied == "world",
+  "copied=" .. tostring(dw_copied))
+-- 慢点击复位: 同位置但间隔 > 500ms → 单击（单格选中, 非选词）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("hello world foo", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+component.debug_advance_uptime(1)  -- 推进 1s > 0.5s 阈值
+q("touch", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local css = tui.debug_csel()
+test("dbl 9d: slow second click resets to single cell", css and css.ax == 9 and css.bx == 9,
+  "ax=" .. tostring(css and css.ax) .. " bx=" .. tostring(css and css.bx))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)
