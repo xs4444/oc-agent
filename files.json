@@ -5,7 +5,7 @@
     "debug.lua": 16478,
     "execute.lua": 2769,
     "http.lua": 8919,
-    "init.lua": 104538,
+    "init.lua": 104956,
     "interrupt.lua": 4297,
     "json.lua": 8490,
     "patch.lua": 6458,
@@ -25,5 +25,5 @@
     "wcwidth.lua": 3353,
     "docs.lua": 14689
   },
-  "version": "2026-08-13T1551"
+  "version": "2026-08-13T1710"
 }

@@ -7053,6 +7053,17 @@ local function utf8_safe_tail(s, n)
   return s:sub(start)
 end
 
+-- UTF-8 字符计数（字节→字符数，与 tui 的字符切分模式一致）。
+-- v0.3.117: /paste 报告字符数——原误用 tui.lua 的 private local ulen
+-- （列宽，从未导出），真机 TUI 模式触发即崩 (attempt to call nil 'ulen')。
+local function utf8_count(s)
+  local n = 0
+  for _ in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    n = n + 1
+  end
+  return n
+end
+
 local function fmt_num(n)
   local s = tostring(math.floor(n or 0))
   local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
@@ -7744,7 +7755,7 @@ local function handle_command(cmd, config, messages)
           -- TUI 模式: 注入输入行（v0.3.107: 用 UI_REF——ui 是 main()
           -- 局部变量 handle_command 看不到，原判断恒 REPL）
           UI_REF.setInputBuffer(content)
-          print("粘贴 " .. ulen(content) .. " 字符到输入行（回车发送）")
+          print("粘贴 " .. utf8_count(content) .. " 字符到输入行（回车发送）")
         else
           -- REPL 模式: 打印内容供复制（readInput 回退 io.read 时无输入行
           -- 可注入——打印让用户手动复制）
