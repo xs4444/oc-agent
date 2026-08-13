@@ -523,6 +523,76 @@ test("D: paste replaces selection -> hello X",
   tui.debug_input_buffer() == "hello X", "buf=" .. tostring(tui.debug_input_buffer()))
 
 -- ════════════════════════════════════════════════════════════════
+-- E. v0.3.115 功能1/3: Ctrl+A 全选 + bash 标准 ↑↓。
+--    E1: Ctrl+A（ch==1）→ sel={0,charCount}; Backspace 删整 buffer。
+--    E2: bash 标准——多行光标顶行 ↑ = 历史上翻（替换整个 buffer）;
+--        底行 ↓ = 历史下翻; 中间 ↑↓ = 跨行移动（B4 已测保持）;
+--        单行 ↑↓ = 历史（现状保持）。
+-- ════════════════════════════════════════════════════════════════
+-- E1a: Ctrl+A 后 Enter（不清 sel）→ sel {0,11} 保留
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "hello world")
+q("key_down", "kb-addr", 1, 30, "player")  -- Ctrl+A（ch==1=SOH）
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+local e1sel = tui.debug_input_sel()
+test("E1: Ctrl+A selects whole buffer {0,11}", e1sel and e1sel.a == 0 and e1sel.b == 11,
+  "sel=" .. tostring(e1sel and (e1sel.a .. "," .. e1sel.b)))
+-- E1b: Ctrl+A + Backspace 删整 buffer → 后续输入从空开始
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "hello world")
+q("key_down", "kb-addr", 1, 30, "player")  -- Ctrl+A
+q("key_down", "kb-addr", 8, 14, "player")  -- Backspace 删整段 → buffer ""
+q("key_down", "kb-addr", 120, 45, "player")  -- 'x' → buffer "x"
+q("key_down", "kb-addr", 13, 28, "player")
+local ok_e1, res_e1 = pcall(tui.readInput, nil)
+test("E1: Ctrl+A + Backspace clears buffer (submit == x)", ok_e1 and res_e1 == "x",
+  "got=" .. tostring(res_e1))
+
+-- E2: bash 标准 ↑↓（历史经 run1 提交建立; 跨 run 不复位 cmdHistory）
+-- run1: 提交 "prevcmd" → cmdHistory = {"prevcmd"}
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "prevcmd")
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+-- run2: 多行 paste + 点击顶行（行 1 = y=22, cursor 0）+ ↑ → 历史上翻 → "prevcmd"
+q("clipboard", "kb-addr", "l1\nl2\nl3\nl4")
+q("touch", "screen-addr", 5, 22, 0)  -- 顶行行首 (ih=4, inputTop=22)
+q("key_down", "kb-addr", 0, 200, "player")  -- Up: 顶行 → 历史
+q("key_down", "kb-addr", 13, 28, "player")
+local ok_e2, res_e2 = pcall(tui.readInput, nil)
+test("E2: Up at top line browses history (prevcmd)", ok_e2 and res_e2 == "prevcmd",
+  "got=" .. tostring(res_e2))
+-- E3: 底行 ↓ = 历史下翻（同 run 内往返: paste 多行 → End 底行 → Up×2
+--     到历史（首 Up 跨行上移, 二 Up 顶行翻历史）→ Down 底行语义回
+--     savedInput）→ 提交 = 原始 "ab\ncd"。若 Up/Down 任一非 bash 语义
+--     （跨行 vs 历史错乱）, 往返结果 ≠ "ab\ncd" → 断言失败。
+q("clipboard", "kb-addr", "ab\ncd")
+q("key_down", "kb-addr", 0, 207, "player")  -- End → buffer 尾（line_end==charCount）
+q("key_down", "kb-addr", 0, 200, "player")  -- Up: 底行 → 跨行上移（非历史）
+q("key_down", "kb-addr", 0, 200, "player")  -- Up: 顶行 → 历史上翻
+q("key_down", "kb-addr", 0, 208, "player")  -- Down: 单行 buffer → 历史下翻回 savedInput
+q("key_down", "kb-addr", 13, 28, "player")
+local ok_e3, res_e3 = pcall(tui.readInput, nil)
+test("E3: bottom Down round-trips through history", ok_e3 and res_e3 == "ab\ncd",
+  "got=" .. tostring(res_e3):gsub("\n", "\\n"))
+-- E4: 单行 ↑ = 历史（现状保持; 独立 run 自建历史, 期望不依赖前面 run）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "prevcmd")
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)  -- cmdHistory = {"prevcmd"}
+q("clipboard", "kb-addr", "solo")
+q("key_down", "kb-addr", 0, 200, "player")  -- Up: 单行 → 历史上翻
+q("key_down", "kb-addr", 13, 28, "player")
+local ok_e4, res_e4 = pcall(tui.readInput, nil)
+test("E4: single-line Up browses history (prevcmd)", ok_e4 and res_e4 == "prevcmd",
+  "got=" .. tostring(res_e4))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)
