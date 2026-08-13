@@ -98,6 +98,21 @@ local function gpu_ensure()
     end
   end
 end
+-- v0.3.116: GPU 宽字符判定与真机对齐——懒加载 src/agent/wcwidth.lua
+-- （musl 区间表, require("agent.wcwidth")——init.lua 已把父目录加进
+-- package.path）。旧 ch:byte(1)>=128 把 en/em dash(3 字节 1 列) 误判 2 格,
+-- 与修复后的 tui 判定不一致 → mock 与实现打架。缺模块回落旧启发。
+local _wcwidth_mock = nil
+local function wide_char(ch)
+  if not _wcwidth_mock then
+    local ok_w, w = pcall(require, "agent.wcwidth")
+    if ok_w and type(w) == "table" then _wcwidth_mock = w end
+  end
+  if _wcwidth_mock then return _wcwidth_mock.isWide(ch) end
+  local b = ch:byte(1)
+  return b ~= nil and b >= 128
+end
+
 -- v0.3.111: GPU 模拟对齐真机 TextBuffer 宽字符语义（repos/opencomputers
 -- TextBuffer.scala:108-144/245-260 + FontUtils.scala:14 实证）:
 --   · ≥3 字节 UTF-8 宽字符占 2 格——首格存完整字符, 第 2 格写 padding 空格
@@ -112,7 +127,7 @@ local function gpu_set(x, y, text)
   text = tostring(text or "")
   local col = x
   for ch in text:gmatch("([\1-\127\194-\244][\128-\191]*)") do
-    local wide = ch:byte(1) >= 128
+    local wide = wide_char(ch)  -- v0.3.116: wcwidth 判定（en dash 1 列）
     if y >= 1 and y <= GPU_H and col >= 1 and col <= GPU_W then
       GPU_Screen[y][col] = ch
       GPU_FG[y][col] = GPU_curFG
@@ -141,7 +156,7 @@ local function gpu_fill(x, y, w, h, text)
   gpu_ensure()
   text = tostring(text or " ")
   local ch = text:match("([\1-\127\194-\244][\128-\191]*)") or " "
-  local wide = ch:byte(1) >= 128
+  local wide = wide_char(ch)  -- v0.3.116: wcwidth 判定
   for yy = y, math.min(GPU_H, y + h - 1) do
     local col = x
     local xmax = math.min(GPU_W, x + w - 1)

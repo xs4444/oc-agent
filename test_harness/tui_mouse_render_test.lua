@@ -655,6 +655,132 @@ test("dbl 9d: slow second click resets to single cell", css and css.ax == 9 and 
   "ax=" .. tostring(css and css.ax) .. " bx=" .. tostring(css and css.bx))
 
 -- ════════════════════════════════════════════════════════════════
+-- 10. wcwidth 宽字符判定（v0.3.116 根因修复）: 旧 isWideChar=#ch>=3 /
+--     ulen=byte>=128 把 en dash(U+2013 3 字节)/em dash 等真机 1 列
+--     字符误判 2 列 → 混排选中偏移。修复后与 OC 真机 musl 一致:
+--     en/em dash 1 列, 中文 2 列, 全角 2 列, é(2 字节) 1 列, emoji 2 列。
+--     同时 oc_mock gpu_set 同步 wcwidth 判定（模拟真机写屏）。
+-- ════════════════════════════════════════════════════════════════
+local ok_wc, W = pcall(require, "agent.wcwidth")
+test("wc 10a: wcwidth module loads", ok_wc and type(W) == "table", tostring(ok_wc))
+if ok_wc and type(W) == "table" then
+  test("wc 10a: en dash U+2013 is 1 col", W.wcwidth(0x2013) == 1,
+    "w=" .. tostring(W.wcwidth(0x2013)))
+  test("wc 10a: em dash U+2014 is 1 col", W.wcwidth(0x2014) == 1,
+    "w=" .. tostring(W.wcwidth(0x2014)))
+  test("wc 10a: CJK U+4E2D (zhong) is 2 cols", W.wcwidth(0x4E2D) == 2,
+    "w=" .. tostring(W.wcwidth(0x4E2D)))
+  test("wc 10a: CJK U+6587 (wen) is 2 cols", W.wcwidth(0x6587) == 2,
+    "w=" .. tostring(W.wcwidth(0x6587)))
+  test("wc 10a: fullwidth U+FF01 is 2 cols", W.wcwidth(0xFF01) == 2,
+    "w=" .. tostring(W.wcwidth(0xFF01)))
+  test("wc 10a: latin-1 e-acute U+00E9 is 1 col", W.wcwidth(0xE9) == 1,
+    "w=" .. tostring(W.wcwidth(0xE9)))
+  test("wc 10a: emoji U+1F600 is 2 cols", W.wcwidth(0x1F600) == 2,
+    "w=" .. tostring(W.wcwidth(0x1F600)))
+  test("wc 10a: isWide(en dash) false", W.isWide("–") == false)
+  test("wc 10a: isWide(CJK) true", W.isWide("中") == true)
+end
+
+-- 10b: en dash 1 列渲染 + 复制（"a–b中": a@2 –@3 b@4 中@5-6）
+local wb_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) wb_copied = t end})
+tui.print("a–b中", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 2, 2, 0)
+q("drag", "screen-addr", 3, 2, 0)
+q("drop", "screen-addr", 3, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10b: en dash selection copy == 'a–' (1 col, no padding)", wb_copied == "a–",
+  "copied=" .. tostring(wb_copied))
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("a–b中", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 2, 2, 0)
+q("drag", "screen-addr", 3, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local e3 = cell(3, 2)  -- en dash 选中: 反色
+test("wc 10b: en dash col3 inverted", e3.fg == 0 and e3.bg == tui.colors.user,
+  string.format("fg=%x bg=%x ch=%q", e3.fg, e3.bg, e3.ch))
+local e4 = cell(4, 2)  -- 'b' 不在选中段: 原色（en dash 不占 2 列的关键断言）
+test("wc 10b: col4 b NOT selected (en dash is 1 col)", e4.fg == tui.colors.user and e4.bg == 0,
+  string.format("fg=%x bg=%x ch=%q", e4.fg, e4.bg, e4.ch))
+-- 10c: 跨 en dash + 中文: (4,2)-(6,2) = "b中"
+local wc_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) wc_copied = t end})
+tui.print("a–b中", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 4, 2, 0)
+q("drag", "screen-addr", 6, 2, 0)
+q("drop", "screen-addr", 6, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10c: mixed en-dash+CJK copy == 'b中'", wc_copied == "b中",
+  "copied=" .. tostring(wc_copied))
+-- 10d: em dash 单格选中（"x—y": x@2 —@3 y@4）
+local wd_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) wd_copied = t end})
+tui.print("x—y", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 3, 2, 0)
+q("drop", "screen-addr", 3, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10d: em dash single-cell copy == '—'", wd_copied == "—",
+  "copied=" .. tostring(wd_copied))
+-- 10e: é (2 字节 1 列) 复制（"café": c@2 a@3 f@4 é@5）
+local we_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) we_copied = t end})
+tui.print("café", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 4, 2, 0)
+q("drag", "screen-addr", 5, 2, 0)
+q("drop", "screen-addr", 5, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10e: e-acute selection copy == 'fé' (1 col each)", we_copied == "fé",
+  "copied=" .. tostring(we_copied))
+-- 10f: emoji (4 字节 2 列) 复制（"A😀B": A@2 😀@3-4 B@5）
+local wf_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) wf_copied = t end})
+tui.print("A😀B", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 3, 2, 0)
+q("drag", "screen-addr", 4, 2, 0)
+q("drop", "screen-addr", 4, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10f: emoji selection copy == '😀' (2 cols)", wf_copied == "😀",
+  "copied=" .. tostring(wf_copied))
+-- 10g: 中文宽字符回归（padding 格起点复制）
+local wg_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) wg_copied = t end})
+tui.print("中文", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 3, 2, 0)  -- 中 的 padding 格
+q("drop", "screen-addr", 3, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("wc 10g: CJK padding-cell tap still copies whole char", wg_copied == "中",
+  "copied=" .. tostring(wg_copied))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)

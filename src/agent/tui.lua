@@ -19,6 +19,12 @@ local ok_k, keyboard = pcall(require, "keyboard")
 -- computer**——荒野大师/OCEmu 无全局（debug.lua:59 同款坑：oc_mock 注入
 -- 全局 computer 掩盖，真机崩溃）。
 local ok_cp, computer = pcall(require, "computer")
+-- 宽字符判定模块（v0.3.116）: musl wcwidth 区间表（与 OC 真机 FontUtils.scala
+-- 一致）。根因修复: 旧 isWideChar=#ch>=3 把 en dash(U+2013)/em dash 等
+-- 3 字节但真机 1 列的字符误判为宽字符 → 混排选中偏移。pcall 保护:
+-- 缺模块时回落旧启发（#ch>=3），不阻塞启动/测试。
+local ok_w, wcwidth = pcall(require, "agent.wcwidth")
+if not ok_w or type(wcwidth) ~= "table" then wcwidth = nil end
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
@@ -50,11 +56,19 @@ end
 -- 字符游标迭代 + 列游标累积）。
 -- ═══════════════════════════════════════════════════════════════
 
--- 显示宽度（列数）: ASCII 1 列, 宽字符 2 列
+-- 显示宽度（列数）: ASCII 1 列, 宽字符 2 列。
+-- v0.3.116: 宽度判定改用 wcwidth 区间表（真机 musl 语义）——旧
+-- ch:byte(1)<128 把 en/em dash(3 字节 1 列) 等误计 2 列, 列坐标整体偏移。
 local function ulen(s)
   local n = 0
   for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
-    if ch:byte(1) < 128 then n = n + 1 else n = n + 2 end
+    if wcwidth then
+      n = n + wcwidth.wcwidth(wcwidth.codepointOf(ch))
+    elseif ch:byte(1) < 128 then
+      n = n + 1
+    else
+      n = n + 2
+    end
   end
   return n
 end
@@ -73,10 +87,13 @@ local function usub(s, i, j)
   return table.concat(out)
 end
 
--- 宽字符判定: CJK 等宽字符 UTF-8 编码 >= 3 字节，OC 屏幕占 2 格
--- （第二格 padding）。ASCII 1 字节、拉丁扩展 2 字节。
+-- 宽字符判定: 返回该字符是否占 2 列（wcwidth==2）。
 -- v0.3.111: 从原 446 行上移到此工具区，供 charWidth/subCols 复用。
+-- v0.3.116: 内部实现改用 wcwidth 模块（musl 区间表, 与 OC 真机一致）——
+-- 旧 #ch>=3 把 en dash(U+2013)/em dash 等 3 字节 1 列字符误判宽字符
+-- → 混排选中偏移（用户真机报告）。函数名/签名/布尔语义不变。
 local function isWideChar(ch)
+  if wcwidth then return wcwidth.isWide(ch) end
   return type(ch) == "string" and #ch >= 3
 end
 

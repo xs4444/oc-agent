@@ -29,6 +29,9 @@ local MODULES = {
   "agent.patch",
   "agent.selftest",
   "agent.debug",
+  -- v0.3.116: 宽字符判定区间表（tui.lua require("agent.wcwidth")）——
+  -- 单文件构建必须 preload 它, 否则真机 require 失败
+  "agent.wcwidth",
   "agent.tui",
 }
 

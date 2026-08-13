@@ -3131,6 +3131,165 @@ return {
 }
 end
 
+-- agent.agent.wcwidth (embedded module)
+package.preload["agent.wcwidth"] = function()
+-- 宽字符判定（musl wcwidth，与 OC 真机 FontUtils.scala 完全一致）
+-- v0.3.116: 从 repos/opencomputers/.../FontUtils.scala 的 c_wcwidth
+-- （table/wtable 位图）推导出的宽字符（wcwidth==2）区间表，
+-- 114 区间，二分查找。mismatches=0（对全部 0x110000 码点验证）。
+-- 修复根因: 旧 isWideChar=#ch>=3 把 en dash(U+2013)/em dash 等
+-- 3 字节但真机 1 列的字符误判为宽字符 → 混排选中偏移。
+local W = {}
+
+-- UTF-8 字符 → Unicode 码点（纯算术，无位运算依赖，Lua 5.2/5.3 兼容）
+local function codepointOf(ch)
+  local b1 = ch:byte(1)
+  if not b1 then return 0 end
+  if b1 < 0x80 then return b1 end
+  local b2 = ch:byte(2) or 0
+  if b1 < 0xE0 then return (b1 - 0xC0) * 64 + (b2 - 0x80) end
+  local b3 = ch:byte(3) or 0
+  if b1 < 0xF0 then return (b1 - 0xE0) * 4096 + (b2 - 0x80) * 64 + (b3 - 0x80) end
+  local b4 = ch:byte(4) or 0
+  return (b1 - 0xF0) * 262144 + (b2 - 0x80) * 4096 + (b3 - 0x80) * 64 + (b4 - 0x80)
+end
+
+local WIDE = {
+  {4352,4447},
+  {8986,8987},
+  {9001,9002},
+  {9193,9196},
+  {9200},
+  {9203},
+  {9725,9726},
+  {9748,9749},
+  {9800,9811},
+  {9855},
+  {9875},
+  {9889},
+  {9898,9899},
+  {9917,9918},
+  {9924,9925},
+  {9934},
+  {9940},
+  {9962},
+  {9970,9971},
+  {9973},
+  {9978},
+  {9981},
+  {9989},
+  {9994,9995},
+  {10024},
+  {10060},
+  {10062},
+  {10067,10069},
+  {10071},
+  {10133,10135},
+  {10160},
+  {10175},
+  {11035,11036},
+  {11088},
+  {11093},
+  {11904,11929},
+  {11931,12019},
+  {12032,12245},
+  {12272,12283},
+  {12288,12329},
+  {12334,12350},
+  {12353,12438},
+  {12443,12543},
+  {12549,12591},
+  {12593,12686},
+  {12688,12730},
+  {12736,12771},
+  {12784,12830},
+  {12832,12871},
+  {12880,19903},
+  {19968,42124},
+  {42128,42182},
+  {43360,43388},
+  {44032,55203},
+  {63744,64255},
+  {65040,65049},
+  {65072,65106},
+  {65108,65126},
+  {65128,65131},
+  {65281,65376},
+  {65504,65510},
+  {94176,94179},
+  {94208,100343},
+  {100352,101106},
+  {110592,110878},
+  {110928,110930},
+  {110948,110951},
+  {110960,111355},
+  {126980},
+  {127183},
+  {127374},
+  {127377,127386},
+  {127488,127490},
+  {127504,127547},
+  {127552,127560},
+  {127568,127569},
+  {127584,127589},
+  {127744,127776},
+  {127789,127797},
+  {127799,127868},
+  {127870,127891},
+  {127904,127946},
+  {127951,127955},
+  {127968,127984},
+  {127988},
+  {127992,128062},
+  {128064},
+  {128066,128252},
+  {128255,128317},
+  {128331,128334},
+  {128336,128359},
+  {128378},
+  {128405,128406},
+  {128420},
+  {128507,128591},
+  {128640,128709},
+  {128716},
+  {128720,128722},
+  {128725},
+  {128747,128748},
+  {128756,128762},
+  {128992,129003},
+  {129293,129393},
+  {129395,129398},
+  {129402,129442},
+  {129445,129450},
+  {129454,129482},
+  {129485,129535},
+  {129648,129651},
+  {129656,129658},
+  {129664,129666},
+  {129680,129685},
+  {131072,196605},
+  {196608,262141},
+}
+
+-- wcwidth: 宽字符返回 2，否则 1（组合字符零宽暂按 1，与 charWidth 语义一致）
+local function wcwidth(cp)
+  local lo, hi = 1, #WIDE
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    local s, e = WIDE[mid][1], WIDE[mid][2]
+    if cp < s then hi = mid - 1
+    elseif e and cp > e then lo = mid + 1
+    else return 2 end
+  end
+  return 1
+end
+
+W.codepointOf = codepointOf
+W.wcwidth = wcwidth
+W.isWide = function(ch) return wcwidth(codepointOf(ch)) == 2 end
+return W
+end
+
 -- agent.agent.tui (embedded module)
 package.preload["agent.tui"] = function()
 -- ═══════════════════════════════════════════════════════════════
@@ -3154,6 +3313,12 @@ local ok_k, keyboard = pcall(require, "keyboard")
 -- computer**——荒野大师/OCEmu 无全局（debug.lua:59 同款坑：oc_mock 注入
 -- 全局 computer 掩盖，真机崩溃）。
 local ok_cp, computer = pcall(require, "computer")
+-- 宽字符判定模块（v0.3.116）: musl wcwidth 区间表（与 OC 真机 FontUtils.scala
+-- 一致）。根因修复: 旧 isWideChar=#ch>=3 把 en dash(U+2013)/em dash 等
+-- 3 字节但真机 1 列的字符误判为宽字符 → 混排选中偏移。pcall 保护:
+-- 缺模块时回落旧启发（#ch>=3），不阻塞启动/测试。
+local ok_w, wcwidth = pcall(require, "agent.wcwidth")
+if not ok_w or type(wcwidth) ~= "table" then wcwidth = nil end
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
@@ -3185,11 +3350,19 @@ end
 -- 字符游标迭代 + 列游标累积）。
 -- ═══════════════════════════════════════════════════════════════
 
--- 显示宽度（列数）: ASCII 1 列, 宽字符 2 列
+-- 显示宽度（列数）: ASCII 1 列, 宽字符 2 列。
+-- v0.3.116: 宽度判定改用 wcwidth 区间表（真机 musl 语义）——旧
+-- ch:byte(1)<128 把 en/em dash(3 字节 1 列) 等误计 2 列, 列坐标整体偏移。
 local function ulen(s)
   local n = 0
   for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
-    if ch:byte(1) < 128 then n = n + 1 else n = n + 2 end
+    if wcwidth then
+      n = n + wcwidth.wcwidth(wcwidth.codepointOf(ch))
+    elseif ch:byte(1) < 128 then
+      n = n + 1
+    else
+      n = n + 2
+    end
   end
   return n
 end
@@ -3208,10 +3381,13 @@ local function usub(s, i, j)
   return table.concat(out)
 end
 
--- 宽字符判定: CJK 等宽字符 UTF-8 编码 >= 3 字节，OC 屏幕占 2 格
--- （第二格 padding）。ASCII 1 字节、拉丁扩展 2 字节。
+-- 宽字符判定: 返回该字符是否占 2 列（wcwidth==2）。
 -- v0.3.111: 从原 446 行上移到此工具区，供 charWidth/subCols 复用。
+-- v0.3.116: 内部实现改用 wcwidth 模块（musl 区间表, 与 OC 真机一致）——
+-- 旧 #ch>=3 把 en dash(U+2013)/em dash 等 3 字节 1 列字符误判宽字符
+-- → 混排选中偏移（用户真机报告）。函数名/签名/布尔语义不变。
 local function isWideChar(ch)
+  if wcwidth then return wcwidth.isWide(ch) end
   return type(ch) == "string" and #ch >= 3
 end
 
