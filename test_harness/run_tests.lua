@@ -1843,6 +1843,21 @@ do
   end
 end
 
+-- v0.3.112 输入框多行 + 滚轮防闪烁回归（任务 A/B）: 独立文件
+-- tui_input_scroll_test.lua 以 dofile 接入（同鼠标渲染测试模式）。
+do
+  _IN_RUN_TESTS = true
+  local ok_is, p_is, f_is = pcall(dofile, "tui_input_scroll_test.lua")
+  _IN_RUN_TESTS = nil
+  if ok_is and type(p_is) == "number" then
+    test("tui input scroll test file runs", true)
+    pass = pass + p_is
+    fail = fail + f_is
+  else
+    test("tui input scroll test file runs", false, tostring(p_is))
+  end
+end
+
 print("")
 print("═══════════════════════════════════════")
 print("Tool Loop Guards (chat 层借鉴) Tests")

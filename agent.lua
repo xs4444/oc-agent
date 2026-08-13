@@ -3430,6 +3430,12 @@ function tui.init(config)
   state.search = nil
   state.inputBuffer = ""
   state.inputCursor = 0
+  -- v0.3.112 输入框多行: 显示高度（自动增高）+ 输入窗口滚动 + 滚轮路由
+  -- （最后 touch/drag 的 y 决定 scroll 事件滚内容区还是输入框）
+  state.inputHeight = 1
+  state.inputScroll = 0
+  state.lastTouchY = nil
+  state.inputFollow = true  -- 输入窗口是否跟随光标（手动滚轮浏览时关）
   state.cmdHistory = {}
   state.cmdHistoryIndex = 0
   state.savedInput = ""
@@ -3473,11 +3479,12 @@ function tui.drawHeader()
   end
 end
 
--- 绘制状态栏（h-1 行: status 左 + 动态数据右 + scroll 指示; scrollSafe 时上移一行）
+-- 绘制状态栏（输入框上方 1 行: status 左 + 动态数据右 + scroll 指示;
+-- v0.3.112 输入框自动增高 → 状态栏 y = 总高 - inputHeight - scrollSafe）
 function tui.drawStatus()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
-  local y = state.height - 1 - (state.scrollSafe and 1 or 0)
+  local y = state.height - (state.inputHeight or 1) - (state.scrollSafe and 1 or 0)
   g.setBackground(tui.colors.status)
   g.setForeground(tui.colors.statusText)
   g.fill(1, y, state.width, 1, " ")
@@ -3516,9 +3523,12 @@ function tui.setStatus(msg)
   pcall(tui.drawStatus)
 end
 
--- 内容区边界（含滚动窗口高度）; scrollSafe 时整体上移一行（内容区少 1 行）
+-- 内容区边界（含滚动窗口高度）; scrollSafe 时整体上移一行（内容区少 1 行）。
+-- v0.3.112: 输入框自动增高 → 内容区高度 = 总高 - header(1) - status(1)
+-- - inputHeight（inputHeight=1 时与旧公式完全一致）。
 local function getContentBounds()
-  return 2, 2, state.width - 2, state.height - 3 - (state.scrollSafe and 1 or 0)
+  local ih = math.max(1, state.inputHeight or 1)
+  return 2, 2, state.width - 2, state.height - 2 - ih - (state.scrollSafe and 1 or 0)
 end
 
 -- 逐词换行 + 长词硬断（中文按 unicode 字符）
@@ -3553,6 +3563,112 @@ local function wrapText(str, width)
     end
   end
   return lines
+end
+
+-- ════════════════════════════════════════
+-- 输入框多行支持（v0.3.112, 用户设计）:
+-- "类似其他经典 agent 的输入框——根据行数自动增高（占用对话行），
+--  到一定高度时滚轮换行; 通过光标所在的位置或最后点击的位置分辨
+--  scroll 的是对话框还是输入框。"
+-- 显示行 = wrapText(inputBuffer, 输入行宽) 折行结果; 窗口显示
+-- inputHeight 行（上限 MAX_INPUT_HEIGHT）, inputScroll 滚动窗口。
+-- 内容区高度 = 总高 - header(1) - status(1) - inputHeight（getContentBounds
+-- 已集中改读 state.inputHeight, 全布局一处适配）。
+-- ════════════════════════════════════════
+local MAX_INPUT_HEIGHT = 8
+
+-- 输入框显示行 + 每行字符区间（0 基半开 [start, start+len)）+ 多行标记。
+-- 与 wrapText 同源折行（同一 gmatch 迭代——"ab\n" 无尾部空行,
+-- 空 buffer → 1 个空行; 与历史换行行为完全一致）。
+local function inputDisplayLines()
+  local buf = state.inputBuffer or ""
+  local multiline = buf:find("\n", 1, true) ~= nil
+  local maxWidth = state.width - (multiline and 6 or 5)
+  local lines, ranges = {}, {}
+  local charAcc = 0
+  for line in buf:gmatch("([^\n]*)\n?") do
+    if ulen(line) <= maxWidth then
+      lines[#lines + 1] = line
+      ranges[#ranges + 1] = {charAcc, charCount(line)}
+      charAcc = charAcc + charCount(line) + 1
+    else
+      local remaining = line
+      while ulen(remaining) > maxWidth do
+        local chunk = truncateCols(remaining, maxWidth)
+        if chunk == "" then chunk = usub(remaining, 1, 1) end
+        local n = charCount(chunk)
+        lines[#lines + 1] = chunk
+        ranges[#ranges + 1] = {charAcc, n}
+        charAcc = charAcc + n
+        remaining = usub(remaining, n + 1)
+      end
+      lines[#lines + 1] = remaining
+      ranges[#ranges + 1] = {charAcc, charCount(remaining)}
+      charAcc = charAcc + charCount(remaining) + 1
+    end
+  end
+  if #lines == 0 then lines, ranges = {""}, {{0, 0}} end
+  return lines, ranges, multiline
+end
+
+-- 输入高度同步: 显示行数 → inputHeight（上限 MAX_INPUT_HEIGHT）; 行数
+-- 减少时 inputScroll clamp。返回高度是否变化——调用方据此决定全量
+-- redrawContent（内容区高度变）还是只重绘输入框（防闪烁）。
+local function syncInputHeight()
+  local lines = inputDisplayLines()
+  local newH = math.max(1, math.min(MAX_INPUT_HEIGHT, #lines))
+  local changed = newH ~= (state.inputHeight or 1)
+  state.inputHeight = newH
+  local maxScroll = math.max(0, #lines - newH)
+  if state.inputScroll > maxScroll then state.inputScroll = maxScroll end
+  if state.inputScroll < 0 then state.inputScroll = 0 end
+  return changed
+end
+
+-- 光标所在行字符区间（0 基半开 [start, endExclusive)）: 向前找 \n +
+-- 向后找 \n。v0.3.112 编辑边界从"最后一行"改为"光标所在行"——
+-- Backspace/Left/Right/Delete/Home/End 以当前行为界（不跨行、不删 \n）。
+local function lineBoundsAt(s, cursor)
+  local str = tostring(s or "")
+  cursor = math.max(0, math.min(cursor or 0, charCount(str)))
+  local chars = {}
+  for ch in str:gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    chars[#chars + 1] = ch
+  end
+  local start = 0
+  for i = 1, cursor do
+    if chars[i] == "\n" then start = i end
+  end
+  local endEx = #chars
+  for i = cursor + 1, #chars do
+    if chars[i] == "\n" then endEx = i - 1 break end
+  end
+  return start, endEx
+end
+
+-- 光标上移/下移一个【显示】行（v0.3.112 多行编辑; Up/Down 跨行移动,
+-- 列保持: 当前列宽 → charIndexAtCol 映射到目标行, clamp 到目标行宽）
+local function moveCursorByDisplayLine(dir)
+  local lines, ranges = inputDisplayLines()
+  local c = state.inputCursor
+  local idx = 1
+  for i = 1, #lines do
+    local r = ranges[i]
+    if c >= r[1] and c < r[1] + r[2] then idx = i break end
+  end
+  -- 行尾（== 行末字符后一位）归到该行
+  for i = 1, #lines do
+    if c == ranges[i][1] + ranges[i][2] then idx = i break end
+  end
+  local target = idx + dir
+  if target < 1 or target > #lines then return false end
+  local rt = ranges[target]
+  local text = lines[target]
+  local curText = lines[idx] or ""
+  local curOff = c - (ranges[idx][1] or 0)
+  local colPx = ulen(usub(curText, 1, curOff))
+  state.inputCursor = rt[1] + charIndexAtCol(text, colPx)
+  return true
 end
 
 -- 历史上限（v0.3.109, tmux history-limit 移植）: 2MB 真机内存约束下
@@ -3673,6 +3789,7 @@ end
 -- 会跳过未变行 → 空白残留——必须全清）+ 标记全部可见行脏 + flushDirty。
 function tui.redrawContent()
   local g = component.gpu
+  syncInputHeight()  -- v0.3.112: 内容区高度随输入框动态——先同步再取边界
   local x, y, w, h = getContentBounds()
   -- v0.3.110 字体全黑修复: fill 前必须同时设置 foreground + background。
   -- v0.3.108 引入选中反色后，drawRow 选中段把 fg 改成 background(黑)，
@@ -3996,7 +4113,10 @@ function tui.setInputBuffer(text)
   state.completionCycle = nil
   state.sel = nil
   state.sel_active = nil
-  pcall(tui.drawInput)
+  state.inputFollow = true
+  -- v0.3.112: 注入内容可能改变输入框高度 → 布局全量重绘
+  syncInputHeight()
+  pcall(tui.redrawContent)
 end
 
 -- 清除内容区选中（无复制）
@@ -4008,34 +4128,41 @@ function tui.clearContentSelection()
   end
 end
 
+-- 滚动视图（v0.3.112 防闪烁）: 新 offset 与旧值相同（到顶/底边界）→
+-- no-op 直接 return（边界快速滚动不再高频全屏重绘）; 不同 → 只重绘
+-- 内容区行 + 状态栏（[Scroll n] 指示联动）。**不用 redrawContent**——
+-- 旧实现 fill 全屏擦除再重画 = 滚动闪烁的根因; 滚动重绘 = 每行一次
+-- set 覆盖，无 fill 闪黑。行缓存无需手动清: scrollOffset 变化 → 每行
+-- history idx 变 → drawRow 文本比较自然 miss 重画; 内容未变的行命中
+-- 缓存跳过是正确行为（省写屏）。
+local function scrollView(newOffset)
+  newOffset = math.max(0, newOffset or 0)
+  if newOffset == state.scrollOffset then return end
+  state.scrollOffset = newOffset
+  local _, y, _, h = getContentBounds()
+  redrawRowRange(y, y + h - 1)
+  pcall(tui.drawStatus)
+end
+
 function tui.scrollUp(lines)
   lines = lines or 1
   local _, _, _, h = getContentBounds()
   local maxScroll = math.max(0, #state.history - h)
-  state.scrollOffset = math.min(maxScroll, state.scrollOffset + lines)
-  -- 滚动后行内容移动: 行缓存作废（vim LineOffset 失效同语义）
-  state.lineCache = {}
-  pcall(tui.redrawContent)
+  scrollView(math.min(maxScroll, state.scrollOffset + lines))
 end
 
 function tui.scrollDown(lines)
   lines = lines or 1
-  state.scrollOffset = math.max(0, state.scrollOffset - lines)
-  state.lineCache = {}  -- 滚动后行缓存作废
-  pcall(tui.redrawContent)
+  scrollView(state.scrollOffset - lines)
 end
 
 function tui.scrollToBottom()
-  state.scrollOffset = 0
-  state.lineCache = {}  -- 滚动后行缓存作废
-  pcall(tui.redrawContent)
+  scrollView(0)
 end
 
 function tui.scrollToTop()
   local _, _, _, h = getContentBounds()
-  state.scrollOffset = math.max(0, #state.history - h)
-  state.lineCache = {}  -- 滚动后行缓存作废
-  pcall(tui.redrawContent)
+  scrollView(math.max(0, #state.history - h))
 end
 
 -- 浏览位置吸附（v0.3.111）: 落到宽字符 padding 格时向左回走到字符起点
@@ -4145,97 +4272,126 @@ end
 -- 翻页步长（半屏）——/up /down 命令与 PgUp/PgDn 失效时的兜底
 -- scrollSafe 时内容区矮 1 行 → 步长同步 -1，与内容区一致
 function tui.pageStep()
-  return math.max(1, state.height - 4 - (state.scrollSafe and 1 or 0))
+  -- v0.3.112: 内容区高度动态（输入框自动增高）——PgUp/PgDn 步长跟随
+  local _, _, _, h = getContentBounds()
+  return math.max(1, h - 1)
 end
 
--- 多行 buffer 支持: 粘贴内容（含 \n）完整保留，输入行只显示最后一行，
--- 编辑限定在最后一行（跨行编辑不做），Enter 提交整个多行内容。
--- 返回 buffer 中最后一个 \n 的【字符】位置（无则 0）——与 inputCursor
--- 的字符语义一致（usub 操作字符，避免中文混用时字节/字符错位）。
-local function lastLineStart(buffer)
-  local idx = 0
-  local pos = 0
-  for ch in tostring(buffer):gmatch("([\1-\127\194-\244][\128-\191]*)") do
-    pos = pos + 1
-    if ch == "\n" then idx = pos end
-  end
-  return idx
-end
-
+-- 多行 buffer 支持（v0.3.112 起编辑边界改用 lineBoundsAt——光标所在行;
+-- 本函数"最后一行起点"语义已由输入框多行窗口化 + 跨行编辑取代）。
 -- 绘制输入行（底部: 提示符 + 最后一行文本 + 反色块光标 + Tab 候选提示;
 -- scrollSafe 时上移一行, 最底行 h 永不写入——杜绝终端滚动型模拟器触发整屏上滚）
 -- v0.3.72 拖选高亮: state.sel = {a=字符索引, b=字符索引}（输入缓冲内），
 -- a==b 时无选中。选中段用反色背景绘制（先画文本→再画选中段覆盖）。
 -- GTNH 组件无 setClipboard API——复制目标为 state.clipboard（进程内
 -- 剪贴板，Ctrl+V 粘贴优先使用），跨游戏剪贴板不可行。
+-- 绘制输入框（v0.3.112 重写: 多行窗口化自动增高）:
+-- 底部 inputHeight 行（≤ MAX_INPUT_HEIGHT）显示 inputScroll 起的窗口;
+-- 首可见行前缀 ">> "（多行）/"> "（单行），其余行 "   " 缩进（同宽）;
+-- 光标所在行渲染反色块光标; 状态栏在输入框上方（drawStatus 已联动）。
+-- 窗口跟随光标（state.inputFollow）: 光标行移出窗口时自动滚动; 手动
+-- 滚轮浏览输入历史时关闭跟随。
+-- state.sel（0 基 [a,b) 字符区间）跨行渲染: 每窗口行切片反色。
+-- v0.3.72 拖选高亮 + v0.3.111 宽字符列换算保留。
 function tui.drawInput()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
-  local y = state.height - (state.scrollSafe and 1 or 0)
-  g.setBackground(tui.colors.background)
-  g.fill(1, y, state.width, 1, " ")
-  local line_start = lastLineStart(state.inputBuffer)
-  local multiline = line_start > 0
-  g.setForeground(tui.colors.prompt)
-  g.set(2, y, multiline and ">> " or "> ")
-  g.setForeground(tui.colors.foreground)
-  local inputStart = multiline and 5 or 4
-  local maxWidth = state.width - inputStart - 1
-  -- 只显示最后一行（历史行提交时在内容区打印）
-  local displayText = multiline and usub(state.inputBuffer, line_start + 1)
-    or state.inputBuffer
-  local cursorInLine = math.max(0, state.inputCursor - line_start)
-  -- 光标 x 位置按显示宽度（中文占 2 列，字符索引会错位）
-  local cursorX = inputStart + ulen(usub(displayText, 1, cursorInLine))
-  if ulen(displayText) > maxWidth then
-    local start = math.max(1, cursorInLine - maxWidth + 10)
-    displayText = usub(displayText, start, start + maxWidth - 1)
+  syncInputHeight()
+  local ih = math.max(1, state.inputHeight or 1)
+  local inputY = state.height - (state.scrollSafe and 1 or 0)   -- 最底行
+  local y0 = inputY - ih + 1                                    -- 输入框顶行
+  local buf = state.inputBuffer or ""
+  local multiline = buf:find("\n", 1, true) ~= nil
+  local lines, ranges = inputDisplayLines()
+  -- 光标所在显示行（1 基; 行尾归本行, 兜底最后一行）
+  local curLine = #lines
+  for i = 1, #lines do
+    local r = ranges[i]
+    if state.inputCursor >= r[1] and state.inputCursor < r[1] + r[2] then
+      curLine = i break
+    end
   end
-  g.set(inputStart, y, displayText)
-  -- 选中段高亮（先画文本后覆盖：反色背景 + 反色前景；光标在下）
+  for i = 1, #lines do
+    if state.inputCursor == ranges[i][1] + ranges[i][2] then curLine = i break end
+  end
+  -- 窗口滚动: clamp + 光标跟随（非手动浏览时）
+  local maxScroll = math.max(0, #lines - ih)
+  if state.inputScroll > maxScroll then state.inputScroll = maxScroll end
+  if state.inputScroll < 0 then state.inputScroll = 0 end
+  if state.inputFollow ~= false then
+    if curLine < state.inputScroll + 1 then state.inputScroll = curLine - 1 end
+    if curLine > state.inputScroll + ih then state.inputScroll = curLine - ih end
+  end
+  -- 清输入框区域（整框擦除——多行残留防抖）
+  g.setBackground(tui.colors.background)
+  g.fill(1, y0, state.width, ih, " ")
+  -- 1) 每窗口行: 前缀 + 文本
+  for k = 1, ih do
+    local lineIdx = state.inputScroll + k
+    local sy = y0 + k - 1
+    local text = lines[lineIdx] or ""
+    local prefix, textStart
+    if k == 1 and state.inputScroll == 0 then
+      prefix, textStart = (multiline and ">> " or "> "), (multiline and 5 or 4)
+    else
+      prefix, textStart = "   ", 5
+    end
+    g.setForeground(tui.colors.prompt)
+    g.set(2, sy, prefix)
+    g.setForeground(tui.colors.foreground)
+    if text ~= "" then g.set(textStart, sy, text) end
+  end
+  -- 2) 选中段渲染（state.sel 0 基 [sa, sb) 字符区间 → 每窗口行切片）
   local sel = state.sel
   if sel and sel.a ~= sel.b then
     local sa, sb = math.min(sel.a, sel.b), math.max(sel.a, sel.b)
-    -- 相对最后一行（仅选中当前显示行内的部分）
-    local lo, hi = math.max(sa - line_start, 1), math.min(sb - line_start, charCount(displayText))
-    if lo <= hi then
-      local x0 = inputStart + ulen(usub(displayText, 1, lo - 1))
-      local x1 = inputStart + ulen(usub(displayText, 1, hi))
-      if x1 > state.width - 1 then x1 = state.width - 1 end
-      local w = x1 - x0
-      if w > 0 then
-        g.setBackground(tui.colors.foreground)
-        g.setForeground(tui.colors.background)
-        g.set(x0, y, usub(displayText, lo, hi))
-        -- 填充剩余宽度（选中到行尾）
-        if x0 + w < state.width - 1 then
-          g.fill(x0 + w, y, state.width - 1 - x0 - w, 1, " ")
+    for k = 1, ih do
+      local lineIdx = state.inputScroll + k
+      local r = ranges[lineIdx]
+      if r then
+        local lo = math.max(sa, r[1]) - r[1]        -- 0 基行内起点
+        local hi = math.min(sb, r[1] + r[2]) - r[1]  -- 0 基排他终点
+        if lo < hi then
+          local text = lines[lineIdx] or ""
+          local sy = y0 + k - 1
+          local textStart = (k == 1 and state.inputScroll == 0 and not multiline) and 4 or 5
+          local x0 = textStart + ulen(usub(text, 1, lo))
+          local x1 = textStart + ulen(usub(text, 1, hi))
+          if x1 > state.width - 1 then x1 = state.width - 1 end
+          local w = x1 - x0
+          if w > 0 then
+            g.setBackground(tui.colors.foreground)
+            g.setForeground(tui.colors.background)
+            g.set(x0, sy, usub(text, lo + 1, hi))
+            -- 填充剩余宽度（选中到行尾）
+            if x0 + w < state.width - 1 then
+              g.fill(x0 + w, sy, state.width - 1 - x0 - w, 1, " ")
+            end
+            g.setBackground(tui.colors.background)
+            g.setForeground(tui.colors.foreground)
+          end
         end
-        g.setBackground(tui.colors.background)
-        g.setForeground(tui.colors.foreground)
       end
     end
   end
-  -- 反色块光标
+  -- 3) 反色块光标（光标所在行; 最后画——覆盖选中）
+  local rcur = ranges[curLine] or {0, 0}
+  local off = state.inputCursor - rcur[1]
+  local textC = lines[curLine] or ""
+  local kc = curLine - state.inputScroll
+  local syc = y0 + kc - 1
+  local textStartC = (kc == 1 and state.inputScroll == 0 and not multiline) and 4 or 5
+  local cursorX = textStartC + ulen(usub(textC, 1, off))
   if cursorX <= state.width - 1 then
-    local ch = usub(displayText, cursorInLine + 1, cursorInLine + 1)
+    local ch = usub(textC, off + 1, off + 1)
     if ch == "" then ch = " " end
     g.setBackground(tui.colors.foreground)
     g.setForeground(tui.colors.background)
-    g.set(cursorX, y, ch)
+    g.set(cursorX, syc, ch)
     g.setBackground(tui.colors.background)
     g.setForeground(tui.colors.foreground)
   end
-  -- Tab 补全候选提示（输入行末尾）
-  if state.completionCycle and state.completionCycle[2] then
-    local hint = "Tab: " .. tostring(state.completionCycle[2].cmd)
-    if ulen(displayText) + ulen(hint) + inputStart < state.width then
-      g.setForeground(tui.colors.tool)
-      g.set(state.width - ulen(hint) - 1, y, hint)
-      g.setForeground(tui.colors.foreground)
-    end
-  end
-  pcall(term.setCursor, cursorX, y)
+  pcall(term.setCursor, cursorX, syc)
   pcall(term.setCursorBlink, false)
 end
 
@@ -4373,12 +4529,11 @@ function tui.readInput(on_event)
           snapBrowseFromPadding(state.browsePos)
         elseif ch == 106 then -- j: 下移
           local maxScroll = math.max(0, #state.history - bh)
-          if state.browsePos.y >= state.height - 2 then
+          local _, cyb, _, chb = getContentBounds()  -- v0.3.112: 内容区动态高度
+          if state.browsePos.y >= cyb + chb - 1 then
             -- 到底: 滚动内容（视口下移），浏览位置保持
             if state.scrollOffset > 0 then
-              state.scrollOffset = state.scrollOffset - 1
-              state.lineCache = {}
-              pcall(tui.redrawContent)
+              scrollView(state.scrollOffset - 1)  -- v0.3.112: 无 fill 防闪烁
             end
           else
             state.browsePos.y = state.browsePos.y + 1
@@ -4388,9 +4543,7 @@ function tui.readInput(on_event)
             -- 到顶: 滚动内容（视口上移）
             local maxScroll = math.max(0, #state.history - bh)
             if state.scrollOffset < maxScroll then
-              state.scrollOffset = state.scrollOffset + 1
-              state.lineCache = {}
-              pcall(tui.redrawContent)
+              scrollView(state.scrollOffset + 1)  -- v0.3.112: 无 fill 防闪烁
             end
           else
             state.browsePos.y = state.browsePos.y - 1
@@ -4441,7 +4594,11 @@ function tui.readInput(on_event)
         goto continue_browse
       end
 
-      local line_start = lastLineStart(state.inputBuffer)  -- 编辑边界（最后一行起点）
+      -- v0.3.112: 编辑边界 = 光标所在行（多行编辑——Up/Down 跨行移动,
+      -- Left/Right/Backspace/Delete/Home/End 以当前行为界, 不跨行不删
+      -- \n; 历史翻页仅限单行 buffer）
+      local multiline = state.inputBuffer:find("\n", 1, true) ~= nil
+      local line_start, line_end = lineBoundsAt(state.inputBuffer, state.inputCursor)
       if ch == 13 then -- Enter
         local line = state.inputBuffer
         if line == "" or line:match("^%s+$") then
@@ -4461,7 +4618,7 @@ function tui.readInput(on_event)
           state.completionCycle = nil
           return line
         end
-      elseif ch == 8 or code == 14 then -- Backspace（限最后一行，不删 \n）
+      elseif ch == 8 or code == 14 then -- Backspace（限当前行，不删 \n）
         if state.inputCursor > line_start then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
             .. usub(state.inputBuffer, state.inputCursor + 1)
@@ -4483,10 +4640,10 @@ function tui.readInput(on_event)
           state.inputCursor = state.inputCursor - 1
         end
         state.completionCycle = nil
-      elseif code == 205 then -- Right
+      elseif code == 205 then -- Right（限当前行）
         if keyboard.isControlDown and keyboard.isControlDown() then
-          -- Ctrl+Right: 下一个单词边界（字符索引）
-          local len = charCount(state.inputBuffer)
+          -- Ctrl+Right: 下一个单词边界（当前行内）
+          local len = line_end
           local pos = state.inputCursor
           while pos < len and not usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
             pos = pos + 1
@@ -4495,7 +4652,7 @@ function tui.readInput(on_event)
             pos = pos + 1
           end
           state.inputCursor = pos
-        elseif state.inputCursor < charCount(state.inputBuffer) then
+        elseif state.inputCursor < line_end then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
@@ -4505,23 +4662,26 @@ function tui.readInput(on_event)
         else
           state.inputCursor = line_start
         end
-      elseif code == 207 then -- End（buffer 尾 = 最后一行尾; Ctrl=滚到底）
+      elseif code == 207 then -- End（当前行尾; Ctrl=滚到底）
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollToBottom()
         else
-          state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
+          state.inputCursor = line_end  -- v0.3.112: 光标所在行尾（原 buffer 尾）
         end
-      elseif code == 211 then -- Delete（最后一行内）
-        local len = charCount(state.inputBuffer)
+      elseif code == 211 then -- Delete（当前行内）
+        local len = line_end
         if state.inputCursor < len then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
             .. usub(state.inputBuffer, state.inputCursor + 2)
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 否则历史上翻（多行 buffer 时禁用）
+      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 多行 → 光标上移一行; 单行 → 历史上翻
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollUp(1)
-        elseif line_start == 0 and #state.cmdHistory > 0 then
+        elseif multiline then
+          -- v0.3.112 多行编辑: 列保持上移一个显示行（clamp 到目标行宽）
+          moveCursorByDisplayLine(-1)
+        elseif #state.cmdHistory > 0 then
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -4529,10 +4689,13 @@ function tui.readInput(on_event)
             state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           end
         end
-      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 否则历史下翻（多行时禁用）
+      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 多行 → 光标下移一行; 单行 → 历史下翻
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollDown(1)
-        elseif line_start == 0 and state.cmdHistoryIndex > 0 then
+        elseif multiline then
+          -- v0.3.112 多行编辑: 列保持下移一个显示行
+          moveCursorByDisplayLine(1)
+        elseif state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             state.inputBuffer = state.savedInput
@@ -4592,7 +4755,15 @@ function tui.readInput(on_event)
         -- 并显示实际值；若状态栏仍无变化则事件根本未到达 agent。
         tui.setStatus("kd?" .. tostring(char) .. "/" .. tostring(code))
       end
-      pcall(tui.drawInput)
+      -- v0.3.112: 输入高度随内容变化（粘贴/编辑增删行）→ 内容区高度变
+      -- → 全量重绘; 高度不变 → 只重绘输入框（防闪烁）; 任何键活动
+      -- = 焦点回到光标 → 输入窗口恢复跟随
+      state.inputFollow = true
+      if syncInputHeight() then
+        pcall(tui.redrawContent)
+      else
+        pcall(tui.drawInput)
+      end
     elseif ev == "clipboard" then
       if char then
         -- v0.3.106 改: Ctrl+V 恢复游戏剪贴板粘贴（用户: 选中复制
@@ -4607,7 +4778,13 @@ function tui.readInput(on_event)
         state.completionCycle = nil
         state.sel = nil
         state.sel_active = nil
-        pcall(tui.drawInput)
+        -- v0.3.112: 粘贴多行可能增高输入框 → 内容区高度变 → 全量重绘
+        state.inputFollow = true
+        if syncInputHeight() then
+          pcall(tui.redrawContent)
+        else
+          pcall(tui.drawInput)
+        end
       end
     elseif ev == "touch" or ev == "drag" then
       -- 指针定位 + 拖选（v0.3.68 点击定位；v0.3.72 拖选高亮+Ctrl+C
@@ -4623,20 +4800,25 @@ function tui.readInput(on_event)
       -- 位置才是对的。加类型防御: 非数字直接忽略（不崩溃）。
       local tx, ty, button = sig[3], sig[4], sig[5]
       if type(tx) == "number" and type(ty) == "number" then
-        local inputY = state.height - (state.scrollSafe and 1 or 0)
-        if ty == inputY then
-          -- 输入行: 按列换算字符索引（第 1 列是边框，prompt 从 4/5 列起）
-          local line_start = lastLineStart(state.inputBuffer)
-          local multiline = line_start > 0
-          local inputStart = multiline and 5 or 4
-          local rel = tx - inputStart
+        state.lastTouchY = ty  -- v0.3.112 滚轮路由: 最后点击位置决定滚哪边
+        local inputY = state.height - (state.scrollSafe and 1 or 0)   -- 输入框底行
+        local ih = math.max(1, state.inputHeight or 1)
+        local inputTop = inputY - ih + 1                              -- 输入框顶行
+        if ty >= inputTop and ty <= inputY then
+          -- 输入框（v0.3.112 多行窗口化）: 点击 y → 窗口内行 k → 显示行
+          -- → 该行字符起点 + 列换算（charIndexAtCol——中文落在 padding
+          -- 格定位到该字符）→ inputCursor。点击可见行即编辑该行。
+          local lines, ranges, multiline = inputDisplayLines()
+          local k = ty - inputTop                 -- 窗口内行号 0 基
+          local lineIdx = state.inputScroll + k + 1  -- 1 基显示行
+          if lineIdx < 1 then lineIdx = 1 end
+          if lineIdx > #lines then lineIdx = #lines end
+          local r = ranges[lineIdx] or {0, 0}
+          local text = lines[lineIdx] or ""
+          local textStart = (k == 0 and state.inputScroll == 0 and not multiline) and 4 or 5
+          local rel = tx - textStart
           if rel < 0 then rel = 0 end
-          -- 列 → 字符索引（逐字符累积显示宽度; v0.3.111 抽取为
-          -- charIndexAtCol 复用——中文 2 列/字符，落在 padding 格定位到
-          -- 该字符）
-          local displayText = multiline and usub(state.inputBuffer, line_start + 1)
-            or state.inputBuffer
-          local charIdx = line_start + charIndexAtCol(displayText, rel)
+          local charIdx = r[1] + charIndexAtCol(text, rel)
           if ev == "touch" then
             -- 按下: 起点 = 终点 = 点击位（清除旧选中）
             state.sel = {a = charIdx, b = charIdx}
@@ -4646,13 +4828,13 @@ function tui.readInput(on_event)
             state.sel.b = charIdx
           end
           state.inputCursor = charIdx
+          state.inputFollow = true  -- 点击输入框 → 恢复光标跟随
           state.completionCycle = nil
           pcall(tui.drawInput)
         elseif ev == "drag" and state.sel and state.sel_active then
-          -- 拖出输入行: 终点 = 行首/行尾（向拖动方向延伸）
-          local line_start = lastLineStart(state.inputBuffer)
-          local len = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
-          state.sel.b = ty < inputY and line_start or len
+          -- 拖出输入框: 终点 = 锚点所在行行首/行尾（向拖动方向延伸）
+          local as_, ae_ = lineBoundsAt(state.inputBuffer, state.sel.a or 0)
+          state.sel.b = ty < inputTop and as_ or ae_
           pcall(tui.drawInput)
         else
           -- 内容区选中（v0.3.105 修复）: 原结构误放在"坐标非数字"的
@@ -4686,20 +4868,17 @@ function tui.readInput(on_event)
           tx = math.max(2, math.min(state.width - 1, tx))
           if ty < cy and state.scrollOffset < maxScroll then
             -- 顶部之上: 视口向更早历史滚（scrollOffset+1，内容下移1行）
-            state.scrollOffset = state.scrollOffset + 1
-            state.lineCache = {}
+            -- v0.3.112: 先平移选中坐标再 scrollView（无 fill 全屏擦除）
             state.csel.ay = math.min(cy + ch - 1, state.csel.ay + 1)
             state.csel.by = math.min(cy + ch - 1, state.csel.by + 1)
             ty = cy
-            pcall(tui.redrawContent)
+            scrollView(state.scrollOffset + 1)
           elseif ty > cy + ch - 1 and state.scrollOffset > 0 then
             -- 底部之下: 视口向更晚历史滚（scrollOffset-1，内容上移1行）
-            state.scrollOffset = state.scrollOffset - 1
-            state.lineCache = {}
             state.csel.ay = math.max(cy, state.csel.ay - 1)
             state.csel.by = math.max(cy, state.csel.by - 1)
             ty = cy + ch - 1
-            pcall(tui.redrawContent)
+            scrollView(state.scrollOffset - 1)
           else
             -- 常规拖动（视口内）: 增量重绘受影响行区间
             local old_a, old_b = normalizeCsel()
@@ -4738,11 +4917,36 @@ function tui.readInput(on_event)
       -- 鼠标滚轮: 事件布局同 touch——sig[2]=screen地址, sig[3]=x,
       -- sig[4]=y, sig[5]=delta（TextBuffer.scala:862 sendMouseEvent
       -- 传 delta; v0.3.103 误用 sig[4]=delta 实为 y——修正 sig[5]）
+      -- v0.3.112 滚轮路由（用户设计: "通过...最后点击的位置分辨 scroll
+      -- 的是对话框还是输入框"）: 最后 touch/drag 的 y 在输入框区域 →
+      -- 滚输入窗口（inputScroll ∓ delta, 边界 no-op 防闪烁——同 A）;
+      -- 否则滚内容区。无 touch 记录 → 默认滚内容区（旧行为）。
       local delta = sig[5]
-      if delta == 1 then
-        tui.scrollUp(3)
-      elseif delta == -1 then
-        tui.scrollDown(3)
+      local ih = math.max(1, state.inputHeight or 1)
+      local inputTop = state.height - ih - (state.scrollSafe and 1 or 0) + 1
+      local ly = state.lastTouchY
+      if ly and ly >= inputTop then
+        local lines = inputDisplayLines()
+        local maxScroll = math.max(0, #lines - ih)
+        if delta == 1 then
+          if state.inputScroll > 0 then
+            state.inputScroll = state.inputScroll - 1
+            state.inputFollow = false  -- 手动浏览输入历史: 不跟随光标
+            pcall(tui.drawInput)
+          end
+        elseif delta == -1 then
+          if state.inputScroll < maxScroll then
+            state.inputScroll = state.inputScroll + 1
+            state.inputFollow = false
+            pcall(tui.drawInput)
+          end
+        end
+      else
+        if delta == 1 then
+          tui.scrollUp(3)
+        elseif delta == -1 then
+          tui.scrollDown(3)
+        end
       end
     end
     -- 浏览模式 continue（v0.3.109 P1-1）: browse 分支按键处理后
@@ -4827,6 +5031,25 @@ end
 function tui.debug_set_buffer(s)
   state.inputBuffer = tostring(s or "")
   state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
+  state.inputFollow = true
+  syncInputHeight()  -- v0.3.112: 注入多行 → 高度/窗口立即同步
+end
+
+-- v0.3.112 测试只读钩子（输入框多行 + 滚动防闪烁断言用）
+function tui.debug_input_height()
+  return state.inputHeight or 1
+end
+function tui.debug_input_scroll()
+  return state.inputScroll or 0
+end
+function tui.debug_input_cursor()
+  return state.inputCursor or 0
+end
+function tui.debug_input_buffer()
+  return state.inputBuffer or ""
+end
+function tui.debug_scroll_offset()
+  return state.scrollOffset or 0
 end
 
 return tui

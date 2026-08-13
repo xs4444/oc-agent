@@ -77,6 +77,9 @@ local GPU_Screen = {}   -- [y][x] = char
 local GPU_FG = {}       -- [y][x] = 前景色
 local GPU_BG = {}       -- [y][x] = 背景色
 local GPU_curFG, GPU_curBG = 0xffffff, 0x000000
+-- v0.3.112: gpu.set 调用计数（滚动防闪烁测试——断言边界滚动 no-op
+-- 时不再全屏重绘; 只计 set, 不计 fill）
+local GPU_setCount = 0
 local function gpu_ensure()
   if GPU_Screen[1] then return end
   for y = 1, GPU_H do
@@ -100,6 +103,7 @@ end
 -- browse 吸附都是死代码）。
 local function gpu_set(x, y, text)
   gpu_ensure()
+  GPU_setCount = GPU_setCount + 1
   text = tostring(text or "")
   local col = x
   for ch in text:gmatch("([\1-\127\194-\244][\128-\191]*)") do
@@ -191,6 +195,14 @@ function mock_component.debug_gpu_reset()
   GPU_FG = {}
   GPU_BG = {}
   GPU_curFG, GPU_curBG = 0xffffff, 0x000000
+  GPU_setCount = 0
+end
+-- v0.3.112: gpu.set 调用计数（滚动防闪烁测试: 边界滚动 no-op = 0 次 set）
+function mock_component.debug_gpu_set_count()
+  return GPU_setCount
+end
+function mock_component.debug_gpu_set_reset()
+  GPU_setCount = 0
 end
 
 function mock_component.list(filter)
@@ -549,6 +561,12 @@ local keyboard_proxy = setmetatable({}, {
 local function keyboard_isAvailable() return true end
 keyboard_proxy.isAvailable = keyboard_isAvailable
 keyboard_proxy.isKeyDown = function() return false end
+-- v0.3.112: 真机 keyboard 有 isControlDown/isShiftDown/isAltDown——
+-- __index 兜底会返回抛错的 invoke 代理（未注册地址），方向键/Home/
+-- End 分支的 Ctrl 组合检测一调用即炸。显式提供（返回 false = 无修饰键）。
+keyboard_proxy.isControlDown = function() return false end
+keyboard_proxy.isShiftDown = function() return false end
+keyboard_proxy.isAltDown = function() return false end
 mock_component.keyboard = keyboard_proxy
 OC.keyboard = keyboard_proxy
 
