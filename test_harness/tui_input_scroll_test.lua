@@ -1,0 +1,335 @@
+-- ════════════════════════════════════════════════════════════════
+-- TUI Input Scroll + Auto-Height Regression Test（v0.3.112）
+--
+-- 真机 bug 回归 + 用户设计新功能验证:
+--   A. 滚轮快速滚动闪烁（即使到顶/底）——根因: scrollUp/Down/ToTop/
+--      ToBottom 无条件 lineCache={} + redrawContent（fill 全屏擦除再
+--      重画）→ 到顶/底 offset 不变仍全屏重绘 = 高频全屏 fill = 闪黑。
+--      修复: scrollView() 边界 no-op + 只重绘内容区行（无 fill）。
+--   B. 输入框自动增高 + 滚轮换行（用户原话: "类似其他经典 agent 的
+--      输入框。根据行数自动增高（占用对话行），到一定高度时，滚轮
+--      换行。通过光标所在的位置或最后点击的位置，分辨 scroll 的是
+--      对话框还是输入框。"）——窗口化输入框（MAX_INPUT_HEIGHT=8）+
+--      lastTouchY 路由滚轮。
+--
+-- 依赖 oc_mock 增强（v0.3.112）: debug_gpu_set_count()/set_reset()
+-- （gpu.set 调用计数——断言边界滚动 no-op 时不再全屏重绘）。
+--
+-- 运行:
+--   独立:  lua test_harness/tui_input_scroll_test.lua
+--   接入:  run_tests.lua 设置 _IN_RUN_TESTS=true 后 dofile，
+--          本文件跳过 os.exit 并 return pass, fail 由宿主累加。
+-- ════════════════════════════════════════════════════════════════
+
+io.stdout:setvbuf("no")
+
+-- 环境搭建（幂等: 被 run_tests dofile 时 oc_mock 已加载、agent 已加载）
+if not package.loaded["oc_mock"] then
+  package.path = "test_harness/?.lua;" .. package.path
+end
+if not os.sleep then os.sleep = function() end end
+local oc_mock = require("oc_mock")
+component = oc_mock.component
+computer = oc_mock.computer
+filesystem = oc_mock.filesystem
+shell = oc_mock.shell
+internet = oc_mock.internet
+serialization = oc_mock.serialization
+event = oc_mock.event
+keyboard = oc_mock.keyboard
+for k, v in pairs(oc_mock) do
+  if type(v) == "table" then package.loaded[k] = v end
+end
+_TEST_MODE = true
+if not package.loaded["agent.tui"] then
+  pcall(dofile, "src/agent/init.lua")
+end
+local ok_tui, tui = pcall(require, "agent.tui")
+if not ok_tui or type(tui) ~= "table" then
+  print("FAIL tui_input_scroll_test: agent.tui load failed: " .. tostring(ok_tui))
+  os.exit(1)
+end
+
+local pass, fail = 0, 0
+local function test(name, cond, detail)
+  if cond then
+    pass = pass + 1
+    print("PASS " .. name)
+  else
+    fail = fail + 1
+    print("FAIL " .. name .. (detail and (" -- " .. tostring(detail)) or ""))
+  end
+end
+
+local function q(...)
+  local t = {...}
+  table.insert(oc_mock._event_queue, t)
+end
+local function qKey(char, code)
+  q("key_down", "kb-addr", char, code, "player")
+end
+local function cell(x, y)
+  local scr = component.debug_gpu_screen()
+  return (scr[y] and scr[y][x]) or {ch = "", fg = -1, bg = -1}
+end
+
+-- 30 行历史（ih=1 时内容区 h=22 → maxScroll=8; ih=8 时 h=15 → maxScroll=15）
+local function fresh30()
+  component.debug_gpu_reset()
+  pcall(tui.init, {})
+  for i = 1, 30 do tui.print("line " .. i, tui.colors.user) end
+  tui.redrawContent()
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- A. 滚动防闪烁（v0.3.112）
+--    边界 no-op: 到顶/到底后继续滚 → gpu.set 计数 0（零重绘）;
+--    有效滚动: 计数 > 0（每行一次 set 覆盖，无 fill 全屏擦除）。
+-- ════════════════════════════════════════════════════════════════
+fresh30()
+tui.scrollToTop()  -- offset 0 → 8
+component.debug_gpu_set_reset()
+tui.scrollUp(1)    -- 已在顶部（8=8）→ no-op
+test("A: scrollUp at top is no-op (0 gpu.set)",
+  component.debug_gpu_set_count() == 0,
+  "count=" .. tostring(component.debug_gpu_set_count()))
+tui.scrollToBottom()  -- 8 → 0（有效滚动, 有重绘）
+component.debug_gpu_set_reset()
+tui.scrollDown(1)  -- 已在底部（0=0）→ no-op
+test("A: scrollDown at bottom is no-op (0 gpu.set)",
+  component.debug_gpu_set_count() == 0,
+  "count=" .. tostring(component.debug_gpu_set_count()))
+component.debug_gpu_set_reset()
+tui.scrollUp(3)    -- 0 → 3（有效滚动: 只重绘内容区行, 不 fill）
+test("A: real scroll redraws without crash", true)
+test("A: real scroll uses row redraw (set count > 0)",
+  component.debug_gpu_set_count() > 0,
+  "count=" .. tostring(component.debug_gpu_set_count()))
+
+-- ════════════════════════════════════════════════════════════════
+-- B1. 输入框自动增高: inputHeight = 显示行数（上限 8）; 内容区/状态栏
+--     随之让位（status y = 屏高 - inputHeight; 输入框顶 = 屏高-ih+1）。
+-- ════════════════════════════════════════════════════════════════
+component.debug_gpu_reset()
+pcall(tui.init, {})
+test("B1: default input height 1", tui.debug_input_height() == 1,
+  "h=" .. tostring(tui.debug_input_height()))
+tui.debug_set_buffer("l1\nl2\nl3")
+test("B1: 3-line buffer -> height 3", tui.debug_input_height() == 3,
+  "h=" .. tostring(tui.debug_input_height()))
+pcall(tui.drawInput)
+pcall(tui.redrawContent)
+test("B1: status row moved to y=22 (25-3)", cell(2, 22).ch == "R",
+  "ch=" .. tostring(cell(2, 22).ch))
+test("B1: input box rows 23-25: line1 at (5,23)", cell(5, 23).ch == "l",
+  "ch=" .. tostring(cell(5, 23).ch))
+test("B1: multiline prompt >> at col 2", cell(2, 23).ch == ">",
+  "ch=" .. tostring(cell(2, 23).ch))
+test("B1: line3 at (5,25)", cell(5, 25).ch == "l" and cell(6, 25).ch == "3",
+  "c5=" .. tostring(cell(5, 25).ch) .. " c6=" .. tostring(cell(6, 25).ch))
+tui.debug_set_buffer("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12")
+test("B1: 12-line buffer capped at height 8", tui.debug_input_height() == 8,
+  "h=" .. tostring(tui.debug_input_height()))
+pcall(tui.redrawContent)
+test("B1: with height 8 status at y=17", cell(2, 17).ch == "R",
+  "ch=" .. tostring(cell(2, 17).ch))
+
+-- ════════════════════════════════════════════════════════════════
+-- B2. 输入窗口滚轮: lastTouchY 在输入框区域 → 滚 inputScroll; 边界
+--     no-op（计数与基线相同 = 零额外重绘）; 有效滚动只重绘输入框。
+--     12 行 paste: ih=8, 输入框顶=18, maxScroll=12-8=4。
+--     注: readInput 入口清空 buffer → 每次 run 都以 clipboard 粘贴
+--     重建多行内容（正是真机用户粘贴多行的生产路径）。粘贴后光标在
+--     末行 → drawInput 光标跟随滚到 inputScroll=4（maxScroll）——
+--     先 4 次上滚到顶（s=0）再测各边界。
+-- ════════════════════════════════════════════════════════════════
+local function paste12()
+  q("clipboard", "kb-addr", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12")
+end
+-- run0: paste + touch 输入框 (5,18) → 基线（无滚轮; 光标跟随 → s=4）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+q("interrupted")
+pcall(tui.readInput, nil)
+local c_base = component.debug_gpu_set_count()
+test("B2: paste cursor-follow scrolls to max (s=4)", tui.debug_input_scroll() == 4,
+  "s=" .. tostring(tui.debug_input_scroll()))
+-- run1: paste + touch + 上滚 ×4 → 到顶 s=0
+component.debug_gpu_set_reset()
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, 1) end
+q("interrupted")
+pcall(tui.readInput, nil)
+local c_top = component.debug_gpu_set_count()
+test("B2: 4x wheel up reaches top (s=0)", tui.debug_input_scroll() == 0,
+  "s=" .. tostring(tui.debug_input_scroll()))
+-- run2: 同 run1 + 再上滚 ×1（s=0 边界）→ 计数 == c_top（零额外重绘）
+component.debug_gpu_set_reset()
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, 1) end
+q("scroll", "screen-addr", 5, 18, 1)
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B2: input wheel up at top is no-op (no extra redraw)",
+  component.debug_gpu_set_count() == c_top,
+  "top=" .. tostring(c_top) .. " now=" .. tostring(component.debug_gpu_set_count()))
+-- run3: paste + touch + 4 上 + 2 下 → s=2; 窗口显示显示行 3..10
+component.debug_gpu_set_reset()
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, 1) end
+for _ = 1, 2 do q("scroll", "screen-addr", 5, 18, -1) end
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B2: 2x wheel down from top -> inputScroll 2",
+  tui.debug_input_scroll() == 2, "s=" .. tostring(tui.debug_input_scroll()))
+test("B2: window line5 rendered at row 20", cell(6, 20).ch == "5",
+  "ch=" .. tostring(cell(6, 20).ch))
+test("B2: content scroll untouched", tui.debug_scroll_offset() == 0,
+  "off=" .. tostring(tui.debug_scroll_offset()))
+test("B2: input scroll redraws (extra sets)",
+  component.debug_gpu_set_count() > c_top,
+  "top=" .. tostring(c_top) .. " now=" .. tostring(component.debug_gpu_set_count()))
+-- run4: paste + touch + 4 上 + 4 下 → 到底 s=4（maxScroll）
+component.debug_gpu_set_reset()
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, 1) end
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, -1) end
+q("interrupted")
+pcall(tui.readInput, nil)
+local c_max = component.debug_gpu_set_count()
+test("B2: 4x wheel down reaches maxScroll 4", tui.debug_input_scroll() == 4,
+  "s=" .. tostring(tui.debug_input_scroll()))
+-- run5: 同 run4 + 再下滚 ×1（s=4 边界）→ 计数 == c_max（零额外重绘）
+component.debug_gpu_set_reset()
+paste12()
+q("touch", "screen-addr", 5, 18, 0)
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, 1) end
+for _ = 1, 4 do q("scroll", "screen-addr", 5, 18, -1) end
+q("scroll", "screen-addr", 5, 18, -1)
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B2: input wheel down at max is no-op (no extra redraw)",
+  component.debug_gpu_set_count() == c_max,
+  "max=" .. tostring(c_max) .. " now=" .. tostring(component.debug_gpu_set_count()))
+
+-- ════════════════════════════════════════════════════════════════
+-- B3. 滚轮路由: lastTouchY 在内容区 → 滚内容区（scrollOffset）;
+--     无 touch 记录 → 默认滚内容区（旧行为）。内容区高度随 ih 变
+--     （paste 12 行 → ih=8 → h=15, maxScroll=15）。
+-- ════════════════════════════════════════════════════════════════
+component.debug_gpu_reset()
+pcall(tui.init, {})
+for i = 1, 30 do tui.print("line " .. i, tui.colors.user) end
+-- run1: paste 12 行（ih=8, 输入框顶=18）+ touch 内容区 (5,3) → 路由到
+-- 内容区; 上滚 ×2 → offset 6; drop 清 csel → interrupted 退出
+paste12()
+q("touch", "screen-addr", 5, 3, 0)
+q("scroll", "screen-addr", 5, 3, 1)
+q("scroll", "screen-addr", 5, 3, 1)
+q("drop", "screen-addr", 5, 3, 0)
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B3: content wheel scrolls content (offset 6)",
+  tui.debug_scroll_offset() == 6, "off=" .. tostring(tui.debug_scroll_offset()))
+test("B3: input scroll untouched by content wheel (s=4 from paste follow)",
+  tui.debug_input_scroll() == 4, "s=" .. tostring(tui.debug_input_scroll()))
+-- run2: 无 touch → 默认滚内容区
+component.debug_gpu_reset()
+pcall(tui.init, {})
+for i = 1, 30 do tui.print("line " .. i, tui.colors.user) end
+q("scroll", "screen-addr", 5, 20, 1)
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B3: no-touch wheel defaults to content (offset 3)",
+  tui.debug_scroll_offset() == 3, "off=" .. tostring(tui.debug_scroll_offset()))
+
+-- ════════════════════════════════════════════════════════════════
+-- B4. 多行编辑边界（v0.3.112 光标所在行）: 点击中间行定位 inputCursor;
+--     Backspace 限当前行; Up/Down 跨显示行移动（列保持）; End 到行尾;
+--     Home 到行首; 行首 Backspace no-op。
+--     paste "l1\nl2\nl3\nl4": ih=4, 输入框顶=22, 行2 字符区间 {3,2}。
+-- ════════════════════════════════════════════════════════════════
+local function buf4paste()
+  component.debug_gpu_reset()
+  pcall(tui.init, {})
+  q("clipboard", "kb-addr", "l1\nl2\nl3\nl4")
+end
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)  -- 行2 "l2" 中 'l' 后
+q("interrupted")
+pcall(tui.readInput, nil)
+test("B4: click middle line -> cursor 4", tui.debug_input_cursor() == 4,
+  "c=" .. tostring(tui.debug_input_cursor()))
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)
+qKey(8, 14)      -- Backspace: 删 'l'（限当前行, 不删 \n）
+qKey(13, 28)     -- Enter 提交整个 buffer
+local ok_r, res_r = pcall(tui.readInput, nil)
+test("B4: backspace in middle line", ok_r and res_r == "l1\n2\nl3\nl4",
+  "got=" .. tostring(res_r))
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)
+qKey(0, 200)    -- Up: 光标到行1（列保持 → 行1 偏移 1）
+qKey(88, 45)     -- 'X'（插在行1 'l' 后 → lX1）
+qKey(13, 28)
+pcall(tui.readInput, nil)
+res_r = tui.debug_input_buffer()
+test("B4: Up moves to previous display line (col kept)", res_r == "lX1\nl2\nl3\nl4",
+  "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)
+qKey(0, 200)    -- Up → 行1
+qKey(88, 45)     -- 'X'（lX1）
+qKey(0, 208)    -- Down → 行2（列保持 → 行2 末尾）
+qKey(89, 45)     -- 'Y'（l2Y）
+qKey(13, 28)
+pcall(tui.readInput, nil)
+res_r = tui.debug_input_buffer()
+test("B4: Down moves to next display line (col kept)", res_r == "lX1\nl2Y\nl3\nl4",
+  "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)
+qKey(0, 207)    -- End: 光标所在行尾（不是 buffer 尾!）
+qKey(90, 45)     -- 'Z'
+qKey(13, 28)
+pcall(tui.readInput, nil)
+res_r = tui.debug_input_buffer()
+test("B4: End goes to current line end", res_r == "l1\nl2Z\nl3\nl4",
+  "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+buf4paste()
+q("touch", "screen-addr", 6, 23, 0)
+qKey(0, 199)    -- Home: 光标所在行首
+qKey(90, 45)     -- 'Z'
+qKey(13, 28)
+pcall(tui.readInput, nil)
+res_r = tui.debug_input_buffer()
+test("B4: Home goes to current line start", res_r == "l1\nZl2\nl3\nl4",
+  "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+buf4paste()
+q("touch", "screen-addr", 5, 23, 0)  -- 行2 行首（rel=0 → cursor 3）
+qKey(8, 14)      -- Backspace 在行首: no-op
+qKey(13, 28)
+pcall(tui.readInput, nil)
+res_r = tui.debug_input_buffer()
+test("B4: backspace at line start is no-op", res_r == "l1\nl2\nl3\nl4",
+  "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+-- ════════════════════════════════════════════════════════════════
+print(string.format("RESULT: %d pass, %d fail", pass, fail))
+if not _IN_RUN_TESTS then
+  os.exit(fail > 0 and 1 or 0)
+end
+return pass, fail
