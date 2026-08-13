@@ -295,6 +295,11 @@ function tui.init(config)
   state.search = nil
   state.inputBuffer = ""
   state.inputCursor = 0
+  -- v0.3.113 折行缓存: buffer 版本号（每次写 +1, 见 setInputBufferText）+
+  -- 缓存 {version,width,lines,ranges,multiline} + 重算计数（测试断言）
+  state.inputLinesVersion = 0
+  state.inputLinesCache = nil
+  state.inputReflowCount = 0
   -- v0.3.112 输入框多行: 显示高度（自动增高）+ 输入窗口滚动 + 滚轮路由
   -- （最后 touch/drag 的 y 决定 scroll 事件滚内容区还是输入框）
   state.inputHeight = 1
@@ -442,13 +447,35 @@ end
 -- ════════════════════════════════════════
 local MAX_INPUT_HEIGHT = 8
 
+-- inputBuffer 唯一写入口（v0.3.113）: 所有 buffer 修改点统一走这里——
+-- 折行缓存版本号随写自增; 直接赋值会绕过缓存, 下次 inputDisplayLines
+-- 返回脏数据（版本号没变但内容变了 → 假命中）。
+local function setInputBufferText(text)
+  state.inputBuffer = text
+  state.inputLinesVersion = (state.inputLinesVersion or 0) + 1
+end
+
 -- 输入框显示行 + 每行字符区间（0 基半开 [start, start+len)）+ 多行标记。
 -- 与 wrapText 同源折行（同一 gmatch 迭代——"ab\n" 无尾部空行,
 -- 空 buffer → 1 个空行; 与历史换行行为完全一致）。
+-- v0.3.113 折行缓存: buffer 版本号 + 折行宽度未变 → 直接返回缓存——
+-- drawInput/syncInputHeight 每次按键/光标移动/滚动都调本函数, 几千字符
+-- 时每次 O(n) 折行是输入卡顿根因。光标移动不改 buffer → 版本不变 →
+-- 命中缓存（O(1)）。编辑/粘贴 → setInputBufferText 自增版本 → 1 次重算。
+-- 重算次数计数（state.inputReflowCount）暴露给测试断言。
 local function inputDisplayLines()
+  local c = state.inputLinesCache
+  local v = state.inputLinesVersion or 0
+  if c and c.version == v then
+    return c.lines, c.ranges, c.multiline
+  end
   local buf = state.inputBuffer or ""
   local multiline = buf:find("\n", 1, true) ~= nil
   local maxWidth = state.width - (multiline and 6 or 5)
+  if c and c.version == v and c.width == maxWidth then
+    return c.lines, c.ranges, c.multiline
+  end
+  state.inputReflowCount = (state.inputReflowCount or 0) + 1
   local lines, ranges = {}, {}
   local charAcc = 0
   for line in buf:gmatch("([^\n]*)\n?") do
@@ -473,6 +500,8 @@ local function inputDisplayLines()
     end
   end
   if #lines == 0 then lines, ranges = {""}, {{0, 0}} end
+  state.inputLinesCache = {version = v, width = maxWidth,
+    lines = lines, ranges = ranges, multiline = multiline}
   return lines, ranges, multiline
 end
 
@@ -773,6 +802,11 @@ drawRow = function(g, x, screenY, startIdx, idx)
   -- v0.3.111: 按【列】截断（中文占 2 列——旧 usub(entry.text,1,w) 把列宽
   -- 当字符数，中文行显示溢出内容区右缘）
   local line = truncateCols(entry.text, w)
+  -- v0.3.113: 补空格到满宽——scrollView 逐行 g.set 覆盖滚动（无 fill 全屏
+  -- 擦除），行尾不补满会在新行比旧行短时残留旧字符（短行滚上来覆盖
+  -- 长行 → 长行尾部字符残留在屏）。缓存 key 用补满后的 line（选中/搜索
+  -- 三段渲染的 suf 段自然覆盖到行尾）。
+  line = line .. string.rep(" ", math.max(0, w - ulen(line)))
   local selFrom, selTo = selectionSpan(screenY, x, w)
   local selRange = selFrom and {selFrom, selTo} or nil
   -- 搜索高亮段（v0.3.109 P1-3 + v0.3.111 列修正）: search.from/to 为
@@ -973,7 +1007,7 @@ function tui.setInputBuffer(text)
   -- 注入到当前输入行（覆盖多行选中为单行——内容区选中可能含 \n,
   -- 输入行不支持多行编辑; 换行转空格保持可编辑）
   local single = tostring(text):gsub("[\r\n]+", " ")
-  state.inputBuffer = single
+  setInputBufferText(single)
   state.inputCursor = charCount(single)  -- v0.3.111: 字符索引（旧 ulen=列数，中文错位）
   state.completionCycle = nil
   state.sel = nil
@@ -1165,9 +1199,7 @@ function tui.drawInput()
   local ih = math.max(1, state.inputHeight or 1)
   local inputY = state.height - (state.scrollSafe and 1 or 0)   -- 最底行
   local y0 = inputY - ih + 1                                    -- 输入框顶行
-  local buf = state.inputBuffer or ""
-  local multiline = buf:find("\n", 1, true) ~= nil
-  local lines, ranges = inputDisplayLines()
+  local lines, ranges, multiline = inputDisplayLines()
   -- 光标所在显示行（1 基; 行尾归本行, 兜底最后一行）
   local curLine = #lines
   for i = 1, #lines do
@@ -1323,14 +1355,13 @@ function tui.readInput(on_event)
     return line
   end
 
-  state.inputBuffer = ""
+  setInputBufferText("")
   state.inputCursor = 0
   state.completionCycle = nil
   local cursorVisible = true
   local lastBlink = now_seconds()
 
   pcall(tui.drawInput)
-
   while true do
     local sig = {event.pull(0.25)}
     local ev, _, char, code = sig[1], sig[2], sig[3], sig[4]
@@ -1485,8 +1516,8 @@ function tui.readInput(on_event)
         end
       elseif ch == 8 or code == 14 then -- Backspace（限当前行，不删 \n）
         if state.inputCursor > line_start then
-          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor - 1)
-            .. usub(state.inputBuffer, state.inputCursor + 1)
+          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor - 1)
+            .. usub(state.inputBuffer, state.inputCursor + 1))
           state.inputCursor = state.inputCursor - 1
           state.completionCycle = nil
         end
@@ -1536,8 +1567,8 @@ function tui.readInput(on_event)
       elseif code == 211 then -- Delete（当前行内）
         local len = line_end
         if state.inputCursor < len then
-          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
-            .. usub(state.inputBuffer, state.inputCursor + 2)
+          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
+            .. usub(state.inputBuffer, state.inputCursor + 2))
         end
         state.completionCycle = nil
       elseif code == 200 then -- Up: Ctrl=上滚 1 行; 多行 → 光标上移一行; 单行 → 历史上翻
@@ -1550,7 +1581,7 @@ function tui.readInput(on_event)
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
-            state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
+            setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
             state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           end
         end
@@ -1563,9 +1594,9 @@ function tui.readInput(on_event)
         elseif state.cmdHistoryIndex > 0 then
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
-            state.inputBuffer = state.savedInput
+            setInputBufferText(state.savedInput)
           else
-            state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
+            setInputBufferText(state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1])
           end
           state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
         end
@@ -1585,7 +1616,7 @@ function tui.readInput(on_event)
         -- "Tab 事件没到达"(状态栏无变化) vs "候选为空"(显示 Tab: no match)
         if #cands > 0 then
           if not state.completionCycle then state.completionCycle = {cands, cands[1]} end
-          state.inputBuffer = state.completionCycle[2].cmd
+          setInputBufferText(state.completionCycle[2].cmd)
           state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           tui.setStatus("Tab: " .. state.completionCycle[2].cmd
             .. (#cands > 1 and (" (" .. #cands .. " candidates)") or ""))
@@ -1608,9 +1639,9 @@ function tui.readInput(on_event)
           -- 有输入时清除选中（高亮区间基于旧文本，输入后错位）
           state.sel = nil
           state.sel_active = nil
-          state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
             .. string.char(ch)
-            .. usub(state.inputBuffer, state.inputCursor + 1)
+            .. usub(state.inputBuffer, state.inputCursor + 1))
           state.inputCursor = state.inputCursor + 1
           state.completionCycle = nil
         end
@@ -1636,9 +1667,9 @@ function tui.readInput(on_event)
         -- state.clipboard（选中复制）——抢占游戏剪贴板。现在选中复制
         -- 走 /paste 命令（读 selected.txt），Ctrl+V 永远是游戏剪贴板。
         local paste = char
-        state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
+        setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
           .. paste
-          .. usub(state.inputBuffer, state.inputCursor + 1)
+          .. usub(state.inputBuffer, state.inputCursor + 1))
         state.inputCursor = state.inputCursor + charCount(paste)  -- v0.3.111: 字符索引
         state.completionCycle = nil
         state.sel = nil
@@ -1894,7 +1925,7 @@ end
 -- 测试钩子: 直接设置输入 buffer（模拟粘贴结果）——ocvm 上事件循环模拟
 -- 不可靠（协程 event.pull 卡死），真机验证渲染路径用此钩子。
 function tui.debug_set_buffer(s)
-  state.inputBuffer = tostring(s or "")
+  setInputBufferText(tostring(s or ""))
   state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
   state.inputFollow = true
   syncInputHeight()  -- v0.3.112: 注入多行 → 高度/窗口立即同步
@@ -1909,6 +1940,10 @@ function tui.debug_input_scroll()
 end
 function tui.debug_input_cursor()
   return state.inputCursor or 0
+end
+-- v0.3.113: 折行重算计数（输入卡顿回归断言: 光标移动 0 重算, 编辑 1 次）
+function tui.debug_input_reflow_count()
+  return state.inputReflowCount or 0
 end
 function tui.debug_input_buffer()
   return state.inputBuffer or ""
