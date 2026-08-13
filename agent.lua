@@ -3490,6 +3490,18 @@ local function json_encode(v)
   return ok and out or tostring(v)
 end
 
+-- ════════════════════════════════════════
+-- 增量重绘（v0.3.109 P0-2）
+-- ════════════════════════════════════════
+
+-- drawRow 前向声明（v0.3.109 bug 修复）: drawRow 定义在文件下方
+-- （选中渲染段，~493 行），但 flushDirty/redrawRowRange 先于它调用——
+-- Lua 词法作用域下，未先声明的 local 在调用点绑定到全局 nil →
+-- "attempt to call a nil value (global 'drawRow')" 真机崩溃
+-- （tui.lua:381）。前向声明让下方 `drawRow = function(...)` 赋值到
+-- 这个 local。
+local drawRow
+
 -- 标记脏行区间（vim mod_top/mod_bot 模式）: 只记录行号集合，
 -- 不立即重画——flushDirty 统一处理。
 local function markDirty(y0, y1)
@@ -3528,6 +3540,13 @@ end
 function tui.redrawContent()
   local g = component.gpu
   local x, y, w, h = getContentBounds()
+  -- v0.3.110 字体全黑修复: fill 前必须同时设置 foreground + background。
+  -- v0.3.108 引入选中反色后，drawRow 选中段把 fg 改成 background(黑)，
+  -- 若上一轮渲染停在选中段，这里只设 bg 不设 fg → fill 用残留黑 fg →
+  -- 整区黑字空格；随后 drawRow 命中行缓存的行跳过不重画 → 该行保持
+  -- 黑字 = "字体全黑，选中才亮"（选中行 drawRow 必 miss 缓存重画才亮）。
+  -- v0.3.106 前无反色（fg 无残留）所以从未暴露。
+  g.setForeground(tui.colors.foreground)
   g.setBackground(tui.colors.background)
   g.fill(x - 1, y, w + 2, h, " ")
   -- fill 后所有行缓存作废（屏幕已被抹掉，drawRow 缓存命中=跳过=空白）
@@ -3625,7 +3644,7 @@ end
 -- 匹配段在非选中部分显示）。缓存键加 srch 段（匹配段位置），
 -- 搜索变化时行缓存失配 → 重画。
 -- 返回是否实际写屏（false = 缓存命中跳过）。
-local function drawRow(g, x, screenY, startIdx, idx)
+drawRow = function(g, x, screenY, startIdx, idx)
   local _, _, w = getContentBounds()
   local entry = state.history[idx]
   if not entry then
@@ -3635,6 +3654,7 @@ local function drawRow(g, x, screenY, startIdx, idx)
       return false
     end
     g.setForeground(tui.colors.foreground)
+    g.setBackground(tui.colors.background)
     g.set(x, screenY, string.rep(" ", w))
     state.lineCache[screenY] = {text = "", color = tui.colors.foreground, sel = nil, srch = nil}
     return true
@@ -3672,14 +3692,16 @@ local function drawRow(g, x, screenY, startIdx, idx)
     -- 非选中行: 原色整行 + 可选搜索高亮段（3 段: 前缀/匹配/tool 色/后缀）
     if not srchRange then
       g.setForeground(color)
+      g.setBackground(tui.colors.background)
       g.set(x, screenY, line)
       return true
     end
     local preLen = srchRange[1] - x
     local srchLen = srchRange[2] - srchRange[1] + 1
     local pre = usub(line, 1, preLen)
-    local srch = usub(line, preLen + 1, srchLen)
+    local srch = usub(line, preLen + 1, preLen + srchLen)
     local suf = usub(line, preLen + srchLen + 1)
+    g.setBackground(tui.colors.background)
     if pre ~= "" then
       g.setForeground(color)
       g.set(x, screenY, pre)
@@ -3698,8 +3720,9 @@ local function drawRow(g, x, screenY, startIdx, idx)
   local preLen = selFrom - x
   local selLen = selTo - selFrom + 1
   local pre = usub(line, 1, preLen)
-  local sel = usub(line, preLen + 1, selLen)
+  local sel = usub(line, preLen + 1, preLen + selLen)
   local suf = usub(line, preLen + selLen + 1)
+  g.setBackground(tui.colors.background)
   if pre ~= "" then
     g.setForeground(color)
     g.set(x, screenY, pre)
@@ -3714,6 +3737,13 @@ local function drawRow(g, x, screenY, startIdx, idx)
     g.setForeground(color)
     g.setBackground(tui.colors.background)
     g.set(x + preLen + selLen, screenY, suf)
+  else
+    -- 选中段延伸到行尾（suf 空）: 必须复位 fg/bg——否则残留 fg=黑、
+    -- bg=行色泄漏到下一行 + 下一轮 redrawContent 的 fill（v0.3.110
+    -- fill 前已补 setForeground 防御，这里是根因修复: 每行渲染后
+    -- gpu 状态干净）
+    g.setForeground(tui.colors.foreground)
+    g.setBackground(tui.colors.background)
   end
   return true
 end

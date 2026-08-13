@@ -63,7 +63,109 @@ local OC = {
   _address = "computer-addr-001",
 }
 
+-- 真实 GPU 屏幕模拟（v0.3.109）: 80x25 字符缓冲 + 前景/背景色缓冲 +
+-- fg/bg 状态（与真机 gpu API 语义一致: set/fill 使用当前 fg/bg）。
+-- 用于模拟鼠标渲染测试——断言 drawRow 的颜色输出（字体全黑 bug 的
+-- 本地复现路径: 选中段反色后 fg/bg 状态泄漏到后续行）。
+-- 注意: tui.lua 通过 component.gpu 代理调用（component.invoke 转来）。
+-- 测试可经 oc_mock 导出函数读取缓冲:
+--   oc_mock.debug_gpu_screen()  → {text[y][x], fg[y][x], bg[y][x]}
+--   oc_mock.debug_gpu_fg/bg()   → 当前状态
 local mock_component = {}
+local GPU_W, GPU_H = 80, 25
+local GPU_Screen = {}   -- [y][x] = char
+local GPU_FG = {}       -- [y][x] = 前景色
+local GPU_BG = {}       -- [y][x] = 背景色
+local GPU_curFG, GPU_curBG = 0xffffff, 0x000000
+local function gpu_ensure()
+  if GPU_Screen[1] then return end
+  for y = 1, GPU_H do
+    GPU_Screen[y] = {}
+    GPU_FG[y] = {}
+    GPU_BG[y] = {}
+    for x = 1, GPU_W do
+      GPU_Screen[y][x] = " "
+      GPU_FG[y][x] = GPU_curFG
+      GPU_BG[y][x] = GPU_curBG
+    end
+  end
+end
+local function gpu_set(x, y, text)
+  gpu_ensure()
+  text = tostring(text or "")
+  for i = 1, #text do
+    local ch = text:sub(i, i)
+    if ch ~= "" and y >= 1 and y <= GPU_H and x + i - 1 >= 1 and x + i - 1 <= GPU_W then
+      GPU_Screen[y][x + i - 1] = ch
+      GPU_FG[y][x + i - 1] = GPU_curFG
+      GPU_BG[y][x + i - 1] = GPU_curBG
+    end
+  end
+  return true
+end
+local function gpu_get(x, y)
+  gpu_ensure()
+  if y >= 1 and y <= GPU_H and x >= 1 and x <= GPU_W then
+    return GPU_Screen[y][x]
+  end
+  return " "
+end
+local function gpu_fill(x, y, w, h, text)
+  gpu_ensure()
+  text = tostring(text or " ")
+  local ch = text:sub(1, 1) or " "
+  for yy = y, math.min(GPU_H, y + h - 1) do
+    for xx = x, math.min(GPU_W, x + w - 1) do
+      if yy >= 1 and xx >= 1 then
+        GPU_Screen[yy][xx] = ch
+        GPU_FG[yy][xx] = GPU_curFG
+        GPU_BG[yy][xx] = GPU_curBG
+      end
+    end
+  end
+  return true
+end
+local function OC_gpu(method, ...)
+  gpu_ensure()
+  if method == "set" then
+    return gpu_set(...)
+  elseif method == "get" then
+    return gpu_get(...)
+  elseif method == "fill" then
+    return gpu_fill(...)
+  elseif method == "setForeground" then
+    GPU_curFG = ...
+    return true
+  elseif method == "setBackground" then
+    GPU_curBG = ...
+    return true
+  elseif method == "getForeground" then
+    return GPU_curFG
+  elseif method == "getBackground" then
+    return GPU_curBG
+  end
+  return false
+end
+
+-- 导出调试读取（测试断言用）
+function mock_component.debug_gpu_screen()
+  gpu_ensure()
+  local out = {}
+  for y = 1, GPU_H do
+    out[y] = {}
+    for x = 1, GPU_W do
+      out[y][x] = {ch = GPU_Screen[y][x], fg = GPU_FG[y][x], bg = GPU_BG[y][x]}
+    end
+  end
+  return out
+end
+function mock_component.debug_gpu_reset()
+  GPU_Screen = {}
+  GPU_FG = {}
+  GPU_BG = {}
+  GPU_curFG, GPU_curBG = 0xffffff, 0x000000
+end
+
 function mock_component.list(filter)
   local filter = filter or ""
   local i = 0
@@ -145,6 +247,14 @@ function mock_component.invoke(addr, method, ...)
     return true
   elseif typ == "gpu" and method == "getResolution" then
     return 80, 25
+  elseif typ == "gpu" and (method == "set" or method == "get" or method == "fill"
+      or method == "setForeground" or method == "setBackground"
+      or method == "getForeground" or method == "getBackground") then
+    -- 真实 GPU 屏幕模拟（v0.3.109 鼠标渲染测试）: 维护屏幕缓冲 +
+    -- fg/bg 状态。set/fill 用当前 fg/bg 写字符与颜色——单测可断言
+    -- 渲染结果（此前 invoke 返回 0，drawRow 的字体全黑/状态泄漏
+    -- 无法在本地复现，只能靠真机）。
+    return OC_gpu(method, ...)
   elseif typ == "screen" and method == "isOn" then
     return true
   end
@@ -398,6 +508,23 @@ function mock_thread.waitForAny(threads, timeout)
 end
 
 -- Register mocks globally for agent.lua to use
+-- keyboard 组件（v0.3.110 鼠标测试关键）: tui.readInput 开头检测
+-- keyboard.isAvailable——缺失时回退 io.read 阻塞读行，事件驱动分支
+-- （touch/drag/key_down 处理）永不执行，鼠标渲染测试全假阳性。
+-- 真机 OpenOS 中 keyboard 是全局注入（开机组件），这里显式提供。
+local keyboard_proxy = setmetatable({}, {
+  __index = function(_, method)
+    return function(...)
+      return mock_component.invoke("k1k2k3k4-5678-9abc-def0-1234567890ab", method, ...)
+    end
+  end,
+})
+local function keyboard_isAvailable() return true end
+keyboard_proxy.isAvailable = keyboard_isAvailable
+keyboard_proxy.isKeyDown = function() return false end
+mock_component.keyboard = keyboard_proxy
+OC.keyboard = keyboard_proxy
+
 local M = {
   component = mock_component,
   computer = mock_computer,
@@ -407,11 +534,26 @@ local M = {
   serialization = mock_serialization,
   event = mock_event,
   thread = mock_thread,
+  keyboard = keyboard_proxy,
   -- 事件队列导出（文件服务协议测试用手动入队模拟远端请求）
   _event_queue = OC._event_queue,
 }
 
 -- component.modem — real OC exposes primary component proxies like this
 mock_component.modem = mock_modem
+
+-- component.gpu — real OC exposes primary component proxies like this.
+-- v0.3.109: 此前缺失 → tui.init 里 component.gpu 为 nil → 静默降级
+-- 80x25 → 本地单测从不执行真实渲染（drawRow 崩溃/字体黑均无法暴露）。
+-- proxy: 方法调用 → mock_component.invoke(gpu_addr, method, ...)。
+local GPU_ADDR = "e1e2e3e4-1234-5678-9abc-def012345678"
+local gpu_proxy = setmetatable({}, {
+  __index = function(_, method)
+    return function(...)
+      return mock_component.invoke(GPU_ADDR, method, ...)
+    end
+  end,
+})
+mock_component.gpu = gpu_proxy
 
 return M

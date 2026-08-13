@@ -16,6 +16,7 @@ shell = oc_mock.shell
 internet = oc_mock.internet
 serialization = oc_mock.serialization
 event = oc_mock.event
+keyboard = oc_mock.keyboard
 
 -- Intercept require() to return mocked OC modules
 local orig_require = require
@@ -26,6 +27,7 @@ package.loaded["shell"] = oc_mock.shell
 package.loaded["internet"] = oc_mock.internet
 package.loaded["serialization"] = oc_mock.serialization
 package.loaded["event"] = oc_mock.event
+package.loaded["keyboard"] = oc_mock.keyboard
 
 -- Prevent main() from auto-running
 _TEST_MODE = true
@@ -1818,6 +1820,27 @@ do
   --    → nil（安全路径，不崩）。通过 init 后直接操作（内部 state 不可
   --    直接访问——用 readInput 事件模拟不可行，验证对外 API 安全即可）
   pcall(tui_mod2.cleanup)
+end
+
+print("")
+print("═══════════════════════════════════════")
+print("TUI Mouse Render Regression (v0.3.110) Tests")
+print("═══════════════════════════════════════")
+
+-- 模拟鼠标渲染回归（真机 bug ① drawRow nil 崩溃 ② 字体全黑 ③ 搜索
+-- 高亮 usub bug）: 独立文件 tui_mouse_render_test.lua 以 dofile 接入。
+-- 文件内部使用自己的 PASS/FAIL 计数，返回 pass, fail 由本运行器累加。
+do
+  _IN_RUN_TESTS = true
+  local ok_mr, p_mr, f_mr = pcall(dofile, "tui_mouse_render_test.lua")
+  _IN_RUN_TESTS = nil
+  if ok_mr and type(p_mr) == "number" then
+    test("tui mouse render test file runs", true)
+    pass = pass + p_mr
+    fail = fail + f_mr
+  else
+    test("tui mouse render test file runs", false, tostring(p_mr))
+  end
 end
 
 print("")
