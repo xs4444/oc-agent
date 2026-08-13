@@ -268,7 +268,10 @@ local function chat(messages, config, opts)
 
   local headers = build_headers(config)
 
-  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions", headers, body)
+  -- v0.3.118: opts.on_retry 透传给 http_post——重试过程状态透出
+  -- （init.lua 注入 → 状态栏"重试第 N 次 (HTTP xxx) 退避 Xs"）
+  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions",
+    headers, body, opts and opts.on_retry)
   if err then
     return {content = nil, tool_calls = nil, finish_reason = "error", error = err}
   end

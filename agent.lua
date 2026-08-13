@@ -408,7 +408,11 @@ local function http_post_once(url, headers, body)
 end
 
 -- POST with automatic retry（指数退避 + 总预算上限）
-local function http_post(url, headers, body)
+-- v0.3.118: 可选第 4 参 on_retry(attempt, code, err, wait)——每轮退避前
+-- 触发（os.sleep 前）。状态栏透出"重试第 N 次/原因/退避多久"——否则
+-- 重试期间状态栏冻结在 "Thinking..."，用户看到的是无限 thking。
+-- pcall 包裹: 回调异常不阻断重试（透出是增强，不能成为新故障源）。
+local function http_post(url, headers, body, on_retry)
   local attempt = 0
   -- v0.3.99: patch.now() 墙钟——os.clock 是 CPU 时间，os.sleep 退避期间
   -- 不走 → 预算 deadline 永不触发（v0.3.88 教训）
@@ -426,13 +430,24 @@ local function http_post(url, headers, body)
     end
     local now_t = now()
     if now_t >= deadline then
-      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）。v0.3.118: 网络
+      -- 错误路径追加"重试 N 次后预算耗尽"——状态栏/错误摘要能看出不是
+      -- 静默挂起（HTTP 码路径不动 resp, 避免破坏调用方对码的解析）。
+      if err and err ~= "interrupted" then
+        err = err .. "（重试 " .. tostring(attempt) .. " 次后预算耗尽）"
+      end
       return code, resp, err
     end
     local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
     if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
     local remaining = deadline - now_t
     if wait > remaining then wait = remaining end
+    if type(on_retry) == "function" then
+      local ok_r, rerr = pcall(on_retry, attempt, code, err, wait)
+      if not ok_r then
+        -- 回调异常静默（已有 pcall 捕获; 调试时可在此挂 print）
+      end
+    end
     os.sleep(wait)
   end
 end
@@ -1821,7 +1836,10 @@ local function chat(messages, config, opts)
 
   local headers = build_headers(config)
 
-  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions", headers, body)
+  -- v0.3.118: opts.on_retry 透传给 http_post——重试过程状态透出
+  -- （init.lua 注入 → 状态栏"重试第 N 次 (HTTP xxx) 退避 Xs"）
+  local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions",
+    headers, body, opts and opts.on_retry)
   if err then
     return {content = nil, tool_calls = nil, finish_reason = "error", error = err}
   end
@@ -3632,6 +3650,8 @@ function tui.init(config)
   state.cmdHistoryIndex = 0
   state.savedInput = ""
   state.status = "Ready"
+  state.statusSince = now_seconds()  -- v0.3.118: 状态耗时计时（每次切换重计）
+  state.statusTick = now_seconds()   -- v0.3.118: 空闲重绘节流（elapsed 滚动）
   state.statusData = nil
   state.completions = {}
   state.completionCycle = nil
@@ -3671,8 +3691,10 @@ function tui.drawHeader()
   end
 end
 
--- 绘制状态栏（输入框上方 1 行: status 左 + 动态数据右 + scroll 指示;
--- v0.3.112 输入框自动增高 → 状态栏 y = 总高 - inputHeight - scrollSafe）
+-- 绘制状态栏（输入框上方 1 行: 左 status+耗时 + ML 指示 + 右侧动态数据 +
+-- scroll 指示; v0.3.112 输入框自动增高 → 状态栏 y = 总高 - inputHeight -
+-- scrollSafe。v0.3.118: status 后追加紧凑耗时（+Xs / +XmYs），切换状态
+-- 重计时——用户能看出"当前状态已持续多久"（重试/请求挂起不再无限 thking））
 function tui.drawStatus()
   local g = component.gpu
   if not g then return end  -- 无 gpu（测试/降级环境）静默
@@ -3680,24 +3702,18 @@ function tui.drawStatus()
   g.setBackground(tui.colors.status)
   g.setForeground(tui.colors.statusText)
   g.fill(1, y, state.width, 1, " ")
-  g.set(2, y, state.status)
-  -- 多行输入指示（粘贴多行时: 显示行数，提示 Enter 提交全部）
-  if state.inputBuffer and state.inputBuffer:find("\n", 1, true) then
-    local n = 0
-    for _ in state.inputBuffer:gmatch("\n") do n = n + 1 end
-    g.setForeground(tui.colors.tool)
-    g.set(ulen(state.status) + 4, y, "ML:" .. tostring(n + 1) .. " (Enter=send)")
-    g.setForeground(tui.colors.statusText)
-  end
+  -- 右侧: statusData（pcall 防御: 回调异常不中断状态栏绘制——真机曾现
+  -- "完成后只剩 Ready，model/ctx/cache 全丢"）+ Scroll 指示。先画以计算
+  -- 右区占用（左区 status 截断避让）。
+  local rightW = 1  -- 右缘留白
+  local dataW, scrollW = 0, 0
   if state.statusData then
-    -- pcall 防御: 回调内任何异常（如 provider usage 结构怪异）都不应
-    -- 中断状态栏绘制——否则状态栏只剩 status 文本（真机曾现"完成后
-    -- 只剩 Ready，model/ctx/cache 全丢"）
     local ok_data, data = pcall(state.statusData)
     if ok_data and data and data ~= "" then
       local maxw = state.width - 8
       if ulen(data) > maxw then data = usub(data, 1, maxw - 1) .. "~" end
       g.set(state.width - ulen(data) - 1, y, data)
+      dataW = ulen(data) + 1
     end
   end
   if state.scrollOffset > 0 then
@@ -3705,6 +3721,37 @@ function tui.drawStatus()
     g.setForeground(tui.colors.tool)
     g.set(state.width - ulen(st) - 1, y, st)
     g.setForeground(tui.colors.statusText)
+    scrollW = ulen(st) + 1
+  end
+  rightW = rightW + math.max(dataW, scrollW)
+  -- 左侧: status + 耗时（v0.3.118）——截断到右区边界前
+  local left = state.status or "Ready"
+  if state.statusSince then
+    local elapsed = now_seconds() - state.statusSince
+    if elapsed < 0 then elapsed = 0 end
+    if elapsed < 60 then
+      left = left .. " +" .. math.floor(elapsed) .. "s"
+    else
+      left = left .. " +" .. math.floor(elapsed / 60) .. "m"
+        .. (math.floor(elapsed) % 60) .. "s"
+    end
+  end
+  local maxLeft = state.width - rightW - 2
+  if ulen(left) > maxLeft then
+    left = truncateCols(left, math.max(4, maxLeft - 1)) .. "~"
+  end
+  g.set(2, y, left)
+  -- 多行输入指示（放在左区之后; v0.3.118 位置随耗时后移）
+  if state.inputBuffer and state.inputBuffer:find("\n", 1, true) then
+    local n = 0
+    for _ in state.inputBuffer:gmatch("\n") do n = n + 1 end
+    local ml = "ML:" .. tostring(n + 1) .. " (Enter=send)"
+    local mlx = 2 + ulen(left) + 2
+    if mlx + ulen(ml) <= state.width - rightW then
+      g.setForeground(tui.colors.tool)
+      g.set(mlx, y, ml)
+      g.setForeground(tui.colors.statusText)
+    end
   end
   g.setBackground(tui.colors.background)
   g.setForeground(tui.colors.foreground)
@@ -3712,6 +3759,7 @@ end
 
 function tui.setStatus(msg)
   state.status = msg or "Ready"
+  state.statusSince = now_seconds()  -- v0.3.118: 每次状态切换重新计时
   pcall(tui.drawStatus)
 end
 
@@ -4856,6 +4904,13 @@ function tui.readInput(on_event)
       cursorVisible = not cursorVisible
       lastBlink = now
       -- 简化: 闪烁只做定时重绘提示（块光标常亮，不闪烁——机器人帧率友好）
+    end
+    -- v0.3.118: 状态耗时滚动——空闲时每秒重绘状态栏（+Xs 递增可见）。
+    -- chat 阻塞期间本循环不运行, elapsed 静态属预期（重试回调 + 切换
+    -- 重计时已保证关键节点可见）; 有事件时同帧稍后仍会 setStatus/重绘。
+    if now - (state.statusTick or 0) >= 1.0 then
+      state.statusTick = now
+      pcall(tui.drawStatus)
     end
 
     if ev == "interrupted" then
@@ -6965,7 +7020,7 @@ DEPS.rebuild_current = nil
 --               onAssistantText → assistant 输出走角色色，避免与日志
 --               一样渲染成灰色——历史记录与实时输出视觉一致）。
 local UI_INPUT = nil
-local UI_HOOKS = {onToolCall = nil, onAssistantText = nil}
+local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -8165,7 +8220,16 @@ local function process_exchange(messages, config, user_input, persist, session, 
       end
     end
     persist_diag()
-    local response = chat(messages, config, {tools = tools_override})
+    -- v0.3.118 状态透出: 每轮请求前 "Thinking..."（工具执行后状态栏可能
+    -- 停在 "Running X..."——请求阶段应显示请求状态而非工具名）; 重试由
+    -- chat→http_post 的 on_retry 回调实时更新（"重试第 N 次...退避 Xs"）
+    if UI_HOOKS.onChatStart then UI_HOOKS.onChatStart() end
+    local response = chat(messages, config, {
+      tools = tools_override,
+      on_retry = function(attempt, code, err, wait)
+        if UI_HOOKS.onRetry then UI_HOOKS.onRetry(attempt, code, err, wait) end
+      end,
+    })
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
       uptime = t_start,
@@ -8834,6 +8898,22 @@ local function main(config, ...)
       ui.setCompletions(comps)
       UI_INPUT = function() return ui.readInput() end
       UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+      -- v0.3.118 状态透出: 每轮请求 "Thinking..."; 重试实时显示
+      -- （attempt/code/err/wait 来自 http_post 退避前回调——状态栏不再是
+      -- 无限 thking, 用户能看到"在重试、第几次、等多久"）
+      UI_HOOKS.onChatStart = function() ui.setStatus("Thinking...") end
+      UI_HOOKS.onRetry = function(attempt, code, err, wait)
+        local why
+        if code then
+          why = "HTTP " .. tostring(code)
+        elseif err and err ~= "" then
+          why = tostring(err):sub(1, 36)
+        else
+          why = "网络错误"
+        end
+        ui.setStatus("重试第 " .. attempt .. " 次 (" .. why .. ") 退避 "
+          .. math.ceil(wait) .. "s")
+      end
       -- assistant 正文输出走角色色（白色），与历史 printHistory 一致；
       -- 日志/工具行仍由 print 代理渲染为 dim 灰色。
       UI_HOOKS.onAssistantText = function(s) ui.printRole("assistant", s) end
@@ -8854,10 +8934,15 @@ local function main(config, ...)
     end
   end
 
+  -- v0.3.118: 上次交换失败时保留"请求失败"状态直到用户下一次输入——
+  -- 否则顶部 setStatus("Ready") 会把错误状态立刻刷掉（端点报错一闪而过,
+  -- 用户以为还卡在 Thinking）
+  local failStatus = nil
   while true do
     if ui then
       -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
-      ui.setStatus("Ready")
+      ui.setStatus(failStatus or "Ready")
+      failStatus = nil
       local input = ui.readInput(FILE_SERVE_HOOK)  -- 文件服务回调（modem 请求不丢失）
       if input == nil then
         ui.print("^C", ui.colors.dim)
@@ -8884,10 +8969,15 @@ local function main(config, ...)
       -- "> " 前缀 + io.read 回退分支同样打印）——v0.3.24 曾在主循环重复
       -- 回显，v0.3.40 键盘检测修复后事件驱动激活 → 同一消息显示两行
       -- （真机反馈）。此处不再回显。
-      ui.setStatus("Thinking...")
+      ui.setStatus("发送请求...")  -- v0.3.118: 请求前阶段状态（原 Thinking...）
       local result = process_exchange(messages, config, input, true)
       if result and result.error then
         ui.printRole("error", result.error)
+        -- v0.3.118: 非中断错误 → 状态栏明确"请求失败"（含耗时）——不静默
+        -- 卡 Thinking; 中断走上方 print, 状态回 Ready（用户主动取消不算失败）
+        if not tostring(result.error):find("interrupted", 1, true) then
+          failStatus = "请求失败: " .. tostring(result.error):sub(1, 60)
+        end
       end
       ui.print("", ui.colors.foreground)
       goto continue
