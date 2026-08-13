@@ -483,6 +483,69 @@ do
     "err=" .. tostring(c_res and c_res.error)
       .. string.format(" %.2fs", c_elapsed))
 
+  -- ── v0.3.118 重试透出 + 端点报错行为 ──
+  -- 4) on_retry 回调: 持续 500 + 短预算 → 每轮退避前触发, attempt 从 1 起,
+  --    code=500, wait>0（状态栏"重试第 N 次"数据源）
+  internet.request = function() return make_code_handle(500) end
+  http_mod.set_budget(1)
+  local retry_log = {}
+  local ok_r4 = pcall(http_post, "https://mock/500", {}, "{}",
+    function(attempt, code, err, wait)
+      retry_log[#retry_log + 1] = {attempt = attempt, code = code, wait = wait}
+    end)
+  internet.request = real_request
+  http_mod.set_budget(60)
+  test("on_retry callback fires on 5xx", ok_r4 and #retry_log > 0,
+    "n=" .. tostring(#retry_log))
+  test("on_retry attempt starts at 1 with code 500",
+    retry_log[1] and retry_log[1].attempt == 1 and retry_log[1].code == 500,
+    "first=" .. tostring(retry_log[1] and (retry_log[1].attempt .. "/" .. tostring(retry_log[1].code))))
+  test("on_retry wait > 0", retry_log[1] and retry_log[1].wait and retry_log[1].wait > 0,
+    "wait=" .. tostring(retry_log[1] and retry_log[1].wait))
+  test("on_retry attempts increase", #retry_log >= 2
+    and retry_log[2].attempt == 2,
+    "n=" .. tostring(#retry_log) .. " a2=" .. tostring(retry_log[2] and retry_log[2].attempt))
+
+  -- 5) 4xx 永久失败不重试: 400 非瞬态 → 立即返回 code, 无 err, 回调 0 次
+  internet.request = function() return make_code_handle(400) end
+  local retry_log2 = {}
+  local f_code, f_resp, f_err = http_post("https://mock/400", {}, "{}",
+    function() retry_log2[#retry_log2 + 1] = true end)
+  internet.request = real_request
+  test("http 400 no retry (immediate, callback 0x)", f_code == 400
+    and f_err == nil and #retry_log2 == 0,
+    "code=" .. tostring(f_code) .. " err=" .. tostring(f_err)
+      .. " retries=" .. tostring(#retry_log2))
+
+  -- 6) 网络错误路径预算耗尽: err 附"重试 N 次后预算耗尽"（状态栏/摘要
+  --    能看出非静默挂起; HTTP 码路径不动 resp, 不破坏调用方解析）
+  local hang_handle2 = {}
+  setmetatable(hang_handle2, {
+    __call = function() return "" end,
+    __index = { response = function() return 200 end },
+  })
+  internet.request = function() return hang_handle2 end
+  http_mod.set_response_timeout(0.1)
+  http_mod.set_budget(1)
+  local e_code, e_resp, e_err = http_post("https://mock/hang2", {}, "{}",
+    function() end)
+  internet.request = real_request
+  http_mod.set_response_timeout(120)
+  http_mod.set_budget(60)
+  test("network-error budget exhaustion mentions retry count",
+    type(e_err) == "string" and e_err:find("重试", 1, true) ~= nil
+    and e_err:find("read timeout", 1, true) ~= nil,
+    "err=" .. tostring(e_err))
+
+  -- 7) chat() 层: 4xx 返回 error（不重试不挂起, init.lua 错误分支可见）
+  internet.request = function() return make_code_handle(400, '{"error":"bad request"}') end
+  local g_res = agent_test.chat({{role = "user", content = "hi"}},
+    {api_key = "test", model = "mock", api_url = "https://example.test/chat/completions"})
+  internet.request = real_request
+  test("chat 400 returns error without retry",
+    type(g_res) == "table" and g_res.error and g_res.error:find("HTTP 400", 1, true) ~= nil,
+    "err=" .. tostring(g_res and g_res.error))
+
   -- ── 响应体累积上限（结构性内存护栏）──
   -- OOM 无法预测（单次响应峰值不可知）→ 正确解法 = 结构性上限: 所有已知
   -- 分配源设硬上限。http_post_once 的 chunks 累积此前无上限——max_tokens

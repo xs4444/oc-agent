@@ -593,6 +593,47 @@ test("E4: single-line Up browses history (prevcmd)", ok_e4 and res_e4 == "prevcm
   "got=" .. tostring(res_e4))
 
 -- ════════════════════════════════════════════════════════════════
+-- F. 状态栏耗时（v0.3.118）: setStatus 记录 statusSince（墙钟）,
+--    drawStatus 左侧 status + "+Xs"/"+XmYs"; 状态切换重计时。
+--    时间源 computer.uptime()（oc_mock = OC._uptime + os.clock 差）——
+--    debug_advance_uptime 推进断言。状态行 y = 25-ih(1)-0 = 24。
+-- ════════════════════════════════════════════════════════════════
+local function statusRow()
+  local t = {}
+  for x = 2, 30 do t[#t + 1] = cell(x, 24).ch end
+  return table.concat(t):gsub(" +$", "")
+end
+
+component.debug_gpu_reset()
+pcall(tui.init, {})
+pcall(tui.drawStatus)
+test("F1: initial status Ready +0s", statusRow() == "Ready +0s",
+  "got=" .. tostring(statusRow()))
+component.debug_advance_uptime(5)
+pcall(tui.drawStatus)
+test("F1: elapsed grows to +5s", statusRow() == "Ready +5s",
+  "got=" .. tostring(statusRow()))
+component.debug_advance_uptime(57)  -- 累计 62s
+pcall(tui.drawStatus)
+test("F1: elapsed format +1m2s", statusRow() == "Ready +1m2s",
+  "got=" .. tostring(statusRow()))
+tui.setStatus("Thinking...")
+test("F1: status switch resets elapsed to +0s", statusRow() == "Thinking... +0s",
+  "got=" .. tostring(statusRow()))
+component.debug_advance_uptime(3)
+pcall(tui.drawStatus)
+test("F1: new status elapsed +3s", statusRow() == "Thinking... +3s",
+  "got=" .. tostring(statusRow()))
+-- F2: 长状态截断（超右区避让）: 超长 status 不溢出状态行（截断后保留
+-- 前缀; 宽字符在 mock 屏幕按 2 格写含 padding 空格——用 find 断言）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.setStatus("重试第 12 次 (HTTP 503) 退避 300s 请求重试中请稍候")
+test("F2: long status truncated to fit", #statusRow() < 50
+  and statusRow():find("重", 1, true) ~= nil and statusRow():find("HTTP 503", 1, true) ~= nil,
+  "got=" .. tostring(statusRow()))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)

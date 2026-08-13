@@ -143,7 +143,11 @@ local function http_post_once(url, headers, body)
 end
 
 -- POST with automatic retry（指数退避 + 总预算上限）
-local function http_post(url, headers, body)
+-- v0.3.118: 可选第 4 参 on_retry(attempt, code, err, wait)——每轮退避前
+-- 触发（os.sleep 前）。状态栏透出"重试第 N 次/原因/退避多久"——否则
+-- 重试期间状态栏冻结在 "Thinking..."，用户看到的是无限 thking。
+-- pcall 包裹: 回调异常不阻断重试（透出是增强，不能成为新故障源）。
+local function http_post(url, headers, body, on_retry)
   local attempt = 0
   -- v0.3.99: patch.now() 墙钟——os.clock 是 CPU 时间，os.sleep 退避期间
   -- 不走 → 预算 deadline 永不触发（v0.3.88 教训）
@@ -161,13 +165,24 @@ local function http_post(url, headers, body)
     end
     local now_t = now()
     if now_t >= deadline then
-      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）
+      -- 预算耗尽: 返回最后一次结果（调用方按错误处理）。v0.3.118: 网络
+      -- 错误路径追加"重试 N 次后预算耗尽"——状态栏/错误摘要能看出不是
+      -- 静默挂起（HTTP 码路径不动 resp, 避免破坏调用方对码的解析）。
+      if err and err ~= "interrupted" then
+        err = err .. "（重试 " .. tostring(attempt) .. " 次后预算耗尽）"
+      end
       return code, resp, err
     end
     local wait = RETRY_BASE_DELAY * 2 ^ (attempt - 1)
     if wait > RETRY_DELAY_CAP then wait = RETRY_DELAY_CAP end
     local remaining = deadline - now_t
     if wait > remaining then wait = remaining end
+    if type(on_retry) == "function" then
+      local ok_r, rerr = pcall(on_retry, attempt, code, err, wait)
+      if not ok_r then
+        -- 回调异常静默（已有 pcall 捕获; 调试时可在此挂 print）
+      end
+    end
     os.sleep(wait)
   end
 end

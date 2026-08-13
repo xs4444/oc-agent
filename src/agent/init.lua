@@ -153,7 +153,7 @@ DEPS.rebuild_current = nil
 --               onAssistantText → assistant 输出走角色色，避免与日志
 --               一样渲染成灰色——历史记录与实时输出视觉一致）。
 local UI_INPUT = nil
-local UI_HOOKS = {onToolCall = nil, onAssistantText = nil}
+local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -1353,7 +1353,16 @@ local function process_exchange(messages, config, user_input, persist, session, 
       end
     end
     persist_diag()
-    local response = chat(messages, config, {tools = tools_override})
+    -- v0.3.118 状态透出: 每轮请求前 "Thinking..."（工具执行后状态栏可能
+    -- 停在 "Running X..."——请求阶段应显示请求状态而非工具名）; 重试由
+    -- chat→http_post 的 on_retry 回调实时更新（"重试第 N 次...退避 Xs"）
+    if UI_HOOKS.onChatStart then UI_HOOKS.onChatStart() end
+    local response = chat(messages, config, {
+      tools = tools_override,
+      on_retry = function(attempt, code, err, wait)
+        if UI_HOOKS.onRetry then UI_HOOKS.onRetry(attempt, code, err, wait) end
+      end,
+    })
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
       uptime = t_start,
@@ -2022,6 +2031,22 @@ local function main(config, ...)
       ui.setCompletions(comps)
       UI_INPUT = function() return ui.readInput() end
       UI_HOOKS.onToolCall = function(name) ui.setStatus("Running " .. name .. "...") end
+      -- v0.3.118 状态透出: 每轮请求 "Thinking..."; 重试实时显示
+      -- （attempt/code/err/wait 来自 http_post 退避前回调——状态栏不再是
+      -- 无限 thking, 用户能看到"在重试、第几次、等多久"）
+      UI_HOOKS.onChatStart = function() ui.setStatus("Thinking...") end
+      UI_HOOKS.onRetry = function(attempt, code, err, wait)
+        local why
+        if code then
+          why = "HTTP " .. tostring(code)
+        elseif err and err ~= "" then
+          why = tostring(err):sub(1, 36)
+        else
+          why = "网络错误"
+        end
+        ui.setStatus("重试第 " .. attempt .. " 次 (" .. why .. ") 退避 "
+          .. math.ceil(wait) .. "s")
+      end
       -- assistant 正文输出走角色色（白色），与历史 printHistory 一致；
       -- 日志/工具行仍由 print 代理渲染为 dim 灰色。
       UI_HOOKS.onAssistantText = function(s) ui.printRole("assistant", s) end
@@ -2042,10 +2067,15 @@ local function main(config, ...)
     end
   end
 
+  -- v0.3.118: 上次交换失败时保留"请求失败"状态直到用户下一次输入——
+  -- 否则顶部 setStatus("Ready") 会把错误状态立刻刷掉（端点报错一闪而过,
+  -- 用户以为还卡在 Thinking）
+  local failStatus = nil
   while true do
     if ui then
       -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
-      ui.setStatus("Ready")
+      ui.setStatus(failStatus or "Ready")
+      failStatus = nil
       local input = ui.readInput(FILE_SERVE_HOOK)  -- 文件服务回调（modem 请求不丢失）
       if input == nil then
         ui.print("^C", ui.colors.dim)
@@ -2072,10 +2102,15 @@ local function main(config, ...)
       -- "> " 前缀 + io.read 回退分支同样打印）——v0.3.24 曾在主循环重复
       -- 回显，v0.3.40 键盘检测修复后事件驱动激活 → 同一消息显示两行
       -- （真机反馈）。此处不再回显。
-      ui.setStatus("Thinking...")
+      ui.setStatus("发送请求...")  -- v0.3.118: 请求前阶段状态（原 Thinking...）
       local result = process_exchange(messages, config, input, true)
       if result and result.error then
         ui.printRole("error", result.error)
+        -- v0.3.118: 非中断错误 → 状态栏明确"请求失败"（含耗时）——不静默
+        -- 卡 Thinking; 中断走上方 print, 状态回 Ready（用户主动取消不算失败）
+        if not tostring(result.error):find("interrupted", 1, true) then
+          failStatus = "请求失败: " .. tostring(result.error):sub(1, 60)
+        end
       end
       ui.print("", ui.colors.foreground)
       goto continue
