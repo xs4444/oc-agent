@@ -90,16 +90,32 @@ local function gpu_ensure()
     end
   end
 end
+-- v0.3.111: GPU 模拟对齐真机 TextBuffer 宽字符语义（repos/opencomputers
+-- TextBuffer.scala:108-144/245-260 + FontUtils.scala:14 实证）:
+--   · ≥3 字节 UTF-8 宽字符占 2 格——首格存完整字符, 第 2 格写 padding 空格
+--   · ASCII 占 1 格; set 原子覆盖（宽字符一次写 2 格）
+--   · gpu.get 宽字符首格返回完整 3 字节字符, padding 格返回 " "
+-- 旧实现按【字节】逐格写（中文 3 字节拆 3 格）——tui 宽字符渲染路径
+-- 在 mock 下永远测不到真机行为（readContentSelection padding 跳过 /
+-- browse 吸附都是死代码）。
 local function gpu_set(x, y, text)
   gpu_ensure()
   text = tostring(text or "")
-  for i = 1, #text do
-    local ch = text:sub(i, i)
-    if ch ~= "" and y >= 1 and y <= GPU_H and x + i - 1 >= 1 and x + i - 1 <= GPU_W then
-      GPU_Screen[y][x + i - 1] = ch
-      GPU_FG[y][x + i - 1] = GPU_curFG
-      GPU_BG[y][x + i - 1] = GPU_curBG
+  local col = x
+  for ch in text:gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    local wide = ch:byte(1) >= 128
+    if y >= 1 and y <= GPU_H and col >= 1 and col <= GPU_W then
+      GPU_Screen[y][col] = ch
+      GPU_FG[y][col] = GPU_curFG
+      GPU_BG[y][col] = GPU_curBG
+      if wide and col + 1 <= GPU_W then
+        -- padding 空格（真机 TextBuffer 自动补, 原子覆盖 2 格）
+        GPU_Screen[y][col + 1] = " "
+        GPU_FG[y][col + 1] = GPU_curFG
+        GPU_BG[y][col + 1] = GPU_curBG
+      end
     end
+    col = col + (wide and 2 or 1)
   end
   return true
 end
@@ -110,17 +126,28 @@ local function gpu_get(x, y)
   end
   return " "
 end
+-- v0.3.111: fill 同样宽字符感知——首字符宽度决定每格步长（宽字符 →
+-- 每 2 格一对: 字符+padding 空格），与真机 TextBuffer fill 语义一致
 local function gpu_fill(x, y, w, h, text)
   gpu_ensure()
   text = tostring(text or " ")
-  local ch = text:sub(1, 1) or " "
+  local ch = text:match("([\1-\127\194-\244][\128-\191]*)") or " "
+  local wide = ch:byte(1) >= 128
   for yy = y, math.min(GPU_H, y + h - 1) do
-    for xx = x, math.min(GPU_W, x + w - 1) do
-      if yy >= 1 and xx >= 1 then
-        GPU_Screen[yy][xx] = ch
-        GPU_FG[yy][xx] = GPU_curFG
-        GPU_BG[yy][xx] = GPU_curBG
+    local col = x
+    local xmax = math.min(GPU_W, x + w - 1)
+    while col <= xmax do
+      if yy >= 1 and col >= 1 then
+        GPU_Screen[yy][col] = ch
+        GPU_FG[yy][col] = GPU_curFG
+        GPU_BG[yy][col] = GPU_curBG
+        if wide and col + 1 <= xmax then
+          GPU_Screen[yy][col + 1] = " "
+          GPU_FG[yy][col + 1] = GPU_curFG
+          GPU_BG[yy][col + 1] = GPU_curBG
+        end
       end
+      col = col + (wide and 2 or 1)
     end
   end
   return true

@@ -3172,8 +3172,20 @@ local function now_seconds()
   return os.clock()
 end
 
--- UTF-8 显示宽度（OC 等宽屏: ASCII 1 列, CJK/多字节 2 列——中文按 1 字符
--- 计算会导致换行/光标/截断全部错位，长中文行溢出炸布局）
+-- ═══════════════════════════════════════════════════════════════
+-- UTF-8 工具区（v0.3.111 宽字符修复）
+-- OC 等宽屏: ASCII 1 列, CJK/多字节 UTF-8 占 2 列（第二格 padding）。
+-- 全文件两套坐标系（缺一即错位）:
+--   · 列（column）: 屏幕格坐标（gpu.set/get/fill、csel、selFrom…）
+--   · 字符索引（char）: 字符串内字符序号（inputCursor、state.sel、
+--     search.from/to、usub 参数）
+-- 中文按 1 字符/1 字节计算 → 换行/光标/截断/选中全部错位，长中文行
+-- 溢出炸布局（用户报告: 鼠标选中英文正常、中文有 bug）。
+-- 以下工具统一做 列⇄字符 换算（vim drawscreen.c:941-943 双游标对译:
+-- 字符游标迭代 + 列游标累积）。
+-- ═══════════════════════════════════════════════════════════════
+
+-- 显示宽度（列数）: ASCII 1 列, 宽字符 2 列
 local function ulen(s)
   local n = 0
   for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
@@ -3181,6 +3193,7 @@ local function ulen(s)
   end
   return n
 end
+-- 字符索引取子串（i..j 为字符序号, j<0 = 到末尾）
 local function usub(s, i, j)
   local str = tostring(s)
   local start_char, end_char = math.max(1, i or 1), j or -1
@@ -3193,6 +3206,123 @@ local function usub(s, i, j)
     if end_char >= 0 and count > end_char then break end
   end
   return table.concat(out)
+end
+
+-- 宽字符判定: CJK 等宽字符 UTF-8 编码 >= 3 字节，OC 屏幕占 2 格
+-- （第二格 padding）。ASCII 1 字节、拉丁扩展 2 字节。
+-- v0.3.111: 从原 446 行上移到此工具区，供 charWidth/subCols 复用。
+local function isWideChar(ch)
+  return type(ch) == "string" and #ch >= 3
+end
+
+-- 单字符显示宽度（列数）: 1 或 2
+local function charWidth(ch)
+  return isWideChar(ch) and 2 or 1
+end
+
+-- 字符计数（按 UTF-8 字符，非字节）: 字节偏移 → 字符索引换算用
+local function charCount(s)
+  local n = 0
+  for _ in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    n = n + 1
+  end
+  return n
+end
+
+-- 按【列】截断: 返回列宽 ≤ maxCols 的最长前缀（末尾宽字符放不下则丢弃）
+-- ——drawRow 行截断与 wrapText 硬断用（宁可短 1 列不可溢出炸布局）。
+-- 与 subCols 不同: 这里不包含越界的宽字符。
+local function truncateCols(s, maxCols)
+  local col, out = 0, {}
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    local cw = charWidth(ch)
+    if col + cw > maxCols then break end
+    out[#out + 1] = ch
+    col = col + cw
+  end
+  return table.concat(out)
+end
+
+-- 按【列】区间取子串（双游标: 迭代字符累积列宽）。colFrom 为 1 起始列,
+-- colTo < 0 = 到行尾。宽字符整字符包含:
+--   · colFrom 落在宽字符 padding 格 → 从该字符起点开始
+--   · 宽字符跨越 colTo → 包含整个字符
+-- 因此返回子串的列宽可能 < colFrom-1 或 > colTo（调用处容忍）。
+-- 返回 (子串, 起始列, 结束列)（起始/结束列为 0 起始半开区间）。
+local function subCols(s, colFrom, colTo)
+  local str = tostring(s)
+  colFrom = math.max(1, colFrom or 1)
+  local chars = {}
+  for ch in str:gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    chars[#chars + 1] = ch
+  end
+  local col, startIdx, endIdx, startCol = 0, nil, nil, 0
+  for i = 1, #chars do
+    local cw = charWidth(chars[i])
+    if not startIdx and col + cw >= colFrom then
+      startIdx = i
+      startCol = col
+    end
+    col = col + cw
+    if startIdx and colTo >= 0 and col >= colTo then
+      endIdx = i
+      break
+    end
+  end
+  if not startIdx then return "", 0, 0 end
+  return table.concat(chars, "", startIdx, endIdx or #chars), startCol, col
+end
+
+-- 列位置 → 字符索引（readInput 输入行点击定位——逐字符累积显示宽度
+-- 求列→字符索引的正确实现抽取复用; v0.3.68 起）。落在宽字符 padding
+-- 格时返回该字符索引。col ≤ 0 → 0（行首）。
+local function charIndexAtCol(s, col)
+  if col <= 0 then return 0 end
+  local idx, w = 0, 0
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    local cw = charWidth(ch)
+    if w + cw > col then break end
+    w = w + cw
+    idx = idx + 1
+  end
+  return idx
+end
+
+-- 字符区间（1 起始闭合）→ 列区间（0 起始半开 [from, to)）
+-- ——search.from/to 为字符索引（findMatch 字节偏移转换），drawRow
+-- 高亮时换算列区间。
+local function charRangeToCols(s, fromChar, toChar)
+  local col, i, cf, ct = 0, 0, nil, nil
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    i = i + 1
+    local cw = charWidth(ch)
+    if i == fromChar then cf = col end
+    if i == toChar then ct = col + cw break end
+    col = col + cw
+  end
+  return cf or 0, ct or col
+end
+
+-- 按列区间把一行切成 前缀/中段/后缀 三段（选中段/搜索段着色共用）。
+-- relFrom/relTo: 0 起始半开列区间（相对行首）。宽字符整字符归属——
+-- 不与区间边界交错（col+width ≤ relFrom → 前缀; col ≥ relTo → 后缀），
+-- 分段永不把宽字符劈成两半。单次遍历完成三段的边界计算（drawRow
+-- 每行只扫一遍，性能达标）。
+local function splitLineByCols(line, relFrom, relTo)
+  local pre, sel, suf = {}, {}, {}
+  local col = 0
+  for ch in tostring(line):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    local cw = charWidth(ch)
+    if col + cw <= relFrom then
+      pre[#pre + 1] = ch
+    elseif col >= relTo then
+      suf[#suf + 1] = ch
+    else
+      sel[#sel + 1] = ch
+    end
+    col = col + cw
+  end
+  return table.concat(pre), table.concat(sel), table.concat(suf)
 end
 
 local tui = {}
@@ -3405,9 +3535,13 @@ local function wrapText(str, width)
         else
           if current ~= "" then lines[#lines + 1] = current end
           if ulen(word) > width then
+            -- v0.3.111: 硬断按【列】切（中文占 2 列——旧 usub(word,1,width)
+            -- 把列宽当字符数，中文长词每行溢出 width 列，总宽超屏炸布局）
             while ulen(word) > width do
-              lines[#lines + 1] = usub(word, 1, width)
-              word = usub(word, width + 1)
+              local chunk = truncateCols(word, width)
+              if chunk == "" then chunk = usub(word, 1, 1) end  -- 单宽字符超宽防御
+              lines[#lines + 1] = chunk
+              word = usub(word, charCount(chunk) + 1)
             end
             current = word
           else
@@ -3576,12 +3710,6 @@ local function normalizeCsel()
   return a, b
 end
 
--- 宽字符判定（v0.3.106 中文支持）: CJK 等宽字符 UTF-8 编码 >= 3 字节，
--- OC 屏幕占 2 格（第二格 padding）。ASCII 1 字节、拉丁扩展 2 字节。
-local function isWideChar(ch)
-  return type(ch) == "string" and #ch >= 3
-end
-
 -- ═══════════════════════════════════════════════════════════════
 -- 选中渲染（v0.3.108 重构——经典终端无状态派生模式，抄 tmux/vim）
 --
@@ -3660,17 +3788,19 @@ drawRow = function(g, x, screenY, startIdx, idx)
     return true
   end
   local color = entry.color or tui.colors.foreground
-  local line = usub(entry.text, 1, w)
+  -- v0.3.111: 按【列】截断（中文占 2 列——旧 usub(entry.text,1,w) 把列宽
+  -- 当字符数，中文行显示溢出内容区右缘）
+  local line = truncateCols(entry.text, w)
   local selFrom, selTo = selectionSpan(screenY, x, w)
   local selRange = selFrom and {selFrom, selTo} or nil
-  -- 搜索高亮段（v0.3.109 P1-3）: 当前匹配行且匹配段在可见宽度内
+  -- 搜索高亮段（v0.3.109 P1-3 + v0.3.111 列修正）: search.from/to 为
+  -- 【字符索引】（findMatch 字节偏移已转换）→ charRangeToCols 换算
+  -- 列区间——中文匹配段直接当列用会错位
   local srchRange = nil
   if state.search and state.search.idx == idx then
-    local sf, st = state.search.from, state.search.to
-    -- 屏幕列 = x-1 + 字符索引（history 存的是字符索引——OC 屏 1 列起，
-    -- 但 x 是内容区左边界（=2），字符索引与列差 x-1）
-    local scf = x - 1 + sf
-    local sct = x - 1 + st
+    local cf, ct = charRangeToCols(entry.text, state.search.from, state.search.to)
+    local scf = x + cf
+    local sct = x + ct - 1
     if sct >= x and scf <= x + w - 1 then
       scf = math.max(x, scf)
       sct = math.min(x + w - 1, sct)
@@ -3690,17 +3820,17 @@ drawRow = function(g, x, screenY, startIdx, idx)
   state.lineCache[screenY] = {text = line, color = color, sel = selRange, srch = srchRange}
   if not selFrom then
     -- 非选中行: 原色整行 + 可选搜索高亮段（3 段: 前缀/匹配/tool 色/后缀）
+    -- v0.3.111: 选中/搜索段统一走 splitLineByCols 按【列】切三段——宽
+    -- 字符整字符归属，分段位置精确（旧 usub 按字符数切，中文列偏移全错）。
+    -- 各段起始列 = x + 累计 ulen(段)（段内无半字符，列宽计算精确）。
     if not srchRange then
       g.setForeground(color)
       g.setBackground(tui.colors.background)
       g.set(x, screenY, line)
       return true
     end
-    local preLen = srchRange[1] - x
-    local srchLen = srchRange[2] - srchRange[1] + 1
-    local pre = usub(line, 1, preLen)
-    local srch = usub(line, preLen + 1, preLen + srchLen)
-    local suf = usub(line, preLen + srchLen + 1)
+    local pre, srch, suf = splitLineByCols(line, srchRange[1] - x, srchRange[2] - x + 1)
+    local preCols, srchCols = ulen(pre), ulen(srch)
     g.setBackground(tui.colors.background)
     if pre ~= "" then
       g.setForeground(color)
@@ -3708,20 +3838,17 @@ drawRow = function(g, x, screenY, startIdx, idx)
     end
     if srch ~= "" then
       g.setForeground(tui.colors.tool)
-      g.set(x + preLen, screenY, srch)
+      g.set(x + preCols, screenY, srch)
     end
     if suf ~= "" then
       g.setForeground(color)
-      g.set(x + preLen + srchLen, screenY, suf)
+      g.set(x + preCols + srchCols, screenY, suf)
     end
     return true
   end
   -- 选中行: 3 段着色（前缀原色 / 选中段反色 / 后缀原色）
-  local preLen = selFrom - x
-  local selLen = selTo - selFrom + 1
-  local pre = usub(line, 1, preLen)
-  local sel = usub(line, preLen + 1, preLen + selLen)
-  local suf = usub(line, preLen + selLen + 1)
+  local pre, sel, suf = splitLineByCols(line, selFrom - x, selTo - x + 1)
+  local preCols, selCols = ulen(pre), ulen(sel)
   g.setBackground(tui.colors.background)
   if pre ~= "" then
     g.setForeground(color)
@@ -3731,12 +3858,12 @@ drawRow = function(g, x, screenY, startIdx, idx)
     -- 反色: fg=背景, bg=行原色（文字以原色为底、黑字）
     g.setForeground(tui.colors.background)
     g.setBackground(color)
-    g.set(x + preLen, screenY, sel)
+    g.set(x + preCols, screenY, sel)
   end
   if suf ~= "" then
     g.setForeground(color)
     g.setBackground(tui.colors.background)
-    g.set(x + preLen + selLen, screenY, suf)
+    g.set(x + preCols + selCols, screenY, suf)
   else
     -- 选中段延伸到行尾（suf 空）: 必须复位 fg/bg——否则残留 fg=黑、
     -- bg=行色泄漏到下一行 + 下一轮 redrawContent 的 fill（v0.3.110
@@ -3865,7 +3992,7 @@ function tui.setInputBuffer(text)
   -- 输入行不支持多行编辑; 换行转空格保持可编辑）
   local single = tostring(text):gsub("[\r\n]+", " ")
   state.inputBuffer = single
-  state.inputCursor = ulen(single)
+  state.inputCursor = charCount(single)  -- v0.3.111: 字符索引（旧 ulen=列数，中文错位）
   state.completionCycle = nil
   state.sel = nil
   state.sel_active = nil
@@ -3911,6 +4038,21 @@ function tui.scrollToTop()
   pcall(tui.redrawContent)
 end
 
+-- 浏览位置吸附（v0.3.111）: 落到宽字符 padding 格时向左回走到字符起点
+-- （tmux grid.c:1717 grid_in_set 从 padding 格回走模式）——padding 格是
+-- 宽字符的显示延续，不是独立光标位。h/l 移动后调用（含 h 落到前一
+-- 宽字符的 padding 格、l 落到本宽字符 padding 格两种情况）。
+local function snapBrowseFromPadding(pos)
+  if pos.x <= 1 then return end
+  local g = component.gpu
+  local ok_prev, prev = pcall(g.get, pos.x - 1, pos.y)
+  local ok_cur, cur = pcall(g.get, pos.x, pos.y)
+  -- 前一格是宽字符（首格）且当前格是空格 → 当前格是它的 padding → 回走
+  if ok_prev and isWideChar(prev) and ok_cur and (cur == " " or cur == "") then
+    pos.x = pos.x - 1
+  end
+end
+
 -- 进入键盘浏览/选择模式（v0.3.109 P1-1, tmux copy-mode 移植）:
 -- /browse 命令进入。hjkl 移动虚拟光标（复用派生选中渲染——
 -- Space 设置 csel anchor 为当前浏览位置，移动扩展选中，
@@ -3941,8 +4083,14 @@ local function findMatch(pattern, startIdx, dir)
   while true do
     if i < 1 or i > n then return nil end
     local text = state.history[i].text or ""
-    local f, t = text:find(pattern, 1, true)
-    if f then return i, f, t end
+    local bf, bt = text:find(pattern, 1, true)
+    if bf then
+      -- v0.3.111: string.find 返回【字节】偏移 → 转【字符】索引（gmatch
+      -- 数字符）——中文匹配段字节≠字符≠列，直存字节偏移当列用会错位
+      local f = charCount(text:sub(1, bf - 1)) + 1
+      local t = charCount(text:sub(1, bt))
+      return i, f, t
+    end
     i = i + dir
   end
 end
@@ -4049,7 +4197,7 @@ function tui.drawInput()
   if sel and sel.a ~= sel.b then
     local sa, sb = math.min(sel.a, sel.b), math.max(sel.a, sel.b)
     -- 相对最后一行（仅选中当前显示行内的部分）
-    local lo, hi = math.max(sa - line_start, 1), math.min(sb - line_start, ulen(displayText))
+    local lo, hi = math.max(sa - line_start, 1), math.min(sb - line_start, charCount(displayText))
     if lo <= hi then
       local x0 = inputStart + ulen(usub(displayText, 1, lo - 1))
       local x1 = inputStart + ulen(usub(displayText, 1, hi))
@@ -4217,10 +4365,12 @@ function tui.readInput(on_event)
       -- 浏览模式下所有按键只做浏览/选择操作，不碰输入行。
       if state.browseMode then
         local _, _, _, bh = getContentBounds()
-        if ch == 104 then -- h: 左移
+        if ch == 104 then -- h: 左移（落到 padding 格回走——v0.3.111）
           state.browsePos.x = math.max(1, state.browsePos.x - 1)
-        elseif ch == 108 then -- l: 右移
+          snapBrowseFromPadding(state.browsePos)
+        elseif ch == 108 then -- l: 右移（同）
           state.browsePos.x = math.min(state.width - 2, state.browsePos.x + 1)
+          snapBrowseFromPadding(state.browsePos)
         elseif ch == 106 then -- j: 下移
           local maxScroll = math.max(0, #state.history - bh)
           if state.browsePos.y >= state.height - 2 then
@@ -4336,7 +4486,7 @@ function tui.readInput(on_event)
       elseif code == 205 then -- Right
         if keyboard.isControlDown and keyboard.isControlDown() then
           -- Ctrl+Right: 下一个单词边界（字符索引）
-          local len = ulen(state.inputBuffer)
+          local len = charCount(state.inputBuffer)
           local pos = state.inputCursor
           while pos < len and not usub(state.inputBuffer, pos + 1, pos + 1):match("%s") do
             pos = pos + 1
@@ -4345,7 +4495,7 @@ function tui.readInput(on_event)
             pos = pos + 1
           end
           state.inputCursor = pos
-        elseif state.inputCursor < ulen(state.inputBuffer) then
+        elseif state.inputCursor < charCount(state.inputBuffer) then
           state.inputCursor = state.inputCursor + 1
         end
         state.completionCycle = nil
@@ -4359,10 +4509,10 @@ function tui.readInput(on_event)
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollToBottom()
         else
-          state.inputCursor = ulen(state.inputBuffer)
+          state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
         end
       elseif code == 211 then -- Delete（最后一行内）
-        local len = ulen(state.inputBuffer)
+        local len = charCount(state.inputBuffer)
         if state.inputCursor < len then
           state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
             .. usub(state.inputBuffer, state.inputCursor + 2)
@@ -4376,7 +4526,7 @@ function tui.readInput(on_event)
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
             state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
-            state.inputCursor = ulen(state.inputBuffer)
+            state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           end
         end
       elseif code == 208 then -- Down: Ctrl=下滚 1 行; 否则历史下翻（多行时禁用）
@@ -4389,7 +4539,7 @@ function tui.readInput(on_event)
           else
             state.inputBuffer = state.cmdHistory[#state.cmdHistory - state.cmdHistoryIndex + 1]
           end
-          state.inputCursor = ulen(state.inputBuffer)
+          state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
         end
       elseif code == 201 then -- PgUp: 上滚
         tui.scrollUp(tui.pageStep())
@@ -4408,7 +4558,7 @@ function tui.readInput(on_event)
         if #cands > 0 then
           if not state.completionCycle then state.completionCycle = {cands, cands[1]} end
           state.inputBuffer = state.completionCycle[2].cmd
-          state.inputCursor = ulen(state.inputBuffer)
+          state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           tui.setStatus("Tab: " .. state.completionCycle[2].cmd
             .. (#cands > 1 and (" (" .. #cands .. " candidates)") or ""))
         else
@@ -4453,7 +4603,7 @@ function tui.readInput(on_event)
         state.inputBuffer = usub(state.inputBuffer, 1, state.inputCursor)
           .. paste
           .. usub(state.inputBuffer, state.inputCursor + 1)
-        state.inputCursor = state.inputCursor + ulen(paste)
+        state.inputCursor = state.inputCursor + charCount(paste)  -- v0.3.111: 字符索引
         state.completionCycle = nil
         state.sel = nil
         state.sel_active = nil
@@ -4481,19 +4631,12 @@ function tui.readInput(on_event)
           local inputStart = multiline and 5 or 4
           local rel = tx - inputStart
           if rel < 0 then rel = 0 end
-          -- 遍历显示文本找 rel 列对应字符索引（逐字符累积显示宽度）
+          -- 列 → 字符索引（逐字符累积显示宽度; v0.3.111 抽取为
+          -- charIndexAtCol 复用——中文 2 列/字符，落在 padding 格定位到
+          -- 该字符）
           local displayText = multiline and usub(state.inputBuffer, line_start + 1)
             or state.inputBuffer
-          local idx = 0
-          local w = 0
-          while idx < ulen(displayText) do
-            local ch = usub(displayText, idx + 1, idx + 1)
-            local cw = ulen(ch) == 2 and 2 or 1
-            if w + cw > rel then break end
-            w = w + cw
-            idx = idx + 1
-          end
-          local charIdx = line_start + idx
+          local charIdx = line_start + charIndexAtCol(displayText, rel)
           if ev == "touch" then
             -- 按下: 起点 = 终点 = 点击位（清除旧选中）
             state.sel = {a = charIdx, b = charIdx}
@@ -4508,7 +4651,7 @@ function tui.readInput(on_event)
         elseif ev == "drag" and state.sel and state.sel_active then
           -- 拖出输入行: 终点 = 行首/行尾（向拖动方向延伸）
           local line_start = lastLineStart(state.inputBuffer)
-          local len = ulen(state.inputBuffer)
+          local len = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           state.sel.b = ty < inputY and line_start or len
           pcall(tui.drawInput)
         else
@@ -4683,7 +4826,7 @@ end
 -- 不可靠（协程 event.pull 卡死），真机验证渲染路径用此钩子。
 function tui.debug_set_buffer(s)
   state.inputBuffer = tostring(s or "")
-  state.inputCursor = ulen(state.inputBuffer)
+  state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
 end
 
 return tui

@@ -219,6 +219,128 @@ local n_zero = tui.search("zzz")
 test("search: no match returns 0", n_zero == 0, "n=" .. tostring(n_zero))
 
 -- ════════════════════════════════════════════════════════════════
+-- 6. 中文宽字符（v0.3.111）——真机 bug 回归: 鼠标选中英文正常、中文错位。
+--    "你好世界ab" 列布局: 你=2-3 好=4-5 世=6-7 界=8-9 a=10 b=11
+--    （宽字符占 2 格, 第 2 格是 padding 空格; 依赖 oc_mock GPU 真机
+--    保真——旧 mock 按字节拆 3 格, 此组断言全是死代码）。
+-- ════════════════════════════════════════════════════════════════
+local function txt_width(s)
+  local n = 0
+  for ch in tostring(s):gmatch("([\1-\127\194-\244][\128-\191]*)") do
+    n = n + (ch:byte(1) < 128 and 1 or 2)
+  end
+  return n
+end
+local function freshCjk(copy_fn)
+  component.debug_gpu_reset()
+  pcall(tui.init, {onCopy = copy_fn})
+  tui.print("你好世界ab", tui.colors.user)
+  tui.redrawContent()
+end
+
+-- 6a. 中文行选中高亮: touch(6,2)+drag(9,2) 选中"世界"（列 6-9）——
+--     三段切分必须按【列】; 旧 drawRow usub 按字符数切（列宽当字符数）,
+--     中文选中段错位/花屏。宽字符整字符归属: 世/界的 padding 格在
+--     选中段内同样反色; 前缀"你好"、后缀"ab"保持原色。
+freshCjk()
+q("touch", "screen-addr", 6, 2, 0)
+q("drag", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local w6 = cell(6, 2)  -- 世 首格
+test("cjk sel: 世 first cell inverted", w6.fg == 0 and w6.bg == tui.colors.user,
+  string.format("fg=%x bg=%x ch=%q", w6.fg, w6.bg, w6.ch))
+local w7 = cell(7, 2)  -- 世 padding 格（选中段内）
+test("cjk sel: 世 padding cell inverted", w7.fg == 0 and w7.bg == tui.colors.user,
+  string.format("fg=%x bg=%x ch=%q", w7.fg, w7.bg, w7.ch))
+local w9 = cell(9, 2)  -- 界 padding 格（选中段右缘）
+test("cjk sel: 界 padding cell inverted", w9.fg == 0 and w9.bg == tui.colors.user,
+  string.format("fg=%x bg=%x ch=%q", w9.fg, w9.bg, w9.ch))
+local w4 = cell(4, 2)  -- 前缀"好"
+test("cjk sel: prefix 好 original color", w4.fg == tui.colors.user and w4.bg == 0,
+  string.format("fg=%x bg=%x ch=%q", w4.fg, w4.bg, w4.ch))
+local w10 = cell(10, 2)  -- 后缀 "a"
+test("cjk sel: suffix a original color", w10.fg == tui.colors.user and w10.bg == 0,
+  string.format("fg=%x bg=%x ch=%q", w10.fg, w10.bg, w10.ch))
+test("cjk sel: wide char stored whole at first cell", w6.ch == "世",
+  "ch=" .. tostring(w6.ch))
+
+-- 6b. 中文行复制: touch(6,2)+drag(9,2)+drop → onCopy 收到"世界"
+--     （无 padding 空格混入; readContentSelection 的 prevWide 跳过
+--     必须真机保真下才有效——旧 mock 按字节拆格读回乱码）
+local cjk_copied = nil
+freshCjk(function(text) cjk_copied = text end)
+q("touch", "screen-addr", 6, 2, 0)
+q("drag", "screen-addr", 9, 2, 0)
+q("drop", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("cjk copy: selection text == 世界 (no padding spaces)",
+  cjk_copied == "世界", "copied=" .. tostring(cjk_copied))
+
+-- 6c. 中文搜索高亮: search("世界") → 匹配段 tool 色在列 6-9。
+--     findMatch 字节偏移 → 字符索引（旧直存字节偏移当列用, 中文匹配
+--     段高亮位置偏到字节列）; drawRow 搜索段同样按列换算。
+freshCjk()
+local n_cjk_search = tui.search("世界")
+test("cjk search: match count 1", n_cjk_search == 1, "n=" .. tostring(n_cjk_search))
+local s6 = cell(6, 2)
+test("cjk search: 世 first cell tool color", s6.fg == tui.colors.tool,
+  string.format("fg=%x ch=%q", s6.fg, s6.ch))
+local s9 = cell(9, 2)
+test("cjk search: 界 padding cell tool color", s9.fg == tui.colors.tool,
+  string.format("fg=%x ch=%q", s9.fg, s9.ch))
+local s4 = cell(4, 2)
+test("cjk search: prefix 好 row color", s4.fg == tui.colors.user,
+  string.format("fg=%x ch=%q", s4.fg, s4.ch))
+local s10 = cell(10, 2)
+test("cjk search: suffix a row color", s10.fg == tui.colors.user,
+  string.format("fg=%x ch=%q", s10.fg, s10.ch))
+
+-- 6d. 中文长行: 无空格长词硬断按【列】+ drawRow 截断按【列】——旧
+--     usub(word,1,width) 列宽当字符数 → 每行溢出 width 列（内容区
+--     右缘外写屏）; 中文行超宽 → 花屏/串位。断言每行 ≤ 78 列。
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print(string.rep("你", 100))  -- 200 列 → 硬断 39+39+22 字符（78+78+44 列）
+local ok_redraw = pcall(tui.redrawContent)
+test("cjk wrap: long chinese line renders without crash", ok_redraw)
+local all_fit = true
+for _, e in ipairs(tui.history()) do
+  if txt_width(e.text) > 78 then all_fit = false break end
+end
+test("cjk wrap: every wrapped line <= 78 cols", all_fit)
+-- drawRow 列截断: 直接塞一个超宽 history 行（45你 = 90 列）→ 截断到
+-- 78 列, 内容区右缘（col 80 边框）不被写脏
+local h = tui.history()
+h[#h + 1] = {text = string.rep("你", 45), color = tui.colors.user}  -- 90 列
+local ok_trunc = pcall(tui.redrawContent)
+test("cjk trunc: over-wide row draws without crash", ok_trunc)
+local t78 = cell(78, 5)  -- 第 39 个你的首格（78-79 列）
+test("cjk trunc: row fills up to col 78", t78.ch == "你",
+  "ch=" .. tostring(t78.ch))
+local t80 = cell(80, 5)  -- 内容区右缘边框（不能被子行溢出写脏）
+test("cjk trunc: no overflow past content edge", t80.ch == " ",
+  "ch=" .. tostring(t80.ch))
+
+-- 6e. 浏览模式: h/l 移动不落 padding 格——enterBrowse 后 k×11 到中文
+--     行（y=13→2）、h×35 到"你"首格（x=41→2, 途中经过 好/世/界 的
+--     padding 格均向左回走吸附, tmux grid.c:1717 模式）、Space 选中
+--     + y 复制 → 文本 = "你"（无 padding 混入）。
+local browse_copied = nil
+freshCjk(function(text) browse_copied = text end)
+pcall(tui.enterBrowse)
+for _ = 1, 11 do qKey(107, 45) end  -- k×11
+for _ = 1, 35 do qKey(104, 19) end  -- h×35
+qKey(32, 57)  -- Space: 开始选中
+qKey(121, 21) -- y: 复制并退出浏览
+pcall(tui.readInput, nil)
+test("cjk browse: y-copy after h-move == 你", browse_copied == "你",
+  "copied=" .. tostring(browse_copied))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)
