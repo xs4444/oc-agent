@@ -393,6 +393,136 @@ test("C: large buffer intact after edit", tui.debug_input_buffer() == big_text .
   "len=" .. tostring(#tui.debug_input_buffer()))
 
 -- ════════════════════════════════════════════════════════════════
+-- D. shift 选中编辑（v0.3.114, 用户: "shift 选中删除"）: shift+方向扩展
+--    选中（state.sel 0 基 [min,max), sel_active）; 无 shift 移动取消;
+--    Backspace/Delete 删整段; 可打印字符/粘贴替换选中; 跨行选中删除。
+--    依赖 oc_mock debug_set_shift(bool) 注入 shift 状态（debug_gpu_reset
+--    自动复位）。debug_input_sel() 返回 {a,b} 或 nil; Enter 提交后 sel
+--    仍保留（Enter 分支不清 sel——用 Enter 退出并断言选中状态）。
+-- ════════════════════════════════════════════════════════════════
+-- shift 状态注入（v0.3.114）: 事件预排队、处理时才读 shift 状态 →
+-- 用 mock 的 test_shift 控制事件在事件流中途原位切换（event.pull 排头
+-- 吞掉并应用, 不投递）。非队列形式（component.debug_set_shift）会在
+-- readInput 开始前就把状态复位, 事件处理时读不到。
+local function shiftQ(v) q("test_shift", v) end
+
+-- D1a: shift+Left×2 扩展选中（锚点=原光标 4, 终点=新光标 2 → "cd"）;
+--      Enter 后 sel 保留 {4,2}, 光标 2
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcd")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 203, "player")  -- shift+Left
+q("key_down", "kb-addr", 0, 203, "player")  -- shift+Left
+shiftQ(false)
+q("key_down", "kb-addr", 13, 28, "player")  -- Enter（提交并退出, sel 保留）
+pcall(tui.readInput, nil)
+local dsel = tui.debug_input_sel()
+test("D: shift+Left x2 extends selection {4,2}",
+  dsel and math.min(dsel.a, dsel.b) == 2 and math.max(dsel.a, dsel.b) == 4,
+  "sel=" .. tostring(dsel and (dsel.a .. "," .. dsel.b)))
+test("D: cursor follows to 2", tui.debug_input_cursor() == 2,
+  "c=" .. tostring(tui.debug_input_cursor()))
+
+-- D1b: 选中 + Backspace → 删整段 "cd" → "ab"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcd")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 203, "player")
+q("key_down", "kb-addr", 0, 203, "player")
+shiftQ(false)
+q("key_down", "kb-addr", 8, 14, "player")  -- Backspace 删选中
+q("key_down", "kb-addr", 13, 28, "player")
+local ok_d, res_d = pcall(tui.readInput, nil)
+test("D: Backspace deletes whole selection -> ab", ok_d and res_d == "ab",
+  "got=" .. tostring(res_d))
+
+-- D2: shift+Home 反向扩到行首（选中全行）+ 输入字符替换 → "X"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcd")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 199, "player")  -- shift+Home
+shiftQ(false)
+q("key_down", "kb-addr", 88, 45, "player")  -- 'X' 替换选中
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+test("D: shift+Home selects line, char replaces -> X",
+  tui.debug_input_buffer() == "X", "buf=" .. tostring(tui.debug_input_buffer()))
+
+-- D3: 选中 + Delete → 删整段 "def" → "abc"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcdef")
+shiftQ(true)
+for _ = 1, 3 do q("key_down", "kb-addr", 0, 203, "player") end  -- shift+Left×3
+shiftQ(false)
+q("key_down", "kb-addr", 0, 211, "player")  -- Delete 删选中
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+test("D: Delete deletes whole selection -> abc",
+  tui.debug_input_buffer() == "abc", "buf=" .. tostring(tui.debug_input_buffer()))
+
+-- D4: 中部选中 + 输入字符替换（'d' → 'X'）→ "abcX"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcd")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 203, "player")  -- shift+Left（选 'd'）
+shiftQ(false)
+q("key_down", "kb-addr", 88, 45, "player")  -- 'X' 替换
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+test("D: mid-selection char replaces -> abcX",
+  tui.debug_input_buffer() == "abcX", "buf=" .. tostring(tui.debug_input_buffer()))
+
+-- D5: 无 shift 移动取消选中 → 后续字符在光标处插入（非替换）→ "aXbcd"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "abcd")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 203, "player")
+q("key_down", "kb-addr", 0, 203, "player")  -- sel {4,2}
+shiftQ(false)
+q("key_down", "kb-addr", 0, 203, "player")  -- 无 shift Left → 取消选中, 光标 1
+q("key_down", "kb-addr", 88, 45, "player")  -- 'X' 插入光标处
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+local dsel5 = tui.debug_input_sel()
+test("D: no-shift move cancels selection (insert not replace) -> aXbcd",
+  tui.debug_input_buffer() == "aXbcd", "buf=" .. tostring(tui.debug_input_buffer()))
+test("D: selection cleared after no-shift move", dsel5 == nil,
+  "sel=" .. tostring(dsel5 and (dsel5.a .. "," .. dsel5.b)))
+
+-- D6: shift+Up×2 跨行选中（l2+l3 含 \n）+ Backspace 删整段 → "l1"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "l1\nl2\nl3")
+shiftQ(true)
+q("key_down", "kb-addr", 0, 200, "player")  -- shift+Up → 行2尾
+q("key_down", "kb-addr", 0, 200, "player")  -- shift+Up → 行1尾 (sel {8,2})
+shiftQ(false)
+q("key_down", "kb-addr", 8, 14, "player")  -- Backspace 删选中跨行段
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+test("D: shift+Up cross-line selection deleted -> l1",
+  tui.debug_input_buffer() == "l1", "buf=" .. tostring(tui.debug_input_buffer()))
+
+-- D7: 粘贴替换选中（"world" → "X"）→ "hello X"
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", "hello world")
+shiftQ(true)
+for _ = 1, 5 do q("key_down", "kb-addr", 0, 203, "player") end  -- 选 "world"
+shiftQ(false)
+q("clipboard", "kb-addr", "X")  -- 粘贴替换选中
+q("key_down", "kb-addr", 13, 28, "player")
+pcall(tui.readInput, nil)
+test("D: paste replaces selection -> hello X",
+  tui.debug_input_buffer() == "hello X", "buf=" .. tostring(tui.debug_input_buffer()))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)

@@ -80,6 +80,11 @@ local GPU_curFG, GPU_curBG = 0xffffff, 0x000000
 -- v0.3.112: gpu.set 调用计数（滚动防闪烁测试——断言边界滚动 no-op
 -- 时不再全屏重绘; 只计 set, 不计 fill）
 local GPU_setCount = 0
+-- v0.3.114: shift 修饰键状态（keyboard_proxy.isShiftDown 读取;
+-- debug_set_shift 设置; debug_gpu_reset 复位; event.pull 的 test_shift
+-- 控制事件原位切换）。声明在文件顶部——debug_gpu_reset(193)/event.pull(331)
+-- 都在 keyboard 段(569)之前定义, 靠前声明才能共享同一 upvalue。
+local _shiftDown = false
 local function gpu_ensure()
   if GPU_Screen[1] then return end
   for y = 1, GPU_H do
@@ -196,6 +201,7 @@ function mock_component.debug_gpu_reset()
   GPU_BG = {}
   GPU_curFG, GPU_curBG = 0xffffff, 0x000000
   GPU_setCount = 0
+  _shiftDown = false  -- v0.3.114: 复位 shift 状态（fresh 模式默认无 shift）
 end
 -- v0.3.112: gpu.set 调用计数（滚动防闪烁测试: 边界滚动 no-op = 0 次 set）
 function mock_component.debug_gpu_set_count()
@@ -344,6 +350,14 @@ function mock_event.pull(timeout, ...)
     for i = 2, #filter do pos_filters[i - 1] = filter[i] end
   end
   while true do
+    -- v0.3.114 测试控制事件: 排头 test_shift → 原位应用 shift 状态并吞掉
+    -- （不返回给 readInput）——事件是预排队的, 处理时才能读到 shift 状态,
+    -- 测试需要"事件流中途"切换 shift（shift+方向 → 松开 shift → 普通方向）。
+    -- 事件名/参数不参与调用方 filter 匹配（控制事件永远不投递）。
+    while #OC._event_queue > 0 and OC._event_queue[1][1] == "test_shift" do
+      _shiftDown = not not OC._event_queue[1][2]
+      table.remove(OC._event_queue, 1)
+    end
     -- deliver queued modem events first
     if #OC._event_queue > 0 then
       local sig = table.remove(OC._event_queue, 1)
@@ -564,9 +578,15 @@ keyboard_proxy.isKeyDown = function() return false end
 -- v0.3.112: 真机 keyboard 有 isControlDown/isShiftDown/isAltDown——
 -- __index 兜底会返回抛错的 invoke 代理（未注册地址），方向键/Home/
 -- End 分支的 Ctrl 组合检测一调用即炸。显式提供（返回 false = 无修饰键）。
+-- v0.3.114: isShiftDown 支持测试设置（shift 选中编辑测试用 debug_set_shift）。
 keyboard_proxy.isControlDown = function() return false end
-keyboard_proxy.isShiftDown = function() return false end
+keyboard_proxy.isShiftDown = function() return _shiftDown end
 keyboard_proxy.isAltDown = function() return false end
+-- shift 状态可设置（v0.3.114）: 测试前 debug_set_shift(true) 注入 shift
+-- 按下状态, 测试后复位。debug_gpu_reset 一并复位（fresh 模式默认无 shift）。
+function mock_component.debug_set_shift(v)
+  _shiftDown = not not v
+end
 mock_component.keyboard = keyboard_proxy
 OC.keyboard = keyboard_proxy
 

@@ -242,6 +242,10 @@ function tui.init(config)
   -- selected.txt 供 /debug gist 附带）。
   state.csel = nil
   state.csel_active = nil
+  -- v0.3.114: 输入行选中同样随会话复位（Enter 提交不清 sel——上一会话
+  -- 残留的选中会在新会话的粘贴/输入里触发错误的"替换选中"）
+  state.sel = nil
+  state.sel_active = nil
   tui.onCopy = config.onCopy
   -- 滚动型渲染探测（荒野大师等终端滚动型模拟器）：写入最底行 y=h 会触发
   -- 整屏上滚（帧缓冲模拟器如 ocvm/OCEmu 无此行为）。探测：先在 y=1 写
@@ -563,6 +567,48 @@ local function moveCursorByDisplayLine(dir)
   local colPx = ulen(usub(curText, 1, curOff))
   state.inputCursor = rt[1] + charIndexAtCol(text, colPx)
   return true
+end
+
+-- ════════════════════════════════════════
+-- shift 选中编辑（v0.3.114, 用户: "shift 选中删除", 向经典终端学习）:
+--   · shift+Left/Right/Home/End/Ctrl+方向/多行 Up/Down → 从锚点扩展
+--     选中（state.sel 0 基 [min,max), sel_active=true）
+--   · 无 shift 光标移动 → 取消选中
+--   · Backspace/Delete 有选中 → 删整段; 可打印字符/粘贴有选中 → 替换
+-- ════════════════════════════════════════
+
+-- 删除激活选中区间 [min,max)（跨行, 与行界无关——用户删的是选中文本）;
+-- 光标 = min, 清选中。无激活选中（或 a==b）返回 false（调用方走原逻辑）。
+local function deleteSelection()
+  local sel = state.sel
+  if sel and state.sel_active and sel.a ~= sel.b then
+    local lo, hi = math.min(sel.a, sel.b), math.max(sel.a, sel.b)
+    setInputBufferText(usub(state.inputBuffer, 1, lo) .. usub(state.inputBuffer, hi + 1))
+    state.inputCursor = lo
+    state.sel = nil
+    state.sel_active = nil
+    return true
+  end
+  return false
+end
+
+-- 光标移动后的 shift 扩展（oldCursor = 移动前光标）:
+--   shift 按下 → 无激活选中则锚点=oldCursor、终点=新光标; 已激活仅移终点
+--   （touch/drag 拖选锚点继续生效——鼠标选中后 shift+方向继续扩展）。
+--   无 shift → 取消选中（经典终端: 移动取消选中）。
+local function applyShiftSelect(oldCursor)
+  local shifted = keyboard.isShiftDown and keyboard.isShiftDown()
+  if shifted then
+    if not (state.sel and state.sel_active) then
+      state.sel = {a = oldCursor, b = state.inputCursor}
+      state.sel_active = true
+    else
+      state.sel.b = state.inputCursor
+    end
+  else
+    state.sel = nil
+    state.sel_active = nil
+  end
 end
 
 -- 历史上限（v0.3.109, tmux history-limit 移植）: 2MB 真机内存约束下
@@ -1514,14 +1560,17 @@ function tui.readInput(on_event)
           state.completionCycle = nil
           return line
         end
-      elseif ch == 8 or code == 14 then -- Backspace（限当前行，不删 \n）
-        if state.inputCursor > line_start then
-          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor - 1)
-            .. usub(state.inputBuffer, state.inputCursor + 1))
-          state.inputCursor = state.inputCursor - 1
-          state.completionCycle = nil
+      elseif ch == 8 or code == 14 then -- Backspace（v0.3.114: 有选中删整段; 否则限当前行，不删 \n）
+        if not deleteSelection() then
+          if state.inputCursor > line_start then
+            setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor - 1)
+              .. usub(state.inputBuffer, state.inputCursor + 1))
+            state.inputCursor = state.inputCursor - 1
+            state.completionCycle = nil
+          end
         end
-      elseif code == 203 then -- Left（不跨行）
+      elseif code == 203 then -- Left（不跨行; v0.3.114 shift 扩展选中）
+        local oldCursor = state.inputCursor
         if keyboard.isControlDown and keyboard.isControlDown() then
           -- Ctrl+Left: 前一个单词边界（字符索引）
           local pos = state.inputCursor
@@ -1535,8 +1584,10 @@ function tui.readInput(on_event)
         elseif state.inputCursor > line_start then
           state.inputCursor = state.inputCursor - 1
         end
+        applyShiftSelect(oldCursor)
         state.completionCycle = nil
-      elseif code == 205 then -- Right（限当前行）
+      elseif code == 205 then -- Right（限当前行; v0.3.114 shift 扩展选中）
+        local oldCursor = state.inputCursor
         if keyboard.isControlDown and keyboard.isControlDown() then
           -- Ctrl+Right: 下一个单词边界（当前行内）
           local len = line_end
@@ -1551,33 +1602,45 @@ function tui.readInput(on_event)
         elseif state.inputCursor < line_end then
           state.inputCursor = state.inputCursor + 1
         end
+        applyShiftSelect(oldCursor)
         state.completionCycle = nil
-      elseif code == 199 then -- Home（行首; Ctrl=滚到顶）
+      elseif code == 199 then -- Home（行首; Ctrl=滚到顶; v0.3.114 shift 扩展）
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollToTop()
         else
+          local oldCursor = state.inputCursor
           state.inputCursor = line_start
+          applyShiftSelect(oldCursor)
         end
-      elseif code == 207 then -- End（当前行尾; Ctrl=滚到底）
+      elseif code == 207 then -- End（当前行尾; Ctrl=滚到底; v0.3.114 shift 扩展）
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollToBottom()
         else
+          local oldCursor = state.inputCursor
           state.inputCursor = line_end  -- v0.3.112: 光标所在行尾（原 buffer 尾）
+          applyShiftSelect(oldCursor)
         end
-      elseif code == 211 then -- Delete（当前行内）
-        local len = line_end
-        if state.inputCursor < len then
-          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
-            .. usub(state.inputBuffer, state.inputCursor + 2))
+      elseif code == 211 then -- Delete（v0.3.114: 有选中删整段; 否则当前行内）
+        if not deleteSelection() then
+          local len = line_end
+          if state.inputCursor < len then
+            setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
+              .. usub(state.inputBuffer, state.inputCursor + 2))
+          end
         end
         state.completionCycle = nil
-      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 多行 → 光标上移一行; 单行 → 历史上翻
+      elseif code == 200 then -- Up: Ctrl=上滚 1 行; 多行 → 光标上移一行（shift 扩展选中）; 单行 → 历史上翻
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollUp(1)
         elseif multiline then
           -- v0.3.112 多行编辑: 列保持上移一个显示行（clamp 到目标行宽）
+          local oldCursor = state.inputCursor
           moveCursorByDisplayLine(-1)
+          applyShiftSelect(oldCursor)  -- v0.3.114
         elseif #state.cmdHistory > 0 then
+          -- 历史翻页: buffer 整体替换 → 旧选中索引失效 → 清选中
+          state.sel = nil
+          state.sel_active = nil
           if state.cmdHistoryIndex == 0 then state.savedInput = state.inputBuffer end
           if state.cmdHistoryIndex < #state.cmdHistory then
             state.cmdHistoryIndex = state.cmdHistoryIndex + 1
@@ -1585,13 +1648,17 @@ function tui.readInput(on_event)
             state.inputCursor = charCount(state.inputBuffer)  -- v0.3.111: 字符索引
           end
         end
-      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 多行 → 光标下移一行; 单行 → 历史下翻
+      elseif code == 208 then -- Down: Ctrl=下滚 1 行; 多行 → 光标下移一行（shift 扩展选中）; 单行 → 历史下翻
         if keyboard.isControlDown and keyboard.isControlDown() then
           tui.scrollDown(1)
         elseif multiline then
           -- v0.3.112 多行编辑: 列保持下移一个显示行
+          local oldCursor = state.inputCursor
           moveCursorByDisplayLine(1)
+          applyShiftSelect(oldCursor)  -- v0.3.114
         elseif state.cmdHistoryIndex > 0 then
+          state.sel = nil
+          state.sel_active = nil
           state.cmdHistoryIndex = state.cmdHistoryIndex - 1
           if state.cmdHistoryIndex == 0 then
             setInputBufferText(state.savedInput)
@@ -1636,14 +1703,27 @@ function tui.readInput(on_event)
           state.sel_active = nil
           pcall(tui.drawInput)
         else
-          -- 有输入时清除选中（高亮区间基于旧文本，输入后错位）
-          state.sel = nil
-          state.sel_active = nil
-          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
-            .. string.char(ch)
-            .. usub(state.inputBuffer, state.inputCursor + 1))
-          state.inputCursor = state.inputCursor + 1
-          state.completionCycle = nil
+          if state.sel and state.sel_active and state.sel.a ~= state.sel.b then
+            -- v0.3.114: 可打印字符替换选中（等效删选中 + 插入）
+            local lo, hi = math.min(state.sel.a, state.sel.b),
+              math.max(state.sel.a, state.sel.b)
+            setInputBufferText(usub(state.inputBuffer, 1, lo)
+              .. string.char(ch)
+              .. usub(state.inputBuffer, hi + 1))
+            state.inputCursor = lo + 1
+            state.sel = nil
+            state.sel_active = nil
+            state.completionCycle = nil
+          else
+            -- 有输入时清除选中（高亮区间基于旧文本，输入后错位）
+            state.sel = nil
+            state.sel_active = nil
+            setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
+              .. string.char(ch)
+              .. usub(state.inputBuffer, state.inputCursor + 1))
+            state.inputCursor = state.inputCursor + 1
+            state.completionCycle = nil
+          end
         end
       else
         -- 诊断（v0.3.29 临时）: 未匹配任何分支的 key_down——用于定位荒野大师
@@ -1667,10 +1747,20 @@ function tui.readInput(on_event)
         -- state.clipboard（选中复制）——抢占游戏剪贴板。现在选中复制
         -- 走 /paste 命令（读 selected.txt），Ctrl+V 永远是游戏剪贴板。
         local paste = char
-        setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
-          .. paste
-          .. usub(state.inputBuffer, state.inputCursor + 1))
-        state.inputCursor = state.inputCursor + charCount(paste)  -- v0.3.111: 字符索引
+        if state.sel and state.sel_active and state.sel.a ~= state.sel.b then
+          -- v0.3.114: 粘贴替换选中（与可打印字符语义一致）
+          local lo, hi = math.min(state.sel.a, state.sel.b),
+            math.max(state.sel.a, state.sel.b)
+          setInputBufferText(usub(state.inputBuffer, 1, lo) .. paste .. usub(state.inputBuffer, hi + 1))
+          state.inputCursor = lo + charCount(paste)
+          state.sel = nil
+          state.sel_active = nil
+        else
+          setInputBufferText(usub(state.inputBuffer, 1, state.inputCursor)
+            .. paste
+            .. usub(state.inputBuffer, state.inputCursor + 1))
+          state.inputCursor = state.inputCursor + charCount(paste)  -- v0.3.111: 字符索引
+        end
         state.completionCycle = nil
         state.sel = nil
         state.sel_active = nil
@@ -1944,6 +2034,12 @@ end
 -- v0.3.113: 折行重算计数（输入卡顿回归断言: 光标移动 0 重算, 编辑 1 次）
 function tui.debug_input_reflow_count()
   return state.inputReflowCount or 0
+end
+-- v0.3.114: shift 选中状态只读钩子（选中扩展断言用）
+function tui.debug_input_sel()
+  local s = state.sel
+  if not (s and state.sel_active) then return nil end
+  return {a = s.a, b = s.b}
 end
 function tui.debug_input_buffer()
   return state.inputBuffer or ""
