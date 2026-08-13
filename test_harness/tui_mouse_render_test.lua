@@ -341,6 +341,164 @@ test("cjk browse: y-copy after h-move == 你", browse_copied == "你",
   "copied=" .. tostring(browse_copied))
 
 -- ════════════════════════════════════════════════════════════════
+-- 6f-6k. csel 边界坐标（foot 对照补强, v0.3.111+foot 语义）——
+--    foot 在坐标源头归一化（selection.c:632-657 set_pivot_point:
+--    落 padding 格回走到字符起点; selection.c:841-859 selection_update:
+--    终点在宽字符首格（右侧是 padding）→ new_end.col++ 扩展含整字符;
+--    反向镜像; extract.c:154 复制跳 padding; render.c:1332 光标回走）。
+--    我们的实现是"消费时归一化"（drawRow splitLineByCols 整字符归属 +
+--    readContentSelection from 回走/prevWide 跳 padding）——等价性
+--    由以下边界用例逐项验证:
+--    · 起点落在 padding 格（拖选/单格）→ 选中整字符
+--    · 终点落在宽字符首格（右侧 padding）→ 复制含整字符
+--    · 反向拖（终点在起点左侧）+ 落点在各边界 → 镜像处理
+--    · ASCII 行 + 混合行交叉验证不回归
+-- ════════════════════════════════════════════════════════════════
+-- 驱动完整 touch→drag→drop→退出 的复制流程（返回前捕获 onCopy）
+local function selCopy(ax, ay, bx, by, copy_fn)
+  component.debug_gpu_reset()
+  pcall(tui.init, {onCopy = copy_fn})
+  tui.print("你好世界ab", tui.colors.user)
+  tui.redrawContent()
+  q("touch", "screen-addr", ax, ay, 0)
+  q("drag", "screen-addr", bx, by, 0)
+  q("drop", "screen-addr", bx, by, 0)
+  qKey(120, 45)
+  qKey(13, 28)
+  pcall(tui.readInput, nil)
+end
+
+-- 6f. 起点落在宽字符 padding 格（世 的第 2 格 col 7）+ 向右拖到 界
+--     padding（col 9）→ 高亮与复制都必须覆盖整字符"世界"（foot
+--     set_pivot_point 回走语义: 锚点不在宽字符中间）。
+local f_copied = nil
+freshCjk(function(text) f_copied = text end)
+q("touch", "screen-addr", 7, 2, 0)
+q("drag", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local f6 = cell(6, 2)
+test("cjk 6f: touch-on-padding render covers 世 first cell", f6.fg == 0 and f6.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", f6.fg, f6.bg))
+local f9 = cell(9, 2)
+test("cjk 6f: render covers 界 padding cell", f9.fg == 0 and f9.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", f9.fg, f9.bg))
+local f4 = cell(4, 2)
+test("cjk 6f: prefix 好 keeps original color", f4.fg == tui.colors.user and f4.bg == 0,
+  string.format("fg=%x bg=%x", f4.fg, f4.bg))
+local f10 = cell(10, 2)
+test("cjk 6f: suffix a keeps original color", f10.fg == tui.colors.user and f10.bg == 0,
+  string.format("fg=%x bg=%x", f10.fg, f10.bg))
+f_copied = nil
+selCopy(7, 2, 9, 2, function(t) f_copied = t end)
+test("cjk 6f: copy from padding start == 世界", f_copied == "世界",
+  "copied=" .. tostring(f_copied))
+
+-- 6g. 起点落在首格 + 终点落在同一字符 padding 格（世 6-7 格内选中）
+--     → 复制 "世"（单宽字符整取）; 高亮只覆盖 世, 界 保持后缀
+local g_copied = nil
+selCopy(6, 2, 7, 2, function(t) g_copied = t end)
+test("cjk 6g: select within one wide char == 世", g_copied == "世",
+  "copied=" .. tostring(g_copied))
+-- 6g-2. 单格落点直接在 padding 格（touch+drop 无拖动）→ 整字符
+local g2_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) g2_copied = t end})
+tui.print("你好世界ab", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 9, 2, 0)  -- 界 的 padding 格
+q("drop", "screen-addr", 9, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("cjk 6g: single-cell tap on padding == 界", g2_copied == "界",
+  "copied=" .. tostring(g2_copied))
+freshCjk()
+q("touch", "screen-addr", 6, 2, 0)
+q("drag", "screen-addr", 7, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+local g7 = cell(7, 2)
+test("cjk 6g: 世 padding cell inverted", g7.fg == 0 and g7.bg == tui.colors.user,
+  string.format("fg=%x bg=%x", g7.fg, g7.bg))
+local g8 = cell(8, 2)
+test("cjk 6g: 界 first cell NOT selected (suffix)", g8.fg == tui.colors.user and g8.bg == 0,
+  string.format("fg=%x bg=%x", g8.fg, g8.bg))
+
+-- 6h. 终点落在宽字符首格（界 col 8, 右侧 col 9 是 padding）→ 复制
+--     必须包含整字符（foot selection_update 终点扩展语义）——
+--     选中 2-8 → "你好世界"（界 不因终点截半而丢失）
+local h_copied = nil
+selCopy(2, 2, 8, 2, function(t) h_copied = t end)
+test("cjk 6h: end on first cell expands whole char == 你好世界", h_copied == "你好世界",
+  "copied=" .. tostring(h_copied))
+
+-- 6i. 反向拖: 终点在起点左侧——touch(8)（界首格）drag(3)（你 padding）
+--     → 归一化后 3-8, 复制 "你好世界"（起点你 padding 回走 + 终点
+--     界首格扩展, foot 反向镜像）
+local i_copied = nil
+selCopy(8, 2, 3, 2, function(t) i_copied = t end)
+test("cjk 6i: backward drag whole line == 你好世界", i_copied == "你好世界",
+  "copied=" .. tostring(i_copied))
+
+-- 6j. 反向拖 + 落点在各 padding 边界: touch(9)（界 padding）drag(5)
+--     （好 padding）→ 归一化 5-9, 起点好 padding 回走 → "好世界"
+local j_copied = nil
+selCopy(9, 2, 5, 2, function(t) j_copied = t end)
+test("cjk 6j: backward drag with padding anchors == 好世界", j_copied == "好世界",
+  "copied=" .. tostring(j_copied))
+
+-- 6k. ASCII/混合行交叉验证不回归: 纯 ASCII 选中复制 + 混合行
+--     （ab你好: a=2 b=3 你=4-5 好=6-7）选中跨 ASCII→宽字符
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.print("line one alpha", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 4, 2, 0)
+q("drag", "screen-addr", 8, 2, 0)
+q("drop", "screen-addr", 8, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+local ascii_copy = nil
+tui.onCopy = function(t) ascii_copy = t end
+pcall(tui.readInput, nil)
+test("cjk 6k: ascii row copy unchanged == 'ne on'", ascii_copy == "ne on",
+  "copied=" .. tostring(ascii_copy))
+local k_copy = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) k_copy = t end})
+tui.print("ab你好", tui.colors.user)
+tui.redrawContent()
+q("touch", "screen-addr", 3, 2, 0)
+q("drag", "screen-addr", 5, 2, 0)
+q("drop", "screen-addr", 5, 2, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("cjk 6k: mixed row ascii+wide == b你", k_copy == "b你",
+  "copied=" .. tostring(k_copy))
+
+-- 6l. 多行中文选中: touch(7,2)（世 padding 格）drag(5,3)（下行 'd'）
+--     → 每行 readSegment 独立做 padding 回走/跳过——row2 起点回走
+--     得"世界ab"、row3 整行读"abcd"，\n 连接
+local l_copied = nil
+component.debug_gpu_reset()
+pcall(tui.init, {onCopy = function(t) l_copied = t end})
+tui.print("你好世界ab", tui.colors.user)
+tui.print("abcd你好", tui.colors.assistant)
+tui.redrawContent()
+q("touch", "screen-addr", 7, 2, 0)
+q("drag", "screen-addr", 5, 3, 0)
+q("drop", "screen-addr", 5, 3, 0)
+qKey(120, 45)
+qKey(13, 28)
+pcall(tui.readInput, nil)
+test("cjk 6l: multi-row cjk selection == 世界ab\\nabcd", l_copied == "世界ab\nabcd",
+  "copied=" .. tostring(l_copied):gsub("\n", "\\n"))
+
+-- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
   os.exit(fail > 0 and 1 or 0)
