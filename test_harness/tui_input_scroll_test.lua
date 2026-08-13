@@ -107,6 +107,28 @@ test("A: real scroll uses row redraw (set count > 0)",
   "count=" .. tostring(component.debug_gpu_set_count()))
 
 -- ════════════════════════════════════════════════════════════════
+-- A2. 滚动残留文本（v0.3.113 回归修复）: scrollView 逐行 g.set 覆盖
+--     （无 fill 全屏擦除）——drawRow 行尾若不补空格到满宽, 短行滚动
+--     覆盖长行时残留旧字符（行尾不补满）。构造: 长行(40 x) 在
+--     history[1], 滚到顶（长行上屏）再滚回底（短行覆盖同一行）
+--     → 断言短行右侧全空格。
+-- ════════════════════════════════════════════════════════════════
+component.debug_gpu_reset()
+pcall(tui.init, {})
+tui.debug_set_buffer("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12")  -- ih=8 → h=15
+tui.print(string.rep("x", 40), tui.colors.user)   -- history[1] 长行（40 列）
+for i = 2, 15 do tui.print("line " .. i, tui.colors.user) end
+tui.print("S", tui.colors.user)                   -- history[16] 短行
+-- maxScroll = max(0, 16-15) = 1
+tui.scrollToTop()     -- offset 1: 行2 = history[1] 长行（40 x 上屏）
+tui.scrollToBottom()  -- offset 0: 行2 = history[2] 短行覆盖同一行
+test("A2: scroll residue cleared (short row right side spaces)",
+  cell(10, 2).ch == " " and cell(30, 2).ch == " ",
+  "c10=" .. tostring(cell(10, 2).ch) .. " c30=" .. tostring(cell(30, 2).ch))
+test("A2: short row content intact", cell(2, 2).ch == "l" and cell(7, 2).ch == "2",
+  "c2=" .. tostring(cell(2, 2).ch) .. " c7=" .. tostring(cell(7, 2).ch))
+
+-- ════════════════════════════════════════════════════════════════
 -- B1. 输入框自动增高: inputHeight = 显示行数（上限 8）; 内容区/状态栏
 --     随之让位（status y = 屏高 - inputHeight; 输入框顶 = 屏高-ih+1）。
 -- ════════════════════════════════════════════════════════════════
@@ -326,6 +348,49 @@ pcall(tui.readInput, nil)
 res_r = tui.debug_input_buffer()
 test("B4: backspace at line start is no-op", res_r == "l1\nl2\nl3\nl4",
   "got=" .. tostring(res_r):gsub("\n", "\\n"))
+
+-- ════════════════════════════════════════════════════════════════
+-- C. 折行缓存（v0.3.113 输入卡顿回归）: 光标移动/滚动零重算（version
+--    不变 → inputDisplayLines 缓存命中 O(1)）; 编辑/粘贴恰 1 次重算。
+--    大量文本（200 行 × 50 字符 ≈ 10K 字符）粘贴后编辑/光标行为与
+--    修复前一致。依赖 debug_input_reflow_count() 钩子。
+-- ════════════════════════════════════════════════════════════════
+local big_lines = {}
+for i = 1, 200 do big_lines[i] = "line " .. string.format("%03d", i) .. string.rep("x", 44) end
+local big_text = table.concat(big_lines, "\n")
+
+-- C1: 粘贴 ~10K 字符 + 4 次光标移动 → 恰 2 次重算（readInput 入口清空 1 次
+--     + 粘贴 1 次）——光标移动零重算（卡顿根因回归断言）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", big_text)
+q("key_down", "kb-addr", 0, 205, "player")  -- Right
+q("key_down", "kb-addr", 0, 203, "player")  -- Left
+q("key_down", "kb-addr", 0, 200, "player")  -- Up
+q("key_down", "kb-addr", 0, 208, "player")  -- Down
+q("interrupted")
+pcall(tui.readInput, nil)
+test("C: large paste + 4 cursor moves == 2 reflows (entry+paste, moves=0)",
+  tui.debug_input_reflow_count() == 2,
+  "count=" .. tostring(tui.debug_input_reflow_count()))
+test("C: height capped at 8 for 200 lines", tui.debug_input_height() == 8,
+  "h=" .. tostring(tui.debug_input_height()))
+test("C: window shows last line (line 200) at row 25",
+  cell(5, 25).ch == "l" and cell(10, 25).ch == "2",
+  "c5=" .. tostring(cell(5, 25).ch) .. " c10=" .. tostring(cell(10, 25).ch))
+-- C2: 同一 run 内: 粘贴 + 编辑 1 字符 → 恰 3 次重算（入口+粘贴+字符）;
+--     buffer 完整 = big .. 'X'（大文本编辑正确性）
+component.debug_gpu_reset()
+pcall(tui.init, {})
+q("clipboard", "kb-addr", big_text)
+q("key_down", "kb-addr", 88, 45, "player")  -- 'X'（光标在末尾 → append）
+q("interrupted")
+pcall(tui.readInput, nil)
+test("C: paste + 1 char edit == 3 reflows (entry+paste+char)",
+  tui.debug_input_reflow_count() == 3,
+  "count=" .. tostring(tui.debug_input_reflow_count()))
+test("C: large buffer intact after edit", tui.debug_input_buffer() == big_text .. "X",
+  "len=" .. tostring(#tui.debug_input_buffer()))
 
 -- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
