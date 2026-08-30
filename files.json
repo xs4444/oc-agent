@@ -23,7 +23,7 @@
     "tools/subagent.lua": 9195,
     "tui.lua": 101295,
     "wcwidth.lua": 3353,
-    "docs.lua": 14689
+    "docs.lua": 16742
   },
-  "version": "2026-08-31T0105"
+  "version": "2026-08-31T0110"
 }
