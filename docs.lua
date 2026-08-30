@@ -53,6 +53,35 @@ local function read_version(dir)
   return nil
 end
 
+-- 版本探测（带兜底）: version.txt 缺失但目录含 .md → 视为旧版安装/手工拷贝。
+-- 否则装过文档的盘在引导里显示 "(无)"，用户误判成未安装。
+local function read_installed_version(dir)
+  local v = read_version(dir)
+  if v then return v end
+  local fs = require("filesystem")
+  local ok_ls, iter = pcall(fs.list, dir)
+  if ok_ls then
+    for item in iter do
+      if tostring(item):gsub("/$", ""):match("%.md$") then
+        return "未知(无version.txt)"
+      end
+    end
+  end
+  return nil
+end
+
+-- 写探测: 能创建+删除临时文件才视为可写（只读盘/写保护软盘明示，
+-- 否则该盘从安装候选里"消失"，用户不知道去哪了）
+local function probe_writable(dir)
+  local ok, f = pcall(io.open, dir .. "/.doc_probe", "w")
+  if ok and f then
+    pcall(function() f:close() end)
+    pcall(os.remove, dir .. "/.doc_probe")
+    return true
+  end
+  return false
+end
+
 local function human_size(n)
   n = tonumber(n)
   if not n then return "?" end
@@ -139,7 +168,7 @@ end
 
 -- ── 磁盘/安装状态扫描 ─────────────────────────────────────────
 
--- 扫描已安装位置: 返回 {path=..., version=...} 列表（/mnt/*/doc + /doc）
+-- 扫描已安装位置: 返回 {path=..., version=..., writable=...} 列表（/mnt/*/doc + /doc）
 local function scan_installed()
   local fs = require("filesystem")
   local found = {}
@@ -149,12 +178,16 @@ local function scan_installed()
       -- fs.list 的目录项可能带尾斜杠（ocvm 等实现差异），先去掉
       local name = tostring(item):gsub("/$", "")
       local full = "/mnt/" .. name .. "/doc"
-      local v = read_version(full)
-      if v then found[#found + 1] = {path = full, version = v} end
+      local v = read_installed_version(full)
+      if v then
+        found[#found + 1] = {path = full, version = v, writable = probe_writable(full)}
+      end
     end
   end
-  local v_root = read_version("/doc")
-  if v_root then found[#found + 1] = {path = "/doc", version = v_root} end
+  local v_root = read_installed_version("/doc")
+  if v_root then
+    found[#found + 1] = {path = "/doc", version = v_root, writable = probe_writable("/doc")}
+  end
   return found
 end
 
@@ -212,7 +245,9 @@ end
 local function install_to(dest, ref, manifest)
   local latest = manifest and json_field(manifest, "version") or nil
   local cur = read_version(dest)
-  print("  目标: " .. dest .. "（当前 " .. tostring(cur or "未安装") .. "）")
+  -- 显示用兜底（旧安装无 version.txt 也如实显示），版本比对仍用原始值
+  local cur_show = cur or read_installed_version(dest)
+  print("  目标: " .. dest .. "（当前 " .. tostring(cur_show or "未安装") .. "）")
   print("  最新: " .. tostring(latest or "?"))
   if latest and cur == latest then
     print("该位置文档已是最新，跳过下载。")
@@ -269,12 +304,13 @@ local function interactive()
   print("")
   print("=== 离线文档管理 ===")
 
-  -- 已安装
+  -- 已安装（writable=false → 盘只读/写保护，原地更新会被拒绝，明示）
   local installed = scan_installed()
   if #installed > 0 then
     print("已安装:")
     for i, ins in ipairs(installed) do
-      print("  [" .. i .. "] " .. ins.path .. " — 版本 " .. ins.version)
+      local ro = (ins.writable == false) and "（当前不可写，无法更新）" or ""
+      print("  [" .. i .. "] " .. ins.path .. " — 版本 " .. ins.version .. ro)
     end
   else
     print("已安装: (无)")
@@ -342,7 +378,10 @@ local function interactive()
   end
 
   local dest
-  -- 安装目标只列数据盘（排除系统盘）
+  -- 安装目标只列数据盘（排除系统盘）；已安装的位置标出当前版本，
+  -- 用户能看出选哪个是原地更新
+  local inst_ver = {}
+  for _, ins in ipairs(installed) do inst_ver[ins.path] = ins.version end
   local data_disks = {}
   for _, d in ipairs(disks) do
     if not d.system then data_disks[#data_disks + 1] = d end
@@ -352,9 +391,15 @@ local function interactive()
     for i, d in ipairs(data_disks) do
       local rec = ""
       if i == 1 then rec = "（推荐: 剩余空间最大）" end
+      local cur = inst_ver[d.path .. "/doc"]
+      if cur then rec = "（已安装: " .. cur .. "）" .. rec end
       print("  [" .. i .. "] " .. d.path .. "/doc — 可用 " .. human_size(d.avail) .. rec)
     end
-    print("  [0] 根目录 /doc（不推荐: 系统盘空间紧张）")
+    local cur_root = inst_ver["/doc"]
+    local root_note = cur_root
+      and ("（已安装: " .. cur_root .. "；不推荐: 系统盘空间紧张）")
+      or "（不推荐: 系统盘空间紧张）"
+    print("  [0] 根目录 /doc" .. root_note)
     io.write("选择 [1]: ")
     local pick = io.read()
     local idx = tonumber(pick and pick:gsub("%s", "")) or 1
@@ -384,7 +429,8 @@ if mode == "uninstall" then
   else
     print("已安装:")
     for i, ins in ipairs(installed) do
-      print("  [" .. i .. "] " .. ins.path .. " — 版本 " .. ins.version)
+      local ro = (ins.writable == false) and "（当前不可写，无法更新）" or ""
+      print("  [" .. i .. "] " .. ins.path .. " — 版本 " .. ins.version .. ro)
     end
     io.write("选择要卸载的位置 [1]: ")
     local pick = io.read()
@@ -402,7 +448,8 @@ elseif mode == "status" then
   local installed = scan_installed()
   if #installed > 0 then
     for _, ins in ipairs(installed) do
-      print("已安装: " .. ins.path .. " — 版本 " .. ins.version)
+      local ro = (ins.writable == false) and "（当前不可写）" or ""
+      print("已安装: " .. ins.path .. " — 版本 " .. ins.version .. ro)
     end
   else
     print("已安装: (无)")
