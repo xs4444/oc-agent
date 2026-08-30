@@ -2549,63 +2549,166 @@ print("════════════════════════�
 print("Sessions & Scroll Command Tests")
 print("═══════════════════════════════════════")
 
--- list_sessions: 扫描会话目录的 *.jsonl（/new 归档 .txt 不列入）
-local sdir = "test_sessions_tmp"
-os.execute("mkdir " .. sdir .. " 2>nul")
-local s_a = io.open(sdir .. "/alpha.jsonl", "w")
-s_a:write(json.encode({role = "user", content = "a1"}) .. "\n")
-s_a:write(json.encode({role = "assistant", content = "a2"}) .. "\n")
-s_a:close()
-local s_b = io.open(sdir .. "/beta.jsonl", "w")
-s_b:write(json.encode({role = "user", content = "b1"}) .. "\n")
-s_b:close()
-io.open(sdir .. "/archive.txt", "w"):write("ignored"):close()
-local sess_list = agent_test.list_sessions(sdir)
-test("list_sessions finds jsonl sessions", #sess_list == 2,
-  "#=" .. tostring(#sess_list))
-test("list_sessions counts messages",
-  sess_list[1].name == "alpha" and sess_list[1].count == 2
-  or sess_list[1].name == "beta" and sess_list[1].count == 1,
-  sess_list[1].name .. "=" .. tostring(sess_list[1].count))
+do  -- 包裹成块: 主 chunk 局部变量贴 200 上限时 VM 寄存器错乱（boolean 当函数调）
+  -- list_sessions: 扫描会话目录的 *.jsonl（/new 归档 .txt 不列入）
+  local sdir = "test_sessions_tmp"
+  os.execute("mkdir " .. sdir .. " 2>nul")
+  local s_a = io.open(sdir .. "/alpha.jsonl", "w")
+  s_a:write(json.encode({role = "user", content = "a1"}) .. "\n")
+  s_a:write(json.encode({role = "assistant", content = "a2"}) .. "\n")
+  s_a:close()
+  local s_b = io.open(sdir .. "/beta.jsonl", "w")
+  s_b:write(json.encode({role = "user", content = "b1"}) .. "\n")
+  s_b:close()
+  io.open(sdir .. "/archive.txt", "w"):write("ignored"):close()
+  local sess_list = agent_test.list_sessions(sdir)
+  test("list_sessions finds jsonl sessions", #sess_list == 2,
+    "#=" .. tostring(#sess_list))
+  test("list_sessions counts messages",
+    sess_list[1].name == "alpha" and sess_list[1].count == 2
+    or sess_list[1].name == "beta" and sess_list[1].count == 1,
+    sess_list[1].name .. "=" .. tostring(sess_list[1].count))
 
--- 切换核心机制: set_paths → load_history 加载新会话
-local orig_path = agent_test.current_session_path()
-agent_test.set_history_path(sdir .. "/beta.jsonl")
-local beta_msgs = agent_test.load_history()
-test("session switch loads new history",
-  #beta_msgs == 1 and beta_msgs[1].content == "b1",
-  "#=" .. tostring(#beta_msgs))
-agent_test.set_history_path(orig_path)
+  -- 切换核心机制: set_paths → load_history 加载新会话
+  local orig_path = agent_test.current_session_path()
+  agent_test.set_history_path(sdir .. "/beta.jsonl")
+  local beta_msgs = agent_test.load_history()
+  test("session switch loads new history",
+    #beta_msgs == 1 and beta_msgs[1].content == "b1",
+    "#=" .. tostring(#beta_msgs))
+  agent_test.set_history_path(orig_path)
 
--- handle_command: /sessions 输出 + /session 切换 + 翻页命令不崩
-local cmd_cfg = {model = "m", api_key = ""}
-local cmd_msgs = {{role = "user", content = "hello"}}
-local exit1, c1, m1 = agent_test.handle_command("/sessions", cmd_cfg, cmd_msgs)
-test("/sessions lists sessions", not exit1 and type(m1) == "table"
-  and m1 == cmd_msgs, tostring(exit1))
-local exit2, c2, m2 = agent_test.handle_command("/session", cmd_cfg, cmd_msgs)
-test("/session usage without name", not exit2 and c2 == cmd_cfg and m2 == cmd_msgs)
-local exit3, c3, m3 = agent_test.handle_command("/session default", cmd_cfg, cmd_msgs)
-test("/session default resets path", not exit3 and c3 == cmd_cfg and type(m3) == "table",
-  "m3=" .. tostring(type(m3)))
-agent_test.set_history_path(orig_path)
-local exit4 = agent_test.handle_command("/up", cmd_cfg, cmd_msgs)
-test("/up without TUI prints hint", not exit4)
-local exit5 = agent_test.handle_command("/pgdn", cmd_cfg, cmd_msgs)
-test("/pgdn without TUI prints hint", not exit5)
-local exit6 = agent_test.handle_command("/top", cmd_cfg, cmd_msgs)
-test("/top without TUI prints hint", not exit6)
-local exit7 = agent_test.handle_command("/browse", cmd_cfg, cmd_msgs)
-test("/browse without TUI prints hint", not exit7)
-local exit8 = agent_test.handle_command("/search hello", cmd_cfg, cmd_msgs)
-test("/search without TUI prints hint", not exit8)
-local exit9 = agent_test.handle_command("/snext", cmd_cfg, cmd_msgs)
-test("/snext without TUI prints hint", not exit9)
--- 清理
-os.remove(sdir .. "/alpha.jsonl")
-os.remove(sdir .. "/beta.jsonl")
-os.remove(sdir .. "/archive.txt")
-os.execute("rmdir " .. sdir .. " 2>nul")
+  -- handle_command: /sessions 输出 + /session 切换 + 翻页命令不崩
+  local cmd_cfg = {model = "m", api_key = ""}
+  local cmd_msgs = {{role = "user", content = "hello"}}
+  local exit1, c1, m1 = agent_test.handle_command("/sessions", cmd_cfg, cmd_msgs)
+  test("/sessions lists sessions", not exit1 and type(m1) == "table"
+    and m1 == cmd_msgs, tostring(exit1))
+  local exit2, c2, m2 = agent_test.handle_command("/session", cmd_cfg, cmd_msgs)
+  test("/session usage without name", not exit2 and c2 == cmd_cfg and m2 == cmd_msgs)
+  local exit3, c3, m3 = agent_test.handle_command("/session default", cmd_cfg, cmd_msgs)
+  test("/session default resets path", not exit3 and c3 == cmd_cfg and type(m3) == "table",
+    "m3=" .. tostring(type(m3)))
+  agent_test.set_history_path(orig_path)
+  local exit4 = agent_test.handle_command("/up", cmd_cfg, cmd_msgs)
+  test("/up without TUI prints hint", not exit4)
+  local exit5 = agent_test.handle_command("/pgdn", cmd_cfg, cmd_msgs)
+  test("/pgdn without TUI prints hint", not exit5)
+  local exit6 = agent_test.handle_command("/top", cmd_cfg, cmd_msgs)
+  test("/top without TUI prints hint", not exit6)
+  local exit7 = agent_test.handle_command("/browse", cmd_cfg, cmd_msgs)
+  test("/browse without TUI prints hint", not exit7)
+  local exit8 = agent_test.handle_command("/search hello", cmd_cfg, cmd_msgs)
+  test("/search without TUI prints hint", not exit8)
+  local exit9 = agent_test.handle_command("/snext", cmd_cfg, cmd_msgs)
+  test("/snext without TUI prints hint", not exit9)
+  -- 清理
+  os.remove(sdir .. "/alpha.jsonl")
+  os.remove(sdir .. "/beta.jsonl")
+  os.remove(sdir .. "/archive.txt")
+  os.execute("rmdir " .. sdir .. " 2>nul")
+end
+
+-- ═══════════════════════════════════════════
+-- /resume: 恢复历史消息（pi session-picker / reasonix --resume 语义）
+--   ① 按名恢复命名会话（消息加载 + 持久化路径切换）
+--   ② 序号越界 / 未知名 → 报错且不动当前会话
+--   ③ 序号恢复（default 夹具在列与否动态探测；须在 ④ 前跑——
+--      ④ 产生的 agent_history_100.jsonl 会插到 alpha 前面）
+--   ④ /new 归档 .txt → 迁移为同名 .jsonl 并恢复，.txt 保留
+--   ⑤ 归档二次恢复 → 续写既有 jsonl（保留恢复后新增的消息）
+-- 注意: 主 chunk 局部变量贴近 200 上限——本节用 IIFE 包裹（零新增
+-- main chunk 局部变量），块内一律复用局部名。
+-- ═══════════════════════════════════════════
+(function()
+  local rdir = "test_resume_tmp"
+  local saved_sdir = agent_test.get_sessions_dir()
+  local saved_path = agent_test.current_session_path()
+  local rcfg, rmsgs, mm = {model = "m", api_key = ""}, {{role = "user", content = "current"}}, nil
+  agent_test.set_sessions_dir(rdir)
+  os.execute("mkdir " .. rdir .. " 2>nul")
+
+  local f_a = io.open(rdir .. "/alpha.jsonl", "w")
+  f_a:write(json.encode({role = "user", content = "alpha question"}) .. "\n")
+  f_a:write(json.encode({role = "assistant", content = "alpha answer"}) .. "\n")
+  f_a:close()
+  local f_arch = io.open(rdir .. "/agent_history_100.txt", "w")
+  f_arch:write(serialization.serialize({
+    {role = "user", content = "archived question"},
+    {role = "assistant", content = "archived answer"},
+  }))
+  f_arch:close()
+
+  -- ① 按名恢复命名会话
+  mm = select(3, agent_test.handle_command("/resume alpha", rcfg, rmsgs))
+  test("/resume <name> loads named session",
+    type(mm) == "table" and #mm == 2 and mm[1].content == "alpha question"
+    and agent_test.current_session_path() == rdir .. "/alpha.jsonl",
+    tostring(agent_test.current_session_path()) .. " #=" .. tostring(mm and #mm))
+
+  -- ② 序号越界 → 不动当前会话
+  mm = select(3, agent_test.handle_command("/resume 99", rcfg, rmsgs))
+  test("/resume <n> out of range keeps session",
+    mm == rmsgs and agent_test.current_session_path() == rdir .. "/alpha.jsonl",
+    tostring(agent_test.current_session_path()))
+
+  -- ③ 序号恢复: default 条目在列与否取决于 HISTORY_PATH 夹具 → 动态探测
+  do
+    local listed = false
+    local f = io.open("./agent_history.txt", "r")
+    if f then
+      for line in f:lines() do
+        local ok_j, m = pcall(json.decode, line)
+        if ok_j and type(m) == "table" and m.role then listed = true break end
+      end
+      f:close()
+    end
+    mm = select(3, agent_test.handle_command("/resume " .. (listed and 2 or 1), rcfg, rmsgs))
+    test("/resume <n> loads by index",
+      type(mm) == "table" and #mm == 2 and mm[1].content == "alpha question",
+      "#=" .. tostring(mm and #mm))
+  end
+
+  -- ④ 归档恢复: .txt → .jsonl 迁移
+  mm = select(3, agent_test.handle_command("/resume agent_history_100", rcfg, rmsgs))
+  do
+    local jlines = 0
+    local jf = io.open(rdir .. "/agent_history_100.jsonl", "r")
+    if jf then
+      for line in jf:lines() do
+        local ok_j, m = pcall(json.decode, line)
+        if ok_j and type(m) == "table" and m.role then jlines = jlines + 1 end
+      end
+      jf:close()
+    end
+    test("/resume archive migrates to jsonl",
+      type(mm) == "table" and #mm == 2 and mm[1].content == "archived question"
+      and jlines == 2 and agent_test.current_session_path() == rdir .. "/agent_history_100.jsonl",
+      "#=" .. tostring(mm and #mm) .. " jlines=" .. tostring(jlines)
+      .. " path=" .. tostring(agent_test.current_session_path()))
+    test("/resume archive keeps .txt", io.open(rdir .. "/agent_history_100.txt", "r") ~= nil,
+      "txt missing")
+  end
+
+  -- ⑤ 二次恢复归档 → 续写 jsonl（不覆盖恢复后新增消息）
+  agent_test.append_history({role = "user", content = "post-resume followup"})
+  mm = select(3, agent_test.handle_command("/resume agent_history_100", rcfg, rmsgs))
+  test("/resume archive twice continues jsonl",
+    type(mm) == "table" and #mm == 3 and mm[3].content == "post-resume followup",
+    "#=" .. tostring(mm and #mm))
+
+  -- 未知名报错
+  mm = select(3, agent_test.handle_command("/resume ghost", rcfg, rmsgs))
+  test("/resume unknown name keeps session", mm == rmsgs, tostring(mm == rmsgs))
+
+  -- 清理
+  agent_test.set_sessions_dir(saved_sdir)
+  agent_test.set_history_path(saved_path)
+  os.remove(rdir .. "/alpha.jsonl")
+  os.remove(rdir .. "/agent_history_100.txt")
+  os.remove(rdir .. "/agent_history_100.jsonl")
+  os.execute("rmdir " .. rdir .. " 2>nul")
+end)()
 
 -- ═══════════════════════════════════════════
 -- debug 报告: 无全局/模块 computer 时不崩

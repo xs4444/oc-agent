@@ -480,7 +480,7 @@ local function handle_command(cmd, config, messages)
         f:close()
       end)
       if ok_save then
-        print("Session archived to " .. archive_path)
+        print("Session archived to " .. archive_path .. " (/resume to restore)")
       else
         print("Session archive failed: " .. tostring(save_err))
       end
@@ -538,6 +538,184 @@ local function handle_command(cmd, config, messages)
           session_mod.set_paths(SESSIONS_DIR .. "/" .. safe .. ".jsonl")
           messages = session_mod.load_history()
           print("Session: " .. safe .. " (" .. #messages .. " msgs)")
+        end
+      end
+    end
+  elseif command == "/resume" then
+    -- 类 pi /resume（参考 repos/pi session-picker、reasonix --resume 的
+    -- SetSession 语义）: 恢复历史消息。可恢复项 = default 主会话 +
+    -- /session 命名会话（*.jsonl）+ /new 归档（agent_history_*.txt，
+    -- Lua 序列化格式——load_history 只认 JSONL，归档仅 /resume 能读回）。
+    -- /resume 交互选择（/relocate 同款 readline，TUI 走 ui.readInput）；
+    -- /resume <n> 按序号；/resume <name> 按名。恢复 = 整体替换当前消息
+    -- 表并把持久化路径切到目标（此后 append 写入目标会话——pi 同语义:
+    -- 从选定会话继续追加，而非只读回放）。归档恢复时迁移为同名 .jsonl
+    -- （续写判断: 对侧 jsonl 条数 >= 归档则直接续写，避免覆盖上次恢复
+    -- 后新增的消息；.txt 保留——cleanup_sessions 约定不动归档）。
+    local sdir = session_mod.get_sessions_dir()
+    local entries = {}
+    local function preview_of(content)
+      local p = tostring(content or ""):gsub("%s+", " ")
+      if p == "" then return "" end
+      if #p > 40 then return utf8_safe_cut(p, 40) .. "…" end
+      return p
+    end
+    -- 单遍流式统计 + 首条 user 消息预览（损坏行跳过，与 load_history 同策略）
+    local function scan_jsonl(name, path, kind)
+      local f = io.open(path, "r")
+      if not f then return end
+      local count, preview = 0, ""
+      for line in f:lines() do
+        local ok_j, msg = pcall(json.decode, line)
+        if ok_j and type(msg) == "table" and msg.role then
+          count = count + 1
+          if preview == "" and msg.role == "user" then
+            preview = preview_of(msg.content)
+          end
+        end
+      end
+      f:close()
+      if count > 0 then
+        entries[#entries + 1] = {name = name, kind = kind or "session", path = path, count = count, preview = preview}
+      end
+    end
+    -- 归档 .txt → {name, count, preview}（unserialize 失败 = 损坏，跳过）
+    local function scan_archive(name, path)
+      local f = io.open(path, "r")
+      if not f then return end
+      local content = f:read("*a")
+      f:close()
+      local ser = require("serialization")
+      local ok_u, data = pcall(ser.unserialize, content)
+      if not ok_u or type(data) ~= "table" then return end
+      local list = data.role and {data} or data
+      if #list == 0 then return end
+      local preview = ""
+      for _, m in ipairs(list) do
+        if type(m) == "table" and m.role == "user" then
+          preview = preview_of(m.content)
+          break
+        end
+      end
+      entries[#entries + 1] = {name = name, kind = "archive", path = path, count = #list, preview = preview}
+    end
+    scan_jsonl("default", HISTORY_PATH, "main")
+    do
+      local fs = require("filesystem")
+      local ok_l, iter = pcall(fs.list, sdir)
+      local jsonls, archives = {}, {}
+      if ok_l and type(iter) == "function" then
+        for name in iter do
+          if name:sub(-6) == ".jsonl" then
+            jsonls[#jsonls + 1] = name
+          elseif name:match("^agent_history_.+%.txt$") then
+            archives[#archives + 1] = name
+          end
+        end
+      end
+      table.sort(jsonls)
+      for _, name in ipairs(jsonls) do
+        scan_jsonl(name:sub(1, -7), sdir .. "/" .. name)
+      end
+      table.sort(archives)
+      for _, name in ipairs(archives) do
+        scan_archive(name:sub(1, -5), sdir .. "/" .. name)
+      end
+    end
+    if #entries == 0 then
+      print("No resumable sessions (named sessions & /new archives; /session <name> to create)")
+    else
+      local function resolve(sel)
+        local n = tonumber(sel)
+        if n and n == math.floor(n) and n >= 1 and n <= #entries then
+          return entries[n]
+        end
+        for _, e in ipairs(entries) do
+          if e.name == sel then return e end
+        end
+        local base = sel:gsub("%.jsonl$", ""):gsub("%.txt$", "")
+        for _, e in ipairs(entries) do
+          if e.name == base then return e end
+        end
+        return nil
+      end
+      local function do_resume(e)
+        if e.kind == "archive" then
+          -- 归档恢复: 先对侧 jsonl 续写判断（条数 >= 归档 = 上次恢复的
+          -- 产物且已含归档全部内容），否则整体迁移重建
+          local jsonl_path = e.path:sub(1, -5) .. ".jsonl"
+          local f2 = io.open(jsonl_path, "r")
+          if f2 then
+            local n2 = 0
+            for line in f2:lines() do
+              local ok_j, m = pcall(json.decode, line)
+              if ok_j and type(m) == "table" and m.role then n2 = n2 + 1 end
+            end
+            f2:close()
+            if n2 >= e.count then
+              session_mod.set_paths(jsonl_path)
+              local msgs = load_history()
+              print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, continued session)")
+              return msgs
+            end
+          end
+          local f = io.open(e.path, "r")
+          if not f then
+            print("Cannot open archive: " .. e.path)
+            return nil
+          end
+          local content = f:read("*a")
+          f:close()
+          local ser = require("serialization")
+          local ok_u, data = pcall(ser.unserialize, content)
+          if not ok_u or type(data) ~= "table" then
+            print("Archive unreadable: " .. tostring(ok_u and "bad format" or data))
+            return nil
+          end
+          local list = data.role and {data} or data
+          local msgs = trim_history(list)
+          session_mod.set_paths(jsonl_path)
+          rebuild_history(msgs)
+          print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, archive migrated to JSONL; .txt kept)")
+          return msgs
+        else
+          session_mod.set_paths(e.path)
+          local msgs = load_history()
+          print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs)")
+          return msgs
+        end
+      end
+      local sel = parts[2]
+      if not sel then
+        -- 交互选择: 列表 + 序号输入（/relocate 同款 readline——REPL 走
+        -- io.read，TUI 走 ui.readInput 嵌套读取）
+        print("Resumable sessions:")
+        for i, e in ipairs(entries) do
+          local tag = e.kind == "archive" and " [archive]" or (e.kind == "main" and " [main]" or "")
+          local cur = e.path == session_mod.current_path() and " *current*" or ""
+          local pv = e.preview ~= "" and "  | " .. e.preview or ""
+          print(string.format("  %d. %-20s (%d msgs)%s%s%s", i, e.name, e.count, tag, cur, pv))
+        end
+        io.write("Resume # (1-" .. #entries .. ", Enter=cancel): ")
+        local line
+        if UI_INPUT then
+          line = UI_INPUT()  -- ^C 返回 nil → 取消; 严禁回退 io.read（TUI 下阻塞）
+        else
+          line = io.read()
+        end
+        sel = line and line:gsub("^%s+", ""):gsub("%s+$", "") or ""
+        if sel == "" then
+          print("Cancelled")
+          sel = nil
+        end
+      end
+      if sel then
+        local e = resolve(sel)
+        if not e then
+          print("No such session: " .. sel .. " (/resume to list)")
+        else
+          local new_msgs = do_resume(e)
+          if new_msgs then messages = new_msgs end
         end
       end
     end
@@ -978,6 +1156,7 @@ local function handle_command(cmd, config, messages)
     print("  /hist           Show current session name and message count")
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
+    print("  /resume [n|name] Resume history: picker (no args), by number or name; also restores /new archives")
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
     print("  /preset-200k    One-shot: set context_window=200000 (+ memory check)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
@@ -2021,7 +2200,7 @@ local function main(config, ...)
         return table.concat(parts, "  ")
       end)
       -- Tab 补全: 命令 + 工具名
-      local comps = {"/help", "/ctx", "/ml", "/new", "/reset", "/compact", "/hist",
+      local comps = {"/help", "/ctx", "/ml", "/new", "/resume", "/reset", "/compact", "/hist",
         "/sessions", "/session", "/relocate", "/preset-200k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
@@ -2201,6 +2380,8 @@ if _TEST_MODE then
     rebuild_history = rebuild_history,
     set_history_path = function(p) session_mod.set_paths(p) end,
     list_sessions = session_mod.list_sessions,
+    get_sessions_dir = session_mod.get_sessions_dir,
+    set_sessions_dir = session_mod.set_sessions_dir,
     current_session_path = session_mod.current_path,
     handle_command = handle_command,
     process_exchange = process_exchange,
