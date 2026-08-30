@@ -2176,6 +2176,111 @@ do
   next_llm = nil
 end
 
+-- 静默停滞 nudge（v0.3.122 重设计）: 默认 12 轮零文本工具轮注入一次进度
+-- 提醒（旧默认 5 轮催收尾，真机实证会拦腰打断正当长工具链）;
+-- 文案改为"汇报进展后可继续"; 有可见输出 → 重新武装（每段静默链提醒一次）。
+do
+  -- 测试1: 默认阈值——12 轮静默触发一次，13 轮收尾
+  local st_resp = {}
+  for i = 1, 12 do
+    st_resp[i] = llm_tool_calls({{id = "call_" .. i, type = "function",
+      ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}})
+  end
+  st_resp[13] = llm_content("最终答案")
+  next_llm = st_resp
+  llm_idx = 0
+  local st_msgs = {}
+  local st_res = agent_test.process_exchange(st_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000}, "测试", false)
+  local nudges = 0
+  for _, m in ipairs(st_msgs) do
+    if m.role == "user" and type(m.content) == "string"
+        and m.content:find("没有任何可见输出", 1, true) then
+      nudges = nudges + 1
+    end
+  end
+  test("stall nudge: 12 silent tool rounds trigger once (default)",
+    st_res and st_res.text == "最终答案" and nudges == 1,
+    "nudges=" .. tostring(nudges) .. " res=" .. tostring(st_res and st_res.text))
+  next_llm = nil
+end
+
+do
+  -- 测试2: config 覆盖阈值 + 叙述轮重置并重新武装——rounds=2 时
+  -- 静默2轮→nudge#1，叙述1轮（重置+再武装），静默2轮→nudge#2
+  -- （参数逐轮变化，避免误触 doom-loop 护栏）
+  local with_tool = function(i)
+    return {choices = {{message = {role = "assistant", content = nil,
+      tool_calls = {{id = "call_" .. i, type = "function",
+        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+      finish_reason = "stop"}}}
+  end
+  local narrated = function(i, text)
+    return {choices = {{message = {role = "assistant", content = text,
+      tool_calls = {{id = "call_" .. i, type = "function",
+        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+      finish_reason = "stop"}}}
+  end
+  next_llm = {
+    with_tool(1),                 -- r1 静默 count=1
+    with_tool(2),                 -- r2 count=2 → nudge#1（工具仍执行）
+    narrated(3, "进展汇报"),       -- r3 有文本 → 重置 + 重新武装
+    with_tool(4),                 -- r4 count=1
+    with_tool(5),                 -- r5 count=2 → nudge#2（再武装生效）
+    llm_content("最终答案"),       -- 收尾
+  }
+  llm_idx = 0
+  local st2_msgs = {}
+  local st2_res = agent_test.process_exchange(st2_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000, stall_nudge_rounds = 2}, "测试", false)
+  local nudges2 = 0
+  for _, m in ipairs(st2_msgs) do
+    if m.role == "user" and type(m.content) == "string"
+        and m.content:find("没有任何可见输出", 1, true) then
+      nudges2 = nudges2 + 1
+    end
+  end
+  test("stall nudge: config override + re-arm after narration",
+    st2_res and st2_res.text and st2_res.text:find("最终答案", 1, true) ~= nil
+      and nudges2 == 2,
+    "nudges=" .. tostring(nudges2) .. " res=" .. tostring(st2_res and st2_res.text))
+  next_llm = nil
+end
+
+do
+  -- 测试3: 每轮都带文本的工具链永不触发（叙述即不算静默停滞）
+  local narrated2 = function(i, text)
+    return {choices = {{message = {role = "assistant", content = text,
+      tool_calls = {{id = "call_" .. i, type = "function",
+        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+      finish_reason = "stop"}}}
+  end
+  next_llm = {
+    narrated2(1, "第1步"),
+    narrated2(2, "第2步"),
+    llm_content("最终答案"),
+  }
+  llm_idx = 0
+  local st3_msgs = {}
+  local st3_res = agent_test.process_exchange(st3_msgs,
+    {model = "m", api_key = "", api_url = "https://example.test/chat/completions",
+     context_window = 128000, stall_nudge_rounds = 2}, "测试", false)
+  local nudges3 = 0
+  for _, m in ipairs(st3_msgs) do
+    if m.role == "user" and type(m.content) == "string"
+        and m.content:find("没有任何可见输出", 1, true) then
+      nudges3 = nudges3 + 1
+    end
+  end
+  test("stall nudge: narrated tool rounds never trigger",
+    st3_res and st3_res.text and st3_res.text:find("最终答案", 1, true) ~= nil
+      and nudges3 == 0,
+    "nudges=" .. tostring(nudges3) .. " res=" .. tostring(st3_res and st3_res.text))
+  next_llm = nil
+end
+
 -- 任务1 触顶收尾: 触顶后的最后请求仍返回 tool_calls → 丢弃只取 content
 do
   next_llm = {

@@ -8355,8 +8355,8 @@ local function process_exchange(messages, config, user_input, persist, session, 
   local tool_steps = 0
   local tool_cap_reached = false
   local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
-  local stall_count = 0        -- 停滞检测: 连续无产出轮数（reasonix todoStallPause 借鉴）
-  local stall_nudged = false   -- nudge 已注入（限一次，防刷屏）
+  local stall_count = 0        -- 静默停滞计数: 连续零文本工具轮数（reasonix todoStallPause 借鉴）
+  local stall_nudged = false   -- nudge 武装标志: 注入后一旦有可见输出即重新武装
   -- 重复调用检测（doom-loop 护栏，opencode 借鉴）: 记录最近工具调用签名
   -- （name + arguments 摘要，最多 8 条）；最近 4 条内同签名 ≥3 次 → 循环。
   -- 与 cap_trigger 是两套独立机制；重复检测优先于工具执行。
@@ -8752,21 +8752,24 @@ local function process_exchange(messages, config, user_input, persist, session, 
       end
     end
 
-    -- ── todo 停滞检测 + nudge（reasonix todoStallPause 借鉴）──
-    -- 模型连续多轮只产出工具调用、无任何可见回答（final_text 空）时，
-    -- 注入一次引导消息让其收尾/换策略——而不是默默烧完 MAX_TOOL_STEPS
-    -- 轮后由 cap_trigger 硬提示（更早介入，省 token 省时间）。
-    -- nudge 限一次（stall_nudged），防模型无视后无限刷提示；
-    -- 有可见内容产出即重置计数。
-    if #final_text == 0 then
+    -- ── 静默停滞检测 + 进度 nudge（reasonix todoStallPause 借鉴）──
+    -- 按轮检测: 本轮零文本输出（content 空/纯空白）→ streak +1，有输出
+    -- → 清零并重新武装。连续 N 轮（默认 12 ≈ MAX_TOOL_STEPS 40 的 1/3）
+    -- 静默 → 注入一次进度提醒——请模型汇报一句进展，不强制收尾
+    -- （真机实证: 正当长工具链轻松超 5 轮，旧版以"final_text 整体为空"
+    -- 计数且 5 轮即催最终回答，长任务被拦腰打断；且 final_text 累积
+    -- 全场，一旦产出过文本旧计数永久失效）。config.stall_nudge_rounds
+    -- 可覆盖。
+    local round_text = response.content
+    if not (type(round_text) == "string" and round_text:gsub("%s", "") ~= "") then
       stall_count = stall_count + 1
-      local nudge_rounds = tonumber(config.stall_nudge_rounds) or 5
+      local nudge_rounds = tonumber(config.stall_nudge_rounds) or 12
       if stall_count >= nudge_rounds and not stall_nudged then
         stall_nudged = true
         print("[stall] 连续 " .. stall_count .. " 轮无可见回答，注入 nudge")
         local nudge_msg = {role = "user",
           content = "你已连续 " .. stall_count
-            .. " 轮只调用工具但没有产出可见回答。请基于已有信息总结进展并给出最终回答；如果确实还需要信息，请明确说明下一步要做什么、需要什么。"}
+            .. " 轮只调用工具且没有任何可见输出。请先用一两句话向用户简要汇报当前进展和下一步计划，然后继续任务；如果信息已足够，直接给出最终回答。"}
         messages[#messages + 1] = nudge_msg
         if persist then
           if session then append_session_history(session, nudge_msg)
@@ -8775,6 +8778,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
       end
     else
       stall_count = 0
+      stall_nudged = false  -- 汇报过进展 → 允许下一段静默链再次提醒
     end
   end
 
