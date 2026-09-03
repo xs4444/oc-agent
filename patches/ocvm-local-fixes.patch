@@ -1,0 +1,85 @@
+diff --git a/Makefile b/Makefile
+index ed9b0c0..34b4dbe 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ lua ?= lua
+ 
+ TARGET_EXEC ?= ocvm
+-OPENCOMPUTERS=https://github.com/MightyPirates/OpenComputers/
++OPENCOMPUTERS=https://github.com/GTNewHorizons/OpenComputers/
+ 
+ LUA_CFLAGS  := $(shell pkg-config --cflags $(lua) --silence-errors)
+ LUA_LDFLAGS := $(shell pkg-config --libs $(lua) --silence-errors)
+diff --git a/client.cfg b/client.cfg
+index cc0a76d..ae97d8d 100644
+--- a/client.cfg
++++ b/client.cfg
+@@ -18,7 +18,7 @@
+         -- T2.5:  524288
+         -- T3  :  786432
+         -- T3.5: 1048576
+-        {"computer", nil, 1048576},
++        {"computer", nil, 4194304},
+         -- filesystem
+         -- 1. source: uri for readonly loot, nil/false for hdd, and true for tmpfs
+         -- 2. label
+@@ -41,7 +41,7 @@
+     },
+     system =
+     {
+-        timeout = 5, -- defaults to 5
++        timeout = 120, -- defaults to 5
+         allowGC = false, -- defaults to false
+         allowBytecode = false, -- defaults to false
+         maxTcpConnections = 4, --defaults to 4
+diff --git a/drivers/internet_http.cpp b/drivers/internet_http.cpp
+index ede6609..4c7ff91 100644
+--- a/drivers/internet_http.cpp
++++ b/drivers/internet_http.cpp
+@@ -35,22 +35,7 @@ static string trim(const string& value)
+ 
+ static string escape(const string& text)
+ {
+-  string result;
+-
+-  size_t last = 0;
+-  while (true)
+-  {
+-    size_t next = text.find("'", last);
+-    result += text.substr(last, next);
+-    if (next == string::npos)
+-    {
+-      break;
+-    }
+-    result += "'\\''";
+-    last = next + 1;
+-  }
+-
+-  return "'" + result + "'";
++  return text; // execvp: no shell escaping needed
+ }
+ 
+ ////////////////// PIPED COMMAND ////////////////////////
+@@ -148,7 +133,11 @@ int PipedCommand::id() const
+ 
+ void PipedCommand::close()
+ {
+-  ::close(_child_id);
++  if (_child_id > 0)
++  {
++    ::waitpid(_child_id, nullptr, WNOHANG);
++    _child_id = -1;
++  }
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -163,7 +152,7 @@ HttpObject::HttpObject(const HttpAddress& addr, const string& post, const map<st
+   vector<string> args{ "-q", "-S", "--no-check-certificate", "-O", "/proc/self/fd/1" };
+   if (post.size())
+   {
+-    args.push_back("--post-data=" + escape(post));
++    args.push_back("--body-data=" + escape(post));
+     args.push_back("--method=POST");
+   }
+   for (const auto& header_pair : header)
