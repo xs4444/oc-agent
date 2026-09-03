@@ -6,9 +6,9 @@
 -- 用法（ocvm）:
 --   lua /mnt/<x>/perf_test.lua /mnt/<x> [循环次数]
 --
--- 测量: 无网络依赖工具（json_query/calc/text_ops/read_file/write_file/
--- list_directory）循环 N 次总耗时 + 每轮内存。结果写入
--- <base>/perf_result.txt。
+-- 测量: 无网络依赖工具（search_files/shell/read_file/write_file/edit_file）
+-- 循环 N 次总耗时 + 每轮内存。结果写入 <base>/perf_result.txt。
+-- v0.3.124: json_query/calc/text_ops/list_directory 已删，基准改用现存工具。
 
 local base = ({...})[1] or "."
 local N = tonumber(({...})[2]) or 200
@@ -94,23 +94,18 @@ end
 local p = "/tmp/perf_write.txt"
 local big = string.rep("x", 200)
 
-bench("json_query", function()
-  return execute_tool("json_query", '{"json":"{\\"a\\":{\\"b\\":[1,2,3]}}","path":"a.b.2"}')
+-- v0.3.124: json_query/calc/text_ops/list_directory 已删，换成现存工具基准
+bench("search_files", function()
+  return execute_tool("search_files", '{"pattern":"x","path":"/tmp"}')
 end)
-bench("calc", function()
-  return execute_tool("calc", '{"expr":"(1+2)*3-4/2"}')
-end)
-bench("text_ops", function()
-  return execute_tool("text_ops", '{"op":"upper","text":"hello world"}')
+bench("shell_components", function()
+  return execute_tool("shell_execute", '{"command":"components"}')
 end)
 bench("write_file", function()
   return execute_tool("write_file", '{"path":"' .. p .. '","content":"' .. big .. '"}')
 end)
 bench("read_file", function()
   return execute_tool("read_file", '{"path":"' .. p .. '"}')
-end)
-bench("list_directory", function()
-  return execute_tool("list_directory", '{"path":"/tmp"}')
 end)
 bench("edit_file", function()
   return execute_tool("edit_file", '{"path":"' .. p .. '","old_string":"xxx","new_string":"yyy","replace_all":true}')

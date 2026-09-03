@@ -218,80 +218,13 @@ local function test_tool(label, name, args, expected_check)
   end
 end
 
-test_tool("json_query scalar", "json_query", '{"json":"{\\"name\\":\\"oc\\",\\"count\\":3}","path":"name"}',
-  function(r) return r == "oc" end)
-
-test_tool("json_query nested", "json_query", '{"json":"{\\"data\\":{\\"items\\":[{\\"title\\":\\"a\\"},{\\"title\\":\\"b\\"}]}}","path":"data.items.1.title"}',
-  function(r) return r == "b" end)
-
-test_tool("json_query object", "json_query", '{"json":"{\\"user\\":{\\"id\\":7,\\"name\\":\\"x\\"}}","path":"user"}',
-  function(r) return r:find('"id":7') ~= nil and r:find('"name":"x"') ~= nil end)
-
-test_tool("json_query invalid json", "json_query", '{"json":"not json","path":"a"}',
-  function(r) return r:find("invalid JSON") ~= nil end)
-
-test_tool("json_query missing path", "json_query", '{"json":"{\\"a\\":1}","path":"b.c"}',
-  function(r) return r:find("not found") ~= nil end)
-
-test_tool("json_query missing arg", "json_query", '{"path":"a"}',
-  function(r) return r:find("must be a string") ~= nil end)
-
-test_tool("calc basic", "calc", '{"expression":"2+3*4"}',
-  function(r) return r == "14" end)
-
-test_tool("calc parens", "calc", '{"expression":"(2+3)*4"}',
-  function(r) return r == "20" end)
-
-test_tool("calc power", "calc", '{"expression":"2^10"}',
-  function(r) return r == "1024" end)
-
-test_tool("calc funcs", "calc", '{"expression":"sqrt(16)+floor(3.7)"}',
-  function(r) return r == "7" end)
-
-test_tool("calc minmax", "calc", '{"expression":"min(3,7)+max(1,9)"}',
-  function(r) return r == "12" end)
-
-test_tool("calc invalid", "calc", '{"expression":"2+*"}',
-  function(r) return r:find("invalid expression") ~= nil end)
-
-test_tool("calc unknown func", "calc", '{"expression":"evil(1)"}',
-  function(r) return r:find("invalid expression") ~= nil or r:find("unknown function") ~= nil end)
-
-test_tool("text_ops upper", "text_ops", '{"op":"upper","text":"hello"}',
-  function(r) return r == "HELLO" end)
-
-test_tool("text_ops length", "text_ops", '{"op":"length","text":"hello"}',
-  function(r) return r == "5" end)
-
-test_tool("text_ops trim", "text_ops", '{"op":"trim","text":"  hi  "}',
-  function(r) return r == "hi" end)
-
-test_tool("text_ops find", "text_ops", '{"op":"find","text":"hello world","arg1":"world"}',
-  function(r) return r:find("found at 7") ~= nil end)
-
-test_tool("text_ops replace", "text_ops", '{"op":"replace","text":"a-b-c","arg1":"-","arg2":"+"}',
-  function(r) return r == "a+b+c" end)
-
-test_tool("text_ops slice", "text_ops", '{"op":"slice","text":"hello world","arg1":"7","arg2":"5"}',
-  function(r) return r == "world" end)
-
-test_tool("text_ops split", "text_ops", '{"op":"split","text":"a\\nb\\nc"}',
-  function(r) return r:find("1%. a") ~= nil and r:find("2%. b") ~= nil and r:find("3%. c") ~= nil end)
-
-test_tool("text_ops unknown op", "text_ops", '{"op":"bogus","text":"x"}',
-  function(r) return r:find("unknown op") ~= nil end)
+-- v0.3.124: json_query / calc / text_ops 工具已删（模型自身能力），
+-- 对应的 test_tool 块随之移除。
 
 test_tool("execute_lua removed", "execute_lua", '{"code":"return 1"}',
   function(r) return r:find("removed") ~= nil end)
 
-test_tool("component_list no filter", "component_list", '{}',
-  function(r) return type(r) == "string" and #r > 0 end)
-
-test_tool("component_list filtered", "component_list", '{"filter":"internet"}',
-  function(r) return r:find("internet") ~= nil end)
-
-test_tool("component_list no match", "component_list", '{"filter":"xyzzy"}',
-  function(r) return r:find("no components") ~= nil end)
+-- v0.3.124: component_list 工具已删（OpenOS 有 `components` 命令）
 
 test_tool("unknown tool", "unknown_tool", '{}',
   function(r) return r:find("Unknown tool") ~= nil end)
@@ -304,21 +237,7 @@ test_tool("web_search limit", "web_search", '{"query":"lua","limit":1}',
 test_tool("web_search empty query", "web_search", '{"query":""}',
   function(r) return r:find("query is required") ~= nil end)
 
--- component_doc tests
-test_tool("component_doc list methods", "component_doc", '{"address":"babe1234"}',
-  function(r) return r:find("getInput") ~= nil and r:find("Type: redstone") ~= nil end)
-test_tool("component_doc single method", "component_doc", '{"address":"babe1234","method":"setOutput"}',
-  function(r) return r:find("setOutput") ~= nil end)
-test_tool("component_doc unknown addr", "component_doc", '{"address":"zzzz"}',
-  function(r) return r:find("unknown component") ~= nil end)
-
--- component_invoke tests
-test_tool("component_invoke redstone", "component_invoke", '{"address":"babe1234","method":"getInput","args":[0]}',
-  function(r) return r == "15" end)
-test_tool("component_invoke gpu", "component_invoke", '{"address":"e1e2e3e4","method":"getResolution"}',
-  function(r) return r == "80\n25" end)
-test_tool("component_invoke unknown", "component_invoke", '{"address":"zzzz","method":"ping"}',
-  function(r) return r:find("unknown component") ~= nil end)
+-- v0.3.124: component_doc / component_invoke 工具已删（用 lua -e 调组件）
 
 -- Test write_file + read_file roundtrip
 local fpath = "test_agent_temp.txt"
@@ -687,21 +606,24 @@ test("should_compact no window falls back to count",
 -- compact_history returns nil when nothing to compact
 test("compact_history nil on tiny history", compact_history({{role="u", content="x"}}, {}) == nil)
 
--- system prompt no longer mentions execute_lua; mentions new tools
+-- v0.3.124: system prompt 不再列 json_query/calc/text_ops/component_*（已删），
+-- 改为引导用 OpenOS 真实命令（components/grep/lua -e）。
 local sp = build_system_prompt()
-test("system prompt has json_query", sp:find("json_query") ~= nil)
-test("system prompt has calc", sp:find("calc") ~= nil)
-test("system prompt has text_ops", sp:find("text_ops") ~= nil)
+test("system prompt has search_files", sp:find("search_files") ~= nil)
+test("system prompt mentions components cmd", sp:find("components") ~= nil)
+test("system prompt no json_query", sp:find("json_query") == nil)
+test("system prompt no text_ops", sp:find("text_ops") == nil)
+test("system prompt no component_invoke", sp:find("component_invoke") == nil)
 test("system prompt no execute_lua", sp:find("execute_lua") == nil)
 
 -- TOOLS list: 显式期望清单，双向断言（无缺失、无多余）。
 -- 新增工具时必须在此清单中登记，否则测试失败。
+-- v0.3.124: 从 19 精简到 11（删 list_directory/glob/json_query/calc/
+-- text_ops/component_list/component_doc/component_invoke）。
 local EXPECTED_TOOLS = {
-  "read_file", "write_file", "edit_file", "append_file", "list_directory",
-  "json_query", "calc", "text_ops",
-  "component_list", "component_doc", "component_invoke",
+  "read_file", "write_file", "edit_file", "append_file", "search_files",
   "web_search", "shell_execute", "subagent_call", "subagent_discover", "ask_user",
-  "compact_history", "search_files", "glob",
+  "compact_history",
 }
 local tools_have = {}
 for _, t in ipairs(agent_test.TOOLS) do
@@ -1143,7 +1065,7 @@ do
   local reply_open = modem.open(9097)
   -- 入队一个"非回复端口"文件请求（模拟 explorer 子代理）
   table.insert(oc_mock._event_queue, {"modem_message", modem.address(), modem.address(), 9092, 0,
-    json.encode({v = 1, op = "list_directory", path = "."})})
+    json.encode({v = 1, op = "search_files", pattern = "zzz"})})
   -- 入队"回复端口"消息（模拟子代理任务完成）
   table.insert(oc_mock._event_queue, {"modem_message", modem.address(), modem.address(), 9097, 0,
     "REPLY_DONE"})
@@ -1710,15 +1632,18 @@ local g_res = try_shell("uname -a")
 test("guard rejects uname", type(g_res) == "string"
   and g_res:find("rejected by guard", 1, true) ~= nil
   and g_res:find("read_file", 1, true) ~= nil, tostring(g_res):sub(1, 160))
-test("guard rejects head", try_shell("head -3 file"):find("rejected by guard", 1, true) ~= nil)
+-- v0.3.124: head/grep/wget 是 OpenOS 1.8.9 真实命令（真机 59 命令集实证），
+-- 护栏不再拦截 → 断言"放行"（结果非 rejected by guard）。
+local function guard_allows(cmd)
+  local r = try_shell(cmd)
+  return type(r) == "string" and r:find("rejected by guard", 1, true) == nil
+end
+test("guard allows head (OpenOS has it)", guard_allows("head -3 file"))
 test("guard rejects tail", try_shell("tail -5 log.txt"):find("rejected by guard", 1, true) ~= nil)
-test("guard rejects grep", try_shell("grep -rn foo /mnt"):find("rejected by guard", 1, true) ~= nil)
+test("guard allows grep (OpenOS Wobbo port)", guard_allows("grep -rn foo /mnt"))
 test("guard rejects wc", try_shell("wc -l file.lua"):find("rejected by guard", 1, true) ~= nil)
 test("guard rejects curl", try_shell("curl https://example.com"):find("rejected by guard", 1, true) ~= nil)
-test("guard rejects wget", try_shell("wget http://x"):find("rejected by guard", 1, true) ~= nil)
--- 管道内的 head 同样拦截
-test("guard rejects head in pipe",
-  try_shell("cat file | head -2"):find("rejected by guard", 1, true) ~= nil)
+test("guard allows wget (OpenOS has it)", guard_allows("wget http://x"))
 -- 裸 lua REPL 拒绝（含提示）
 local g_lua = try_shell("lua")
 test("guard rejects bare lua REPL", type(g_lua) == "string"
@@ -2154,11 +2079,11 @@ end
 do
   next_llm = {
     llm_tool_calls({{id = "call_1", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     llm_tool_calls({{id = "call_2", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_3", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"3+3"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"3+3"}'}}}),
     llm_content("最终答案"),
   }
   llm_idx = 0
@@ -2191,7 +2116,7 @@ do
   local st_resp = {}
   for i = 1, 12 do
     st_resp[i] = llm_tool_calls({{id = "call_" .. i, type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}})
+      ["function"] = {name = "read_file", arguments = '{"expression":"' .. i .. '+1"}'}}})
   end
   st_resp[13] = llm_content("最终答案")
   next_llm = st_resp
@@ -2220,13 +2145,13 @@ do
   local with_tool = function(i)
     return {choices = {{message = {role = "assistant", content = nil,
       tool_calls = {{id = "call_" .. i, type = "function",
-        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+        ["function"] = {name = "read_file", arguments = '{"expression":"' .. i .. '+1"}'}}}},
       finish_reason = "stop"}}}
   end
   local narrated = function(i, text)
     return {choices = {{message = {role = "assistant", content = text,
       tool_calls = {{id = "call_" .. i, type = "function",
-        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+        ["function"] = {name = "read_file", arguments = '{"expression":"' .. i .. '+1"}'}}}},
       finish_reason = "stop"}}}
   end
   next_llm = {
@@ -2261,7 +2186,7 @@ do
   local narrated2 = function(i, text)
     return {choices = {{message = {role = "assistant", content = text,
       tool_calls = {{id = "call_" .. i, type = "function",
-        ["function"] = {name = "calc", arguments = '{"expression":"' .. i .. '+1"}'}}}},
+        ["function"] = {name = "read_file", arguments = '{"expression":"' .. i .. '+1"}'}}}},
       finish_reason = "stop"}}}
   end
   next_llm = {
@@ -2292,13 +2217,13 @@ end
 do
   next_llm = {
     llm_tool_calls({{id = "call_1", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     llm_tool_calls({{id = "call_2", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_3", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"3+3"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"3+3"}'}}}),
     llm_tool_calls({{id = "call_4", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"4+4"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"4+4"}'}}}),
   }
   llm_idx = 0
   local cap_msgs2 = {}
@@ -2321,17 +2246,17 @@ end
 do
   next_llm = {
     llm_tool_calls({{id = "call_1", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     llm_tool_calls({{id = "call_2", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     llm_tool_calls({{id = "call_3", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     llm_tool_calls({{id = "call_4", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}),
     -- 第 5 轮: 仍返回同一调用 + 附带 content（模拟模型被提示后给出回答）
     {choices = {{message = {role = "assistant", content = "收尾回答",
       tool_calls = {{id = "call_5", type = "function",
-        ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}},
+        ["function"] = {name = "read_file", arguments = '{"expression":"1+1"}'}}}},
       finish_reason = "stop"}}},
   }
   llm_idx = 0
@@ -2361,15 +2286,15 @@ end
 do
   next_llm = {
     llm_tool_calls({{id = "call_1", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_2", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_3", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_4", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_tool_calls({{id = "call_5", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"2+2"}'}}}),
+      ["function"] = {name = "read_file", arguments = '{"expression":"2+2"}'}}}),
     llm_content("完成了", nil, "stop"),
   }
   llm_idx = 0
@@ -2395,11 +2320,12 @@ end
 -- 测试3: 正常探索（12 轮不同工具调用）不触发轮次上限（默认 40）也不误判循环
 do
   local explore = {}
-  local names = {"calc", "json_query", "text_ops"}
+  -- v0.3.124: 换成 3 个仍存在的只读工具（不同 name+args 以规避循环检测）
+  local names = {"read_file", "search_files", "read_file"}
   local args = {
-    '{"expression":"1+1"}',
-    '{"json":"{\\"a\\":1}","path":"a"}',
-    '{"op":"upper","text":"hi"}',
+    '{"path":"/a"}',
+    '{"pattern":"x"}',
+    '{"path":"/b"}',
   }
   for i = 1, 12 do
     explore[#explore + 1] = llm_tool_calls({{id = "call_" .. i, type = "function",
@@ -2518,7 +2444,7 @@ end
 do
   next_llm = {
     llm_tool_calls({{id = "call_1", type = "function",
-      ["function"] = {name = "calc", arguments = '{"expression":"1'}}}, "length"),
+      ["function"] = {name = "read_file", arguments = '{"expression":"1'}}}, "length"),
     llm_content("修正后的最终回答", nil, "stop"),
   }
   llm_idx = 0

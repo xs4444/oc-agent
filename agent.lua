@@ -1367,10 +1367,11 @@ local DECLS = {}
 local ORDER = {}
 
 -- Builtin core tool modules, always loaded (canonical order).
+-- v0.3.124: data.lua (json_query/calc/text_ops) 与 component.lua
+-- (component_list/doc/invoke) 已删——模型自身能算数/解析 JSON/处理
+-- 字符串; OC 组件操作用 shell_execute + `components` 命令 / lua -e。
 local BUILTIN = {
   "agent.tools.file",
-  "agent.tools.data",
-  "agent.tools.component",
   "agent.tools.search",
   "agent.tools.shell",
   "agent.tools.subagent",
@@ -1509,7 +1510,7 @@ local REGISTRY = tools.registry()
 -- execute_lua was removed in a previous version; keep the old guard
 -- message (run_tests asserts it) without any actual executor.
 local EXECUTE_LUA_GUARD =
-  "Error: execute_lua has been removed. Use json_query (JSON extraction), calc (math), or text_ops (string manipulation) instead."
+  "Error: execute_lua has been removed. Do math/JSON/text work yourself; for exact arithmetic verify with `lua -e 'print(...)'` via shell_execute."
 
 local M = {}
 
@@ -1640,37 +1641,31 @@ local function build_system_prompt()
     end
   end
 
-  CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, list connected hardware components, run shell commands, and process data with utility tools.\n\n"
+  CACHED_SYSTEM_PROMPT = "You are an AI assistant running inside OpenComputers, a computer system in Minecraft (GT: New Horizons modpack). You can read and write files, inspect connected hardware, and run OpenOS shell commands.\n\n"
     .. "Working directory: " .. tostring(cwd) .. " (agent installed at: " .. tostring(AGENT_DIR or "?") .. "). Use relative paths from this directory when possible; absolute paths work too.\n\n"
-    .. "shell_execute is guarded: Unix-only commands (uname, head, tail, grep, wc, curl, wget) and bare 'lua' (interactive REPL) are rejected with OpenOS equivalents in the error message. Shell syntax is OpenOS (Lua-based), not Linux.\n\n"
+    .. "The OpenOS shell is NOT Linux but has a rich Unix-like command set: ls, find, grep, cat, head, df, du, tree, man, wget, components, lua, etc. (no tail/wc/curl). Prefer these real commands for directory listing (ls), file finding (find), and content search (grep -rn) — check `man <cmd>` when unsure. shell_execute is guarded: truly unavailable commands (uname, tail, wc, curl) and bare 'lua' (interactive REPL) are rejected with an OpenOS-equivalent hint in the error message.\n\n"
     .. "Available tools:\n"
     .. "- read_file: Read file contents (whole file, or a line slice with offset/limit; negative offset = tail; sliced reads show line numbers)\n"
     .. "- write_file: Write content to a file (new files or full rewrites)\n"
     .. "- edit_file: Replace an exact string in a file (must be unique; replace_all for multiple). Read first, keep files under 20KB\n"
     .. "- append_file: Append content to a file — use for logs and growing files, memory cost is constant regardless of file size\n"
-    .. "- list_directory: List files in a directory\n"
-    .. "- json_query: Extract a value from a JSON string using a dot path (e.g. 'hits.0.title'). Use to parse component_invoke, web_search or file contents.\n"
-    .. "- calc: Evaluate a safe arithmetic expression (sqrt, abs, floor, ceil, min, max, + - * / % ^)\n"
-    .. "- text_ops: String manipulation: find, replace, split, slice, upper, lower, trim, length\n"
-    .. "- component_list: List connected OpenComputers components\n"
-    .. "- component_doc: Get documentation for a component's methods (list methods or read one method's doc)\n"
-    .. "- component_invoke: Call a method on a component (after checking component_doc)\n"
+    .. "- search_files: Search file contents for a pattern (recursive; 'path:line: content' output; result cap 50). Use for broad code search; for quick one-off greps, `grep` via shell_execute works too\n"
     .. "- web_search: Search the web for information (titles, URLs, snippets). Uses Tavily if configured, Hacker News otherwise.\n"
     .. "- subagent_call: Delegate heavy work to another computer on your modem network running agent.lua --subagent. Pass its modem address + task (+ role). It uses its own memory/disk.\n"
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
-    .. "- shell_execute: Run an OpenOS shell command\n"
+    .. "- shell_execute: Run an OpenOS shell command (ls/find/grep/df/components/lua -e all available)\n"
     .. "- ask_user: Ask the user a question and wait for their answer (shown on the terminal with numbered options). Use when you need to clarify requirements, get a decision, or offer choices before proceeding — e.g. which option to take, which file to modify, or confirmation for a destructive action.\n\n"
     .. "- compact_history: Compress old conversation messages into an LLM summary (recent messages stay verbatim). Call it when your runtime status shows context usage at 60% or more of the model window, or when the history holds many stale tool results. Key tool outputs and errors are preserved in the summary. Folded messages are archived verbatim to the history file's sibling `*.archive.jsonl` (JSONL, one message per line) — if you later need a detail that the summary lost, read the archive with read_file/search_files.\n\n"
     .. "Context management: your context window is finite. To avoid HTTP 400 errors (context overflow):\n"
     .. "- Read files with read_file using offset/limit slices — never read the same large file repeatedly, and don't dump whole files into the conversation\n"
-    .. "- Keep outputs and tool results concise; prefer json_query/text_ops for extraction\n"
+    .. "- Keep outputs and tool results concise (e.g. cap shell output with `| head -N`)\n"
     .. "- If a request fails with HTTP 400, the agent auto-compacts the history and retries; continue from the summary instead of re-reading everything\n\n"
-    .. "Data processing: use json_query to extract fields from JSON (e.g. component return values), calc for math, text_ops for string work. You cannot execute arbitrary Lua code.\n\n"
-    .. (doc_path and ("Offline GTNH wiki documentation is installed at " .. doc_path .. " (api/, component/, tutorial/, gtnh/ etc). When you need component method signatures, mod API details, or GTNH integration facts, read the relevant .md file with read_file (explore with list_directory) — prefer it over web_search.\n\n") or "")
-    .. "When exploring hardware, use this workflow:\n"
-    .. "1. component_list to discover components\n"
-    .. "2. component_doc(address) to learn what methods a component has\n"
-    .. "3. component_doc(address, method) for method details, then component_invoke to call it\n\n"
+    .. "You can do math, parse JSON, and manipulate text yourself — no helper tools for that. For exact/long arithmetic you may verify with `lua -e 'print(...)'` via shell_execute.\n\n"
+    .. (doc_path and ("Offline GTNH wiki documentation is installed at " .. doc_path .. " (api/, component/, tutorial/, gtnh/ etc). When you need component method signatures, mod API details, or GTNH integration facts, read the relevant .md file with read_file (explore with `ls`/`find` via shell_execute) — prefer it over web_search.\n\n") or "")
+    .. "When working with hardware, use this workflow via shell_execute:\n"
+    .. "1. `components` (or `components <type>`) to list connected components; `components -l` also shows each component's methods and one-line docs\n"
+    .. "2. `man <component-type>` or the offline docs for method details\n"
+    .. "3. Call a method with `lua -e 'component.invoke(\"<address>\", \"<method>\", <args...>)'` — pass Lua literals (numbers/booleans/strings) as arguments, mind the nested quoting\n\n"
     .. "Current computer address: " .. tostring(address) .. "\n"
   return CACHED_SYSTEM_PROMPT
 end
@@ -1921,8 +1916,8 @@ local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
 -- 超时"——实为任务确实没跑完）。300s 给足 explorer 探索任务余量。
 local SUBAGENT_TIMEOUT = 300       -- seconds to wait for a subagent reply
 -- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
--- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
--- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
+-- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/search_files
+-- 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
 local FILE_PORT = 9092
 local FILE_TIMEOUT = 60  -- 子代理等文件回复超时（主代理 chat 中时排队）
 -- 文件服务回复最大字节（v0.3.92）: 无线 modem 最大包 8192B——超过则
@@ -1980,8 +1975,8 @@ local function handle_file_message(exec_fn, sender, port, payload)
   else
     local op = req.op:match("^file:(.+)$") or req.op
     -- 只服务只读文件工具（安全边界: 文件服务绝不执行写工具）
-    if op == "read_file" or op == "list_directory"
-        or op == "search_files" or op == "glob" then
+    -- v0.3.124: list_directory/glob 工具已删，代理 op 同步缩减
+    if op == "read_file" or op == "search_files" then
       local args = {}
       for k, v in pairs(req) do
         if k ~= "v" and k ~= "op" then args[k] = v end
@@ -2701,7 +2696,10 @@ local function test_patch()
 end
 
 -- ════════════════════════════════════════
--- 9. tools — TOOLS 清单齐全（19 项）
+-- 9. tools — TOOLS 清单齐全（11 项）
+-- v0.3.124: 从 19 精简到 11——删 list_directory/glob（OpenOS 有
+-- ls/find）、json_query/calc/text_ops（模型自身能力）、component_*
+-- 三件（OpenOS 有 `components` 命令 + lua -e 调组件）。
 -- ════════════════════════════════════════
 local function test_tools()
   local ok_t, tools = pcall(require, "agent.tools")
@@ -2714,9 +2712,7 @@ local function test_tools()
     if n then names[#names + 1] = n end
   end
   local EXPECTED = {
-    "read_file","edit_file","append_file","write_file","list_directory",
-    "search_files","glob","json_query","calc","text_ops",
-    "component_list","component_doc","component_invoke",
+    "read_file","edit_file","append_file","write_file","search_files",
     "web_search","shell_execute","subagent_call","subagent_discover",
     "ask_user","compact_history",
   }
@@ -2726,7 +2722,7 @@ local function test_tools()
     for _, n in ipairs(names) do if n == e then found = true break end end
     if not found then missing[#missing + 1] = e end
   end
-  record("tools", #missing == 0 and #names == 19,
+  record("tools", #missing == 0 and #names == 11,
     "count=" .. #names .. " missing=" .. (#missing > 0 and table.concat(missing, ",") or "none"))
 end
 
@@ -5563,11 +5559,14 @@ end
 package.preload["agent.tools.file"] = function()
 -- ═══════════════════════════════════════════════════════════════
 -- agent.tools.file — file tools: read_file / edit_file / append_file
--- / write_file / list_directory / search_files / glob.
+-- / write_file / search_files.
 --
--- search_files and glob are ported from oc-ai lib/cmn-utils/grep.lua
--- and glob.lua (recursive directory search + line numbers + literal/
--- Lua pattern + glob filter + max results/line length caps).
+-- search_files is ported from oc-ai lib/cmn-utils/grep.lua (recursive
+-- directory search + line numbers + literal/Lua pattern + glob filter
+-- + max results/line length caps).
+--
+-- v0.3.124: list_directory / glob 已删——真机 OpenOS 1.8.9 自带
+-- ls / find 命令（59 命令实证），shell_execute 即可覆盖，工具层不重复。
 --
 -- Module contract: exports {tools = {...}, exec = function(name, args,
 -- deps)}. exec returns nil for tool names it does not handle. deps is
@@ -5596,11 +5595,6 @@ local tools = {
     parameters={type="object", properties={path={type="string", description="File path"}, content={type="string", description="Content to write"}}, required={"path", "content"}}
   }},
   {type="function", ["function"]={
-    name="list_directory",
-    description="List files in a directory",
-    parameters={type="object", properties={path={type="string", description="Directory path"}}, required={"path"}}
-  }},
-  {type="function", ["function"]={
     name="search_files",
     description="Search file contents for a pattern, returning matching lines as 'path:line: content' (one per line). Recurses directories. pattern is a Lua pattern by default; set literal=true to match a literal string. path is the file or directory to search (default: current directory). glob restricts which files are searched (e.g. '*.lua'). max_results caps the number of matches (default 50); max_line_length truncates long lines (default 200).",
     parameters={type="object", properties={
@@ -5612,19 +5606,11 @@ local tools = {
       max_line_length={type="number", description="Maximum line length to return (default 200)"}
     }, required={"pattern"}}
   }},
-  {type="function", ["function"]={
-    name="glob",
-    description="Find files matching a glob pattern, recursively. Returns matching paths relative to path (one per line). Supports '*' (within a path segment) and '**' (across segments), e.g. '*.lua' or 'lib/**/*.lua'. path is the starting directory (default: current directory).",
-    parameters={type="object", properties={
-      pattern={type="string", description="Glob pattern to match (e.g. '*.lua', 'lib/**/*.lua')"},
-      path={type="string", description="Starting directory (default: current directory)"}
-    }, required={"pattern"}}
-  }},
 }
 
 -- ═══════════════════════════════════════════════════════════════
--- search_files / glob — grep/glob file search (ported from oc-ai
--- lib/cmn-utils/grep.lua and lib/cmn-utils/glob.lua).
+-- search_files — grep 风格文件内容搜索 (ported from oc-ai
+-- lib/cmn-utils/grep.lua).
 --
 -- Path handling is deliberately portable: io.open works in every
 -- environment (real OpenOS, host mock, tests), so it is the primary
@@ -5651,17 +5637,6 @@ local function utf8_cut(s, n)
   end
   if cut < 0 then cut = 0 end
   return s:sub(1, cut)
-end
-
--- Convert a glob pattern to a Lua pattern. Supports '*' (within a
--- path segment) and '**' (across segments): e.g. '*.lua', 'lib/**/*.lua'.
-local function glob_to_lua_pattern(glob_pat)
-  local pat = glob_pat
-  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
-  pat = (pat:gsub("%*%*", "\001"))
-  pat = (pat:gsub("%*", "[^/]*"))
-  pat = (pat:gsub("\001", ".*"))
-  return "^" .. pat .. "$"
 end
 
 -- Simple name glob match ('*' = anything), used for the search_files
@@ -5802,43 +5777,6 @@ local function search_files_code(args)
   return table.concat(out, "\n")
 end
 
--- glob: recursive glob pattern match over relative paths.
--- args: pattern, path.
-local function glob_code(args)
-  local ok_fs, fs = pcall(require, "filesystem")
-  local pattern = args.pattern
-  if type(pattern) ~= "string" or pattern == "" then
-    error("pattern must be a non-empty string")
-  end
-  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
-  local lua_pat = glob_to_lua_pattern(pattern)
-  local matches = {}
-
-  local function walk(dir, prefix)
-    if classify_path(dir, fs) ~= "dir" then return end
-    local ok_list, it = pcall(function() return fs.list(dir) end)
-    if not ok_list or type(it) ~= "function" then return end
-    for entry in it do
-      local full = dir .. "/" .. entry
-      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
-      if classify_path(full, fs) == "dir" then
-        walk(full, rel)
-      else
-        if rel:match(lua_pat) then
-          matches[#matches + 1] = rel
-        end
-      end
-    end
-  end
-
-  walk(base, "")
-  table.sort(matches)
-  if #matches == 0 then
-    return "No files match '" .. tostring(args.pattern) .. "' in " .. base
-  end
-  return table.concat(matches, "\n")
-end
-
 local function exec(name, args, deps)
   if name == "read_file" then
     local ok, result = pcall(function()
@@ -5974,395 +5912,8 @@ local function exec(name, args, deps)
     end)
     return ok and result or ("Error: " .. tostring(result))
 
-  elseif name == "list_directory" then
-    local ok, result = pcall(function()
-      local fs = require("filesystem")
-      local parts = {}
-      for f in fs.list(args.path or "/") do
-        parts[#parts + 1] = f
-      end
-      if #parts == 0 then return "(empty)" end
-      return table.concat(parts, "\n")
-    end)
-    return ok and result or ("Error: " .. tostring(result))
-
   elseif name == "search_files" then
     local ok, result = pcall(search_files_code, args)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "glob" then
-    local ok, result = pcall(glob_code, args)
-    return ok and result or ("Error: " .. tostring(result))
-  end
-
-  return nil  -- not handled by this module
-end
-
-return {tools = tools, exec = exec}
-end
-
--- agent.agent.tools.data (embedded module)
-package.preload["agent.tools.data"] = function()
--- ═══════════════════════════════════════════════════════════════
--- agent.tools.data — data tools: json_query / calc / text_ops.
---
--- Module contract: exports {tools = {...}, exec = function(name, args,
--- deps)}. exec returns nil for tool names it does not handle. deps is
--- injected per call by agent.execute; json comes from deps.json (the
--- same global table agent.lua defines in Phase 1 — never referenced
--- as a global here, so Phase 2 can swap in a json module).
--- ═══════════════════════════════════════════════════════════════
-
-local tools = {
-  {type="function", ["function"]={
-    name="json_query",
-    description="Extract a value from a JSON string using a dot path (e.g. 'hits.0.title', 'data.items.3.name'). Arrays are indexed from 0. Returns the matched value (JSON for objects/arrays, plain text for scalars). Use to parse component_invoke, web_search or file contents.",
-    parameters={type="object", properties={json={type="string", description="JSON text to query"}, path={type="string", description="Dot-separated path, e.g. 'hits.0.title'"}}, required={"json", "path"}}
-  }},
-  {type="function", ["function"]={
-    name="calc",
-    description="Evaluate a safe arithmetic expression. Supports + - * / % ^, parentheses, and functions: sqrt, abs, floor, ceil, min, max. Does NOT execute code — use for math only. Example: 'sqrt(2)*10^3'",
-    parameters={type="object", properties={expression={type="string", description="Arithmetic expression to evaluate"}}, required={"expression"}}
-  }},
-  {type="function", ["function"]={
-    name="text_ops",
-    description="String manipulation operations: find(text, pattern) -> position or nil; replace(text, old, new) -> new text; split(text, sep) -> numbered lines; slice(text, start, length); upper(text); lower(text); trim(text); length(text).",
-    parameters={type="object", properties={op={type="string", description="Operation: find, replace, split, slice, upper, lower, trim, length"}, text={type="string", description="Input text"}, arg1={type="string", description="First argument (pattern/old/separator/start)"}, arg2={type="string", description="Second argument (new/length)"}}, required={"op", "text"}}
-  }},
-}
-
--- json_query: extract value from JSON via dot path (arrays 0-indexed)
-local function json_query_code(json, json_str, path)
-  if type(json_str) ~= "string" then return "Error: json argument must be a string" end
-  local ok_decode, data = pcall(json.decode, json_str)
-  if not ok_decode then
-    return "Error: invalid JSON: " .. tostring(data)
-  end
-
-  local cur = data
-  if path == nil or path == "" then
-    -- no path: return whole value
-    if type(cur) == "table" then return json.encode(cur) end
-    if type(cur) == "boolean" then return tostring(cur) end
-    return tostring(cur or "null")
-  end
-
-  for seg in (path .. "."):gmatch("([^%.]+)%.") do
-    if type(cur) ~= "table" then
-      return "Error: cannot descend into " .. type(cur) .. " at '" .. seg .. "'"
-    end
-    local idx = tonumber(seg)
-    local next_val
-    if idx ~= nil then
-      next_val = cur[idx + 1]  -- JSON array index → 1-based Lua table
-    else
-      next_val = cur[seg]
-    end
-    if next_val == nil then
-      return "Error: path not found at '" .. seg .. "'"
-    end
-    cur = next_val
-  end
-
-  if type(cur) == "table" then return json.encode(cur) end
-  if type(cur) == "boolean" then return tostring(cur) end
-  return tostring(cur or "null")
-end
-
--- calc: safe arithmetic expression evaluator (no code execution)
-local function calc_code(expr)
-  if type(expr) ~= "string" or expr == "" then
-    return "Error: expression must be a non-empty string"
-  end
-
-  local pos = 1
-  local function peek()
-    while expr:sub(pos, pos):match("%s") do pos = pos + 1 end
-    return expr:sub(pos, pos)
-  end
-
-  local function parse_primary()
-    peek()
-    local c = expr:sub(pos, pos)
-    if c == "(" then
-      pos = pos + 1
-      local v = parse_expr()
-      peek()
-      if expr:sub(pos, pos) ~= ")" then error("expected ')'") end
-      pos = pos + 1
-      return v
-    end
-    -- function call: name(...)
-    local name = expr:match("^([a-zA-Z_][a-zA-Z0-9_]*)%s*%(", pos)
-    if name then
-      pos = pos + #name
-      peek()
-      if expr:sub(pos, pos) ~= "(" then error("expected '(' after " .. name) end
-      pos = pos + 1
-      local args = {}
-      peek()
-      if expr:sub(pos, pos) ~= ")" then
-        while true do
-          args[#args + 1] = parse_expr()
-          peek()
-          local cc = expr:sub(pos, pos)
-          if cc == "," then pos = pos + 1
-          elseif cc == ")" then break
-          else error("expected ',' or ')'") end
-        end
-      end
-      pos = pos + 1
-      local fns = {
-        sqrt = function(x) return math.sqrt(x) end,
-        abs = function(x) return math.abs(x) end,
-        floor = function(x) return math.floor(x) end,
-        ceil = function(x) return math.ceil(x) end,
-        min = function(...) return math.min(...) end,
-        max = function(...) return math.max(...) end,
-      }
-      if not fns[name] then error("unknown function: " .. name) end
-      return fns[name](table.unpack(args))
-    end
-    local rest = expr:sub(pos)
-    -- strict number: optional sign, digits, optional fraction; exponent handled
-    -- separately (a capture group would return nil when the exponent is absent)
-    local num = rest:match("^%-?%d+%.?%d*")
-    if not num or num == "" then error("expected number at " .. pos) end
-    local exp = rest:sub(#num + 1):match("^[eE][%-+]?%d+")
-    if exp then num = num .. exp end
-    pos = pos + #num
-    return tonumber(num)
-  end
-
-  local function parse_unary()
-    peek()
-    if expr:sub(pos, pos) == "-" then
-      pos = pos + 1
-      return -parse_unary()
-    end
-    if expr:sub(pos, pos) == "+" then
-      pos = pos + 1
-      return parse_unary()
-    end
-    return parse_primary()
-  end
-
-  local function parse_power()
-    local v = parse_unary()
-    peek()
-    if expr:sub(pos, pos) == "^" then
-      pos = pos + 1
-      return v ^ parse_power()
-    end
-    return v
-  end
-
-  local function parse_mul()
-    local v = parse_power()
-    while true do
-      peek()
-      local c = expr:sub(pos, pos)
-      if c == "*" then pos = pos + 1; v = v * parse_power()
-      elseif c == "/" then pos = pos + 1; v = v / parse_power()
-      elseif c == "%" then pos = pos + 1; v = v % parse_power()
-      else return v end
-    end
-  end
-
-  local function parse_add()
-    local v = parse_mul()
-    while true do
-      peek()
-      local c = expr:sub(pos, pos)
-      if c == "+" then pos = pos + 1; v = v + parse_mul()
-      elseif c == "-" then pos = pos + 1; v = v - parse_mul()
-      else return v end
-    end
-  end
-
-  parse_expr = parse_add
-
-  local ok, result = pcall(function()
-    local v = parse_expr()
-    peek()
-    if pos <= #expr then error("trailing input at " .. pos) end
-    return v
-  end)
-  if not ok then
-    return "Error: invalid expression: " .. tostring(result)
-  end
-  -- Format: integer-valued results without trailing .0
-  if type(result) == "number" then
-    if math.abs(result % 1) < 1e-9 and math.abs(result) < 1e15 then
-      return string.format("%d", result)
-    end
-    return tostring(result)
-  end
-  return tostring(result or "")
-end
-
--- text_ops: string manipulation
-local function text_ops_code(op, text, arg1, arg2)
-  if type(text) ~= "string" then return "Error: text must be a string" end
-  local fn = ({
-    length = function() return tostring(#text) end,
-    upper = function() return string.upper(text) end,
-    lower = function() return string.lower(text) end,
-    trim = function() return text:match("^%s*(.-)%s*$") end,
-    find = function()
-      local s, e = text:find(arg1 or "", 1, true)
-      if not s then return "not found" end
-      return "found at " .. s .. " (length " .. (e - s + 1) .. ")"
-    end,
-    replace = function()
-      return (text:gsub(arg1 or "", arg2 or ""))
-    end,
-    slice = function()
-      local start = tonumber(arg1) or 1
-      local len = tonumber(arg2)
-      if start < 1 then start = 1 end
-      if len and len > 0 then
-        return text:sub(start, start + len - 1)
-      end
-      return text:sub(start)
-    end,
-    split = function()
-      local sep = arg1 or "\n"
-      local parts = {}
-      local n = 0
-      for piece in (text .. sep):gmatch("(.-)" .. string.gsub(sep, "[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")) do
-        n = n + 1
-        parts[#parts + 1] = n .. ". " .. piece
-      end
-      if n == 0 then return "(no parts)" end
-      return table.concat(parts, "\n")
-    end,
-  })[op]
-
-  if not fn then return "Error: unknown op: " .. tostring(op) end
-  local ok, result = pcall(fn)
-  if not ok then
-    return "Error: " .. tostring(result)
-  end
-  return tostring(result or "")
-end
-
-local function exec(name, args, deps)
-  local json = deps.json
-  if name == "json_query" then
-    local ok, result = pcall(json_query_code, json, args.json, args.path)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "calc" then
-    local ok, result = pcall(calc_code, args.expression)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "text_ops" then
-    local ok, result = pcall(text_ops_code, args.op, args.text, args.arg1, args.arg2)
-    return ok and result or ("Error: " .. tostring(result))
-  end
-
-  return nil  -- not handled by this module
-end
-
-return {tools = tools, exec = exec}
-end
-
--- agent.agent.tools.component (embedded module)
-package.preload["agent.tools.component"] = function()
--- ═══════════════════════════════════════════════════════════════
--- agent.tools.component — OpenComputers hardware tools:
--- component_list / component_doc / component_invoke.
---
--- Module contract: exports {tools = {...}, exec = function(name, args,
--- deps)}. exec returns nil for tool names it does not handle. deps is
--- injected per call by agent.execute; json comes from deps.json.
--- ═══════════════════════════════════════════════════════════════
-
-local tools = {
-  {type="function", ["function"]={
-    name="component_list",
-    description="List connected OpenComputers components (optionally filtered by type name)",
-    parameters={type="object", properties={filter={type="string", description="Optional type filter (e.g. 'redstone', 'gpu', 'adapter')"}}}
-  }},
-  {type="function", ["function"]={
-    name="component_doc",
-    description="Get documentation for a component's methods. Call with just an address to list all methods, or with a method name for details. Use after component_list to learn what a component can do.",
-    parameters={type="object", properties={address={type="string", description="Component address (can be abbreviated, e.g. first 4 chars)"}, method={type="string", description="Optional method name to get docs for"}}, required={"address"}}
-  }},
-  {type="function", ["function"]={
-    name="component_invoke",
-    description="Call a method on an OpenComputers component. Use component_doc first to learn available methods.",
-    parameters={type="object", properties={address={type="string", description="Component address (can be abbreviated)"}, method={type="string", description="Method name to call"}, args={type="array", items={type="string"}, description="Arguments to pass to the method (numbers, strings, booleans)"}}, required={"address", "method"}}
-  }},
-}
-
-local function exec(name, args, deps)
-  local json = deps.json
-
-  if name == "component_list" then
-    local ok, result = pcall(function()
-      local comp = require("component")
-      local parts = {}
-      for addr, typ in comp.list(args.filter or "") do
-        parts[#parts + 1] = addr:sub(1, 8) .. "... = " .. typ
-      end
-      if #parts == 0 then return "(no components found)" end
-      return table.concat(parts, "\n")
-    end)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "component_doc" then
-    local ok, result = pcall(function()
-      local comp = require("component")
-      local resolved, err = comp.get(args.address)
-      if not resolved then
-        -- no resolved proxy, but the address may still be a known component
-        -- (get only fails for unrecognized addresses); type() is the check
-        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
-      end
-      local addr = resolved or args.address
-      local parts = {}
-      if args.method then
-        local doc = comp.doc(addr, args.method)
-        return doc and ("(" .. args.method .. ")\n" .. doc) or ("no doc for method: " .. args.method)
-      else
-        local methods = comp.methods(addr)
-        if not methods then return "no methods listed for " .. args.address end
-        for m in pairs(methods) do
-          parts[#parts + 1] = m
-        end
-        table.sort(parts)
-        return "Type: " .. tostring(comp.type(addr)) .. "\nMethods:\n" .. table.concat(parts, "\n")
-      end
-    end)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "component_invoke" then
-    local ok, result = pcall(function()
-      local comp = require("component")
-      local resolved, err = comp.get(args.address)
-      if not resolved then
-        -- no resolved proxy, but the address may still be a known component
-        -- (get only fails for unrecognized addresses); type() is the check
-        if not comp.type(args.address) then return "unknown component address: " .. tostring(args.address) .. (err and (" (" .. err .. ")") or "") end
-      end
-      local addr = resolved or args.address
-      local arg_values = {}
-      if type(args.args) == "table" then
-        for _, v in ipairs(args.args) do
-          arg_values[#arg_values + 1] = v
-        end
-      end
-      local r = {comp.invoke(addr, args.method, table.unpack(arg_values))}
-      -- format results
-      local out = {}
-      for _, v in ipairs(r) do
-        out[#out + 1] = type(v) == "table" and json.encode(v) or tostring(v)
-      end
-      if #out == 0 then return "(no return values)" end
-      return table.concat(out, "\n")
-    end)
     return ok and result or ("Error: " .. tostring(result))
   end
 
@@ -6495,16 +6046,16 @@ local tools = {
 -- ═══════════════════════════════════════════════════════════════
 -- Unix-ism 护栏（工具层，替代 system prompt 大段指令——确定性拦截，
 -- 不依赖模型遵守; 拒绝信息内含 OpenOS 等价做法，模型从错误中学习）。
--- 逐 | 管道分段检查（管道内的 head/grep 同样拦截）。
+-- 逐 | 管道分段检查。
+-- v0.3.124: head/grep/wget 护栏已删——真机 OpenOS 1.8.9 实证这三个
+-- 命令存在（59 命令集，grep 为 Wobbo 移植版支持 -r/-n/-i 等）；
+-- 旧护栏基于错误的"OpenOS 无这些命令"假设，反而拦住可用命令。
 -- ═══════════════════════════════════════════════════════════════
 local GUARDS = {
-  {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use read_file('/etc/os-release') for system info, or component_list/component_doc."},
-  {pat = "^%s*head", hint = "head: not available in OpenOS. Use read_file with offset=1 and limit=N to read the first N lines."},
+  {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use the `components` command for hardware, or read_file for system files."},
   {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
-  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use search_files to search file contents, glob to find files."},
-  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Use read_file then text_ops op=length to count."},
-  {pat = "^%s*curl", hint = "curl: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
-  {pat = "^%s*wget", hint = "wget: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
+  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Count lines with `lua -e` (io.lines loop) or estimate via read_file offset/limit."},
+  {pat = "^%s*curl", hint = "curl: not available in OpenOS. OpenOS has `wget <url> [-O file]` for HTTP; or use web_search for web info."},
 }
 
 -- 护栏: 返回 nil + 错误信息 = 拒绝; 返回 true = 放行。
@@ -6549,7 +6100,7 @@ local function exec(name, args, deps)
         local cfg = (deps and deps.load_config and deps.load_config()) or {}
         local min_free = tonumber(cfg.mem_exec_min_free) or 500000
         if free < min_free then
-          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files/json_query 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
+          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
         end
       end
     end
@@ -6612,12 +6163,12 @@ package.preload["agent.tools.subagent"] = function()
 local tools = {
   {type="function", ["function"]={
     name="subagent_call",
-    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from subagent_discover — the broadcast discovery tool — or from the address the subagent printed at startup; NOTE: component_list only shows LOCAL components, remote modems are NOT listed there), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate/explorer), a session id to continue a previous conversation on that subagent (same id = context preserved; omit for a fresh session), and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research. EXPLORER ROLE (v0.3.84): read-only reconnaissance — the subagent gets ONLY read-only tools, and its read_file/list_directory/search_files/glob are proxied over the modem to the MASTER computer, letting it read the master's hard drive (code/docs) over the LAN without any write access.",
-    parameters={type="object", properties={address={type="string", description="Target modem address (use subagent_discover to find it; NOT from component_list — remote modems are invisible there)"}, task={type="string", description="Task description for the subagent"},     role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate, explorer (explorer = read-only; file tools proxied to the master)"}, session={type="string", description="Optional session id: same id continues the previous conversation on that subagent; omit for fresh context"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
+    description="Delegate a task to another OpenComputers computer running agent.lua in --subagent mode, connected via the modem network. Provide the target computer's modem address (get it from subagent_discover — the broadcast discovery tool — or from the address the subagent printed at startup; NOTE: the `components` shell command only shows LOCAL components, remote modems are NOT listed there), a clear task description, and optionally a role (scout/researcher/planner/worker/reviewer/oracle/delegate/explorer), a session id to continue a previous conversation on that subagent (same id = context preserved; omit for a fresh session), and background context. The subagent runs the full agent loop (own memory, own tools) and returns its final answer. Timeout 240s. Use for heavy compute, large file processing, or parallel research. EXPLORER ROLE (v0.3.84): read-only reconnaissance — the subagent gets ONLY read-only tools, and its read_file/search_files are proxied over the modem to the MASTER computer, letting it read the master's hard drive (code/docs) over the LAN without any write access.",
+    parameters={type="object", properties={address={type="string", description="Target modem address (use subagent_discover to find it; NOT from the `components` command — remote modems are invisible there)"}, task={type="string", description="Task description for the subagent"},     role={type="string", description="Optional role hint: scout, researcher, planner, worker, reviewer, oracle, delegate, explorer (explorer = read-only; file tools proxied to the master)"}, session={type="string", description="Optional session id: same id continues the previous conversation on that subagent; omit for fresh context"}, context={type="string", description="Optional background context to pass to the subagent"}, timeout={type="number", description="Optional reply timeout in seconds (default 240)"}}, required={"address", "task"}}
   }},
   {type="function", ["function"]={
     name="subagent_discover",
-    description="Broadcast a discovery ping on the modem network to find online subagents (computers running agent.lua --subagent, listening on the task port). Each online subagent replies with its modem address and model. Returns a list of found subagents (address + model), or 'none found'. Call this BEFORE subagent_call to obtain the target address — remote modem addresses cannot be obtained from component_list (that only lists local components). Discovery window is 5 seconds.",
+    description="Broadcast a discovery ping on the modem network to find online subagents (computers running agent.lua --subagent, listening on the task port). Each online subagent replies with its modem address and model. Returns a list of found subagents (address + model), or 'none found'. Call this BEFORE subagent_call to obtain the target address — remote modem addresses cannot be obtained from the `components` shell command (that only lists local components). Discovery window is 5 seconds.",
     -- 无参数工具: 不声明空 properties/required——OC json.lua 把空表 {}
     -- 编码为 []（数组），端点严格校验 properties=[] 直接 400（2026-08-11
     -- ocvm probe 实证: properties=[] → 400, 省略 → 200）。省略合法:
@@ -6630,7 +6181,7 @@ local function exec(name, args, deps)
   if name == "subagent_discover" then
     -- 广播发现（v0.3.78）: broadcast {v=1, op="discover"} 到任务端口，
     -- 收集 5 秒内各在线子代理的 discover_reply（含地址 + 模型）。
-    -- 注意: 远端 modem 不在 component_list（OC 组件只列本机可见），
+    -- 注意: 远端 modem 不在 `components` 命令输出（OC 组件只列本机可见），
     -- 广播发现是唯一可靠寻址方式。
     local ok, result = pcall(function()
       local json = deps.json
@@ -8699,7 +8250,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
               -- 续读提示（按工具类型）: 文件类工具给出路径续读指引
               local path = tool_args and tool_args:match('"path"%s*:%s*"([^"]*)"')
               if tool_name == "read_file" or tool_name == "edit_file"
-                  or tool_name == "append_file" or tool_name == "list_directory" then
+                  or tool_name == "append_file" then
                 if path and path ~= "" then
                   marker = marker .. "\n[full output exceeds cap; use read_file with offset/limit to read the rest of " .. path .. "]"
                 else
@@ -8714,9 +8265,8 @@ local function process_exchange(messages, config, user_input, persist, session, 
             -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
             local KEY_FIELD = {
               read_file="path", write_file="path", edit_file="path", append_file="path",
-              list_directory="path", shell_execute="command", component_doc="address",
-              component_invoke="method", web_search="query", subagent_call="task",
-              calc="expression", json_query="path", text_ops="op", component_list="filter",
+              search_files="pattern", shell_execute="command",
+              web_search="query", subagent_call="task",
             }
             local param_str = ""
             local kf = KEY_FIELD[tool_name]
@@ -8891,21 +8441,20 @@ local function main(config, ...)
               -- （内网读主代理硬盘代码/文档，经 modem FILE_PORT 9092）。
               -- 工具集覆盖规则: TOOLS 声明里 name 在只读白名单 → 保留;
               -- 写工具/shell/ask_user/subagent_call 等 → 剔除。
-              -- 执行拦截: execute_tool 全局替换——read_file/list_directory/
-              -- search_files/glob 转发到 subagent_mod.file_proxy(master=
-              -- sender)（任务发送者即主代理地址），其余走原 execute_mod.run。
+              -- 执行拦截: execute_tool 全局替换——read_file/search_files
+              -- 转发到 subagent_mod.file_proxy(master=sender)（任务发送者
+              -- 即主代理地址），其余走原 execute_mod.run。
+              -- v0.3.124: list_directory/glob 工具已删，代理集同步缩减。
               local tools_override = nil
               if req.role and req.role == "explorer" then
                 local READONLY = {
-                  read_file = true, list_directory = true,
-                  search_files = true, glob = true,
-                  component_list = true, component_doc = true,
-                  json_query = true, calc = true, text_ops = true,
+                  read_file = true,
+                  search_files = true,
                   web_search = true, subagent_discover = true,
                 }
                 local FILE_PROXY_TOOLS = {
-                  read_file = true, list_directory = true,
-                  search_files = true, glob = true,
+                  read_file = true,
+                  search_files = true,
                 }
                 tools_override = {}
                 for _, t in ipairs(TOOLS) do
@@ -8938,7 +8487,7 @@ local function main(config, ...)
                 -- 实证模型拿自己机器的路径（/home、src/agent/init.lua
                 -- 相对路径）去问主代理, 全空/报错。文件工具代理到主代理,
                 -- 路径必须按主代理文件系统理解（绝对路径）。
-                task_text = task_text .. "\n[EXPLORER MODE] file tools (read_file/list_directory/search_files/glob) are PROXIED over the modem to the MASTER computer — they read the MASTER's filesystem, not this machine's local disks. Use paths valid on the master (absolute paths like /home/... or /mnt/<id>/...), NOT paths on this machine."
+                task_text = task_text .. "\n[EXPLORER MODE] file tools (read_file/search_files) are PROXIED over the modem to the MASTER computer — they read the MASTER's filesystem, not this machine's local disks. Use paths valid on the master (absolute paths like /home/... or /mnt/<id>/...), NOT paths on this machine."
               end
               if req.role and req.role ~= "" then
                 task_text = "[角色: " .. req.role .. "]\n" .. task_text
@@ -8976,7 +8525,7 @@ local function main(config, ...)
 
   -- ── 文件服务（v0.3.84）: explorer 子代理经 modem 读主代理硬盘 ──
   -- 主代理空闲时（TUI readInput 事件回调 / REPL 每轮对话间隙）处理
-  -- 只读文件请求（read_file/list_directory/search_files/glob，绝不写）。
+  -- 只读文件请求（read_file/search_files，绝不写；v0.3.124 删 list_directory/glob）。
   -- chat 阻塞期间请求在事件队列排队，恢复空闲后处理。
   -- 仅在有 modem 网卡时启用；失败静默（无网卡机器不受影响）。
   local FILE_EXEC = function(name, args)

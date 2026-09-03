@@ -96,8 +96,9 @@ end
 tt("exec_lua math", "execute_lua", '{"code":"return 2+2"}')
 tt("exec_lua io", "execute_lua", '{"code":"io.write(\\"hello from lua\\")"}')
 tt("exec_lua err", "execute_lua", '{"code":"error(\\"boom\\")"}')
-tt("comp_list", "component_list", '{}')
-tt("comp_list filter", "component_list", '{"filter":"internet"}')
+-- v0.3.124: component_list 工具已删，改用 shell `components` 命令观察组件
+tt("comp_list", "shell_execute", '{"command":"components"}')
+tt("comp_list filter", "shell_execute", '{"command":"components internet"}')
 tt("unknown", "unknown_tool", '{}')
 
 -- component list full check

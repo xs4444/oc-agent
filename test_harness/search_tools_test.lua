@@ -1,13 +1,13 @@
--- search_tools_test.lua: ocvm 真机验证 search_files / glob 工具
+-- search_tools_test.lua: ocvm 真机验证 search_files 工具
 -- 骨架仿 paste_multiline_test.lua / resolution_test.lua:
 --   base 参数、_TEST_MODE=true、pcall(dofile, agent_path)、
 --   require agent.tools.file、log/check 模式。
+-- v0.3.124: glob 工具已删（OpenOS 有 find），本测试只验 search_files。
 -- 不 print 到屏幕（黑盒惯例：打印会污染待断言内容/屏幕），只写结果文件。
 -- 断言:
 --   1) agent.tools.file 模块加载成功且导出 exec
---   2) agent.tools registry 的 list() 含 search_files 与 glob
---   3) exec("glob", {pattern="*.lua", path=base}) 返回非空且含本脚本名
---   4) exec("search_files", {pattern="RESULT_NAME", path=base, glob="*.lua"})
+--   2) agent.tools registry 的 list() 含 search_files
+--   3) exec("search_files", {pattern="RESULT_NAME", path=base, glob="*.lua"})
 --      返回含本脚本文件名的匹配行
 -- 用法: lua /mnt/<short>/search_tools_test.lua /mnt/<short>
 local base = ({...})[1] or "/mnt"
@@ -56,27 +56,19 @@ if not (ok_file and type(file_mod) == "table" and type(file_mod.exec) == "functi
   log("RESULT: " .. PASS .. " pass, " .. FAIL .. " fail") return
 end
 
--- 2) search_files 与 glob 已注册（agent.tools registry list() 双向含）
+-- 2) search_files 已注册（agent.tools registry list() 含）
 local ok_tools, tools_mod = pcall(require, "agent.tools")
-local has_search, has_glob = false, false
+local has_search = false
 if ok_tools and type(tools_mod) == "table" and type(tools_mod.list) == "function" then
   for _, decl in ipairs(tools_mod.list()) do
     local def = decl and decl["function"]
     local name = def and def.name
     if name == "search_files" then has_search = true end
-    if name == "glob" then has_glob = true end
   end
 end
 check("search_files registered", has_search, "list() missing search_files")
-check("glob registered", has_glob, "list() missing glob")
 
--- 3) glob 找到 *.lua 且包含本脚本
-local ok_g, glob_res = pcall(file_mod.exec, "glob", {pattern = "*.lua", path = base})
-check("glob finds files", ok_g and type(glob_res) == "string" and glob_res ~= ""
-  and glob_res:find("search_tools_test.lua", 1, true) ~= nil,
-  "res='" .. tostring(glob_res and glob_res:sub(1, 200) or "nil") .. "'")
-
--- 4) search_files 找到 RESULT_NAME 内容行（含本脚本文件名）
+-- 3) search_files 找到 RESULT_NAME 内容行（含本脚本文件名）
 local ok_s, search_res = pcall(file_mod.exec, "search_files",
   {pattern = "RESULT_NAME", path = base, glob = "*.lua"})
 check("search_files finds content", ok_s and type(search_res) == "string"

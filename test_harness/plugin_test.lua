@@ -156,7 +156,8 @@ test("unknown tool message", type(unk) == "string" and unk:find("Unknown tool") 
 
 -- sloppy JSON that fails to decode still returns the parse-error message
 -- (same behavior as the original execute_tool)
-local parse_err = execute.run("calc", "{expression: '2+2'}", {json = json})
+-- v0.3.124: calc 工具已删；parse-error 测试与具体工具名无关，用现存工具名
+local parse_err = execute.run("read_file", "{expression: '2+2'}", {json = json})
 test("invalid JSON returns parse error",
   type(parse_err) == "string" and parse_err:find("Error parsing arguments") ~= nil,
   "got: " .. tostring(parse_err))

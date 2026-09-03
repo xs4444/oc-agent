@@ -89,14 +89,14 @@ else
     -- Task 2: file write+read roundtrip
     run_turn("Write the text 'HELLO_GTNH' to the file /hello.txt using write_file, then read it back with read_file and tell me what it says.", "T2 file roundtrip", 6)
 
-    -- Task 3: component discovery chain
-    run_turn("Use component_list to see what components exist, then use component_doc on the internet component to list its methods, then use component_invoke to call isHttpEnabled on it. Tell me the result.", "T3 component chain", 8)
+    -- Task 3: component discovery chain (v0.3.124: shell components + lua -e)
+    run_turn("Use shell_execute to run the 'components' command and see what components exist, find the internet component's address, then use shell_execute with lua -e to call component.invoke on that address with method 'isHttpEnabled'. Tell me the result.", "T3 component chain", 8)
 
-    -- Task 4: execute_lua computation
-    run_turn("Use execute_lua to compute 17 * 23 and tell me the result.", "T4 lua exec", 4)
+    -- Task 4: computation via lua -e (execute_lua removed)
+    run_turn("Use shell_execute to run lua -e 'print(17*23)' and tell me the result.", "T4 lua exec", 4)
 
     -- Task 5: multi-step combined (use several tools in sequence)
-    run_turn("First use component_list with filter 'filesystem' to list filesystem components, then use component_invoke on one of them to call getLabel. Tell me what labels you found.", "T5 combined", 8)
+    run_turn("First use shell_execute to run 'components filesystem' to list filesystem components, then use shell_execute with lua -e to call component.invoke getLabel on one of them. Tell me what labels you found.", "T5 combined", 8)
   end
 end
 

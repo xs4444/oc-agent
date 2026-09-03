@@ -321,7 +321,10 @@ local function test_patch()
 end
 
 -- ════════════════════════════════════════
--- 9. tools — TOOLS 清单齐全（19 项）
+-- 9. tools — TOOLS 清单齐全（11 项）
+-- v0.3.124: 从 19 精简到 11——删 list_directory/glob（OpenOS 有
+-- ls/find）、json_query/calc/text_ops（模型自身能力）、component_*
+-- 三件（OpenOS 有 `components` 命令 + lua -e 调组件）。
 -- ════════════════════════════════════════
 local function test_tools()
   local ok_t, tools = pcall(require, "agent.tools")
@@ -334,9 +337,7 @@ local function test_tools()
     if n then names[#names + 1] = n end
   end
   local EXPECTED = {
-    "read_file","edit_file","append_file","write_file","list_directory",
-    "search_files","glob","json_query","calc","text_ops",
-    "component_list","component_doc","component_invoke",
+    "read_file","edit_file","append_file","write_file","search_files",
     "web_search","shell_execute","subagent_call","subagent_discover",
     "ask_user","compact_history",
   }
@@ -346,7 +347,7 @@ local function test_tools()
     for _, n in ipairs(names) do if n == e then found = true break end end
     if not found then missing[#missing + 1] = e end
   end
-  record("tools", #missing == 0 and #names == 19,
+  record("tools", #missing == 0 and #names == 11,
     "count=" .. #names .. " missing=" .. (#missing > 0 and table.concat(missing, ",") or "none"))
 end
 

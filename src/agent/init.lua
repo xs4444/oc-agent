@@ -1832,7 +1832,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
               -- 续读提示（按工具类型）: 文件类工具给出路径续读指引
               local path = tool_args and tool_args:match('"path"%s*:%s*"([^"]*)"')
               if tool_name == "read_file" or tool_name == "edit_file"
-                  or tool_name == "append_file" or tool_name == "list_directory" then
+                  or tool_name == "append_file" then
                 if path and path ~= "" then
                   marker = marker .. "\n[full output exceeds cap; use read_file with offset/limit to read the rest of " .. path .. "]"
                 else
@@ -1847,9 +1847,8 @@ local function process_exchange(messages, config, user_input, persist, session, 
             -- 紧凑显示: [tool_name 关键参数] 结果摘要（一行）
             local KEY_FIELD = {
               read_file="path", write_file="path", edit_file="path", append_file="path",
-              list_directory="path", shell_execute="command", component_doc="address",
-              component_invoke="method", web_search="query", subagent_call="task",
-              calc="expression", json_query="path", text_ops="op", component_list="filter",
+              search_files="pattern", shell_execute="command",
+              web_search="query", subagent_call="task",
             }
             local param_str = ""
             local kf = KEY_FIELD[tool_name]
@@ -2024,21 +2023,20 @@ local function main(config, ...)
               -- （内网读主代理硬盘代码/文档，经 modem FILE_PORT 9092）。
               -- 工具集覆盖规则: TOOLS 声明里 name 在只读白名单 → 保留;
               -- 写工具/shell/ask_user/subagent_call 等 → 剔除。
-              -- 执行拦截: execute_tool 全局替换——read_file/list_directory/
-              -- search_files/glob 转发到 subagent_mod.file_proxy(master=
-              -- sender)（任务发送者即主代理地址），其余走原 execute_mod.run。
+              -- 执行拦截: execute_tool 全局替换——read_file/search_files
+              -- 转发到 subagent_mod.file_proxy(master=sender)（任务发送者
+              -- 即主代理地址），其余走原 execute_mod.run。
+              -- v0.3.124: list_directory/glob 工具已删，代理集同步缩减。
               local tools_override = nil
               if req.role and req.role == "explorer" then
                 local READONLY = {
-                  read_file = true, list_directory = true,
-                  search_files = true, glob = true,
-                  component_list = true, component_doc = true,
-                  json_query = true, calc = true, text_ops = true,
+                  read_file = true,
+                  search_files = true,
                   web_search = true, subagent_discover = true,
                 }
                 local FILE_PROXY_TOOLS = {
-                  read_file = true, list_directory = true,
-                  search_files = true, glob = true,
+                  read_file = true,
+                  search_files = true,
                 }
                 tools_override = {}
                 for _, t in ipairs(TOOLS) do
@@ -2071,7 +2069,7 @@ local function main(config, ...)
                 -- 实证模型拿自己机器的路径（/home、src/agent/init.lua
                 -- 相对路径）去问主代理, 全空/报错。文件工具代理到主代理,
                 -- 路径必须按主代理文件系统理解（绝对路径）。
-                task_text = task_text .. "\n[EXPLORER MODE] file tools (read_file/list_directory/search_files/glob) are PROXIED over the modem to the MASTER computer — they read the MASTER's filesystem, not this machine's local disks. Use paths valid on the master (absolute paths like /home/... or /mnt/<id>/...), NOT paths on this machine."
+                task_text = task_text .. "\n[EXPLORER MODE] file tools (read_file/search_files) are PROXIED over the modem to the MASTER computer — they read the MASTER's filesystem, not this machine's local disks. Use paths valid on the master (absolute paths like /home/... or /mnt/<id>/...), NOT paths on this machine."
               end
               if req.role and req.role ~= "" then
                 task_text = "[角色: " .. req.role .. "]\n" .. task_text
@@ -2109,7 +2107,7 @@ local function main(config, ...)
 
   -- ── 文件服务（v0.3.84）: explorer 子代理经 modem 读主代理硬盘 ──
   -- 主代理空闲时（TUI readInput 事件回调 / REPL 每轮对话间隙）处理
-  -- 只读文件请求（read_file/list_directory/search_files/glob，绝不写）。
+  -- 只读文件请求（read_file/search_files，绝不写；v0.3.124 删 list_directory/glob）。
   -- chat 阻塞期间请求在事件队列排队，恢复空闲后处理。
   -- 仅在有 modem 网卡时启用；失败静默（无网卡机器不受影响）。
   local FILE_EXEC = function(name, args)
