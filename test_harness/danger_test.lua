@@ -106,6 +106,15 @@ local function run_tool(name, args)
   return execute_tool(name, json.encode(args or {}))
 end
 
+-- v0.3.124: json_query/calc/text_ops 工具已删——各场景"agent 仍可用"的
+-- sanity 检查改用 write_file + read_file 往返（确定性、只依赖文件工具）。
+local SANITY_FILE = tmp .. "/sanity.txt"
+local function sanity_roundtrip()
+  run_tool("write_file", {path = SANITY_FILE, content = "ok"})
+  local r = run_tool("read_file", {path = SANITY_FILE})
+  return type(r) == "string" and r == "ok"
+end
+
 print("\n=== 1. Self-modification: write to agent.lua ===")
 local deployed = deployed_root .. "/agent.lua"
 -- 场景目标：修改"已部署的 agent.lua"（副本）
@@ -115,8 +124,8 @@ local after = io.open(deployed, "r")
 local content = after and after:read("*a")
 if after then after:close() end
 test("deployed agent.lua content was overwritten", content == "-- modified agent.lua by write_file tool\n", "got: " .. tostring(#(content or "")) .. " bytes")
-local r2 = run_tool("json_query", {json = '{"a":1}', path = "a"})
-test("agent still functional after self-modify", type(r2) == "string" and r2 == "1", r2)
+local r2 = sanity_roundtrip()
+test("agent still functional after self-modify", r2 == true, tostring(r2))
 
 print("\n=== 2. Bad plugin module in tools/ ===")
 local bad_plugin = deployed_root .. "/tools/bad_plugin.lua"
@@ -162,8 +171,8 @@ print("  (mock-limited) tool returned: " .. tostring(r3))
 -- 命令卡死/超时后 agent 不崩溃、返回字符串结果
 test("agent survives infinite-loop command (no crash)", type(r3) == "string", r3)
 print("  full result for observation: " .. tostring(r3))
-local r4 = run_tool("calc", {expression = "2+2"})
-test("agent functional after loop command", r4 == "4", r4)
+local r4 = sanity_roundtrip()
+test("agent functional after loop command", r4 == true, tostring(r4))
 
 print("\n=== 4. Disk space exhaustion ===")
 -- 4a. 大文件写入（200MB 流式）：agent 不应 OOM/崩溃
@@ -213,11 +222,11 @@ test("config recovers after valid rewrite", type(cfg2) == "table" and cfg2.model
 print("\n=== 6. Delete self (agent.lua) ===")
 local ok_del = os.remove(deployed)
 test("deployed agent.lua file deleted", ok_del or not io.open(deployed, "r"))
-local r7 = run_tool("calc", {expression = "6*7"})
-test("agent still functional after deleting its own file", r7 == "42", r7)
-local r8 = run_tool("text_ops", {text = "hello world", op = "upper"})
-print("  text_ops returned: " .. tostring(r8))
-test("text_ops works after self-delete", r8 ~= nil and r8:find("HELLO") ~= nil, r8)
+local r7 = sanity_roundtrip()
+test("agent still functional after deleting its own file", r7 == true, tostring(r7))
+local r8 = sanity_roundtrip()
+print("  file roundtrip after self-delete: " .. tostring(r8))
+test("file tools work after self-delete", r8 == true, tostring(r8))
 
 print("\n=== 7. Recursive tool calls ===")
 -- 7a. 插件工具递归：chain 插件通过 execute.run 自调用
@@ -253,8 +262,8 @@ local ok_rec, rec_res = pcall(function()
 end)
 print("  recursion result: " .. tostring(rec_res))
 test("deep recursion (100) completes or errors gracefully", ok_rec, rec_res)
-local r9 = run_tool("calc", {expression = "1+1"})
-test("agent functional after recursion", r9 == "2", r9)
+local r9 = sanity_roundtrip()
+test("agent functional after recursion", r9 == true, tostring(r9))
 
 -- 7b. 子代理自调用（modem 环路 → 超时）：用 mock modem 地址但无对端
 local r10 = run_tool("subagent_call", {address = "11aa22bb-3344-5566-7788-99aabbccddee", task = "ping", timeout = 0.1})

@@ -92,11 +92,12 @@ else
     elseif task_num == 2 then
       run_turn("Write 'HELLO_GTNH' to /hello.txt using write_file, then read it back with read_file and report what it says.", 6)
     elseif task_num == 3 then
-      run_turn("Use component_list to find the internet component, component_doc to list its methods, then component_invoke isHttpEnabled on it. Report the result.", 8)
+      -- v0.3.124: shell components + lua -e (component_* 工具已删)
+      run_turn("Use shell_execute to run 'components', find the internet component address, then use shell_execute with lua -e to call component.invoke on it with method 'isHttpEnabled'. Report the result.", 8)
     elseif task_num == 4 then
-      run_turn("Use execute_lua to compute 17 * 23 and tell me the result.", 4)
+      run_turn("Use shell_execute to run lua -e 'print(17*23)' and tell me the result.", 4)
     elseif task_num == 5 then
-      run_turn("Use component_list with filter 'filesystem', then component_invoke getLabel on the first filesystem component found. Report labels.", 8)
+      run_turn("Use shell_execute to run 'components filesystem', then use shell_execute with lua -e to call component.invoke getLabel on the first filesystem component found. Report labels.", 8)
     end
   end
 end

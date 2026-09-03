@@ -28,10 +28,11 @@ local DECLS = {}
 local ORDER = {}
 
 -- Builtin core tool modules, always loaded (canonical order).
+-- v0.3.124: data.lua (json_query/calc/text_ops) 与 component.lua
+-- (component_list/doc/invoke) 已删——模型自身能算数/解析 JSON/处理
+-- 字符串; OC 组件操作用 shell_execute + `components` 命令 / lua -e。
 local BUILTIN = {
   "agent.tools.file",
-  "agent.tools.data",
-  "agent.tools.component",
   "agent.tools.search",
   "agent.tools.shell",
   "agent.tools.subagent",

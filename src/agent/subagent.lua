@@ -25,8 +25,8 @@ local SUBAGENT_REPLY_PORT = 9091   -- master's reply port
 -- 超时"——实为任务确实没跑完）。300s 给足 explorer 探索任务余量。
 local SUBAGENT_TIMEOUT = 300       -- seconds to wait for a subagent reply
 -- 文件服务端口（v0.3.84 新增，explorer 子代理读主代理硬盘）:
--- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/list_directory/
--- search_files/glob 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
+-- 主代理空闲时监听 FILE_PORT；explorer 子代理的 read_file/search_files
+-- 通过 modem 代理到主代理执行，实现"内网读主代理文件"。
 local FILE_PORT = 9092
 local FILE_TIMEOUT = 60  -- 子代理等文件回复超时（主代理 chat 中时排队）
 -- 文件服务回复最大字节（v0.3.92）: 无线 modem 最大包 8192B——超过则
@@ -84,8 +84,8 @@ local function handle_file_message(exec_fn, sender, port, payload)
   else
     local op = req.op:match("^file:(.+)$") or req.op
     -- 只服务只读文件工具（安全边界: 文件服务绝不执行写工具）
-    if op == "read_file" or op == "list_directory"
-        or op == "search_files" or op == "glob" then
+    -- v0.3.124: list_directory/glob 工具已删，代理 op 同步缩减
+    if op == "read_file" or op == "search_files" then
       local args = {}
       for k, v in pairs(req) do
         if k ~= "v" and k ~= "op" then args[k] = v end

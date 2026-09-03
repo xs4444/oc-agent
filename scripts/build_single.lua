@@ -36,10 +36,9 @@ local MODULES = {
 }
 
 -- Tool plugin modules (same canonical order as agent.tools BUILTIN).
+-- v0.3.124: data / component 模块已删（19→11 工具精简）
 local TOOL_MODULES = {
   "agent.tools.file",
-  "agent.tools.data",
-  "agent.tools.component",
   "agent.tools.search",
   "agent.tools.shell",
   "agent.tools.subagent",

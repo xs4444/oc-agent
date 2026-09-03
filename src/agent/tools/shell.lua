@@ -20,16 +20,16 @@ local tools = {
 -- ═══════════════════════════════════════════════════════════════
 -- Unix-ism 护栏（工具层，替代 system prompt 大段指令——确定性拦截，
 -- 不依赖模型遵守; 拒绝信息内含 OpenOS 等价做法，模型从错误中学习）。
--- 逐 | 管道分段检查（管道内的 head/grep 同样拦截）。
+-- 逐 | 管道分段检查。
+-- v0.3.124: head/grep/wget 护栏已删——真机 OpenOS 1.8.9 实证这三个
+-- 命令存在（59 命令集，grep 为 Wobbo 移植版支持 -r/-n/-i 等）；
+-- 旧护栏基于错误的"OpenOS 无这些命令"假设，反而拦住可用命令。
 -- ═══════════════════════════════════════════════════════════════
 local GUARDS = {
-  {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use read_file('/etc/os-release') for system info, or component_list/component_doc."},
-  {pat = "^%s*head", hint = "head: not available in OpenOS. Use read_file with offset=1 and limit=N to read the first N lines."},
+  {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use the `components` command for hardware, or read_file for system files."},
   {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
-  {pat = "^%s*grep", hint = "grep: not available in OpenOS. Use search_files to search file contents, glob to find files."},
-  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Use read_file then text_ops op=length to count."},
-  {pat = "^%s*curl", hint = "curl: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
-  {pat = "^%s*wget", hint = "wget: not available in OpenOS. Use web_search for web info, or component_invoke on internet components for HTTP requests."},
+  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Count lines with `lua -e` (io.lines loop) or estimate via read_file offset/limit."},
+  {pat = "^%s*curl", hint = "curl: not available in OpenOS. OpenOS has `wget <url> [-O file]` for HTTP; or use web_search for web info."},
 }
 
 -- 护栏: 返回 nil + 错误信息 = 拒绝; 返回 true = 放行。
@@ -74,7 +74,7 @@ local function exec(name, args, deps)
         local cfg = (deps and deps.load_config and deps.load_config()) or {}
         local min_free = tonumber(cfg.mem_exec_min_free) or 500000
         if free < min_free then
-          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files/json_query 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
+          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
         end
       end
     end

@@ -1,10 +1,13 @@
 -- ═══════════════════════════════════════════════════════════════
 -- agent.tools.file — file tools: read_file / edit_file / append_file
--- / write_file / list_directory / search_files / glob.
+-- / write_file / search_files.
 --
--- search_files and glob are ported from oc-ai lib/cmn-utils/grep.lua
--- and glob.lua (recursive directory search + line numbers + literal/
--- Lua pattern + glob filter + max results/line length caps).
+-- search_files is ported from oc-ai lib/cmn-utils/grep.lua (recursive
+-- directory search + line numbers + literal/Lua pattern + glob filter
+-- + max results/line length caps).
+--
+-- v0.3.124: list_directory / glob 已删——真机 OpenOS 1.8.9 自带
+-- ls / find 命令（59 命令实证），shell_execute 即可覆盖，工具层不重复。
 --
 -- Module contract: exports {tools = {...}, exec = function(name, args,
 -- deps)}. exec returns nil for tool names it does not handle. deps is
@@ -33,11 +36,6 @@ local tools = {
     parameters={type="object", properties={path={type="string", description="File path"}, content={type="string", description="Content to write"}}, required={"path", "content"}}
   }},
   {type="function", ["function"]={
-    name="list_directory",
-    description="List files in a directory",
-    parameters={type="object", properties={path={type="string", description="Directory path"}}, required={"path"}}
-  }},
-  {type="function", ["function"]={
     name="search_files",
     description="Search file contents for a pattern, returning matching lines as 'path:line: content' (one per line). Recurses directories. pattern is a Lua pattern by default; set literal=true to match a literal string. path is the file or directory to search (default: current directory). glob restricts which files are searched (e.g. '*.lua'). max_results caps the number of matches (default 50); max_line_length truncates long lines (default 200).",
     parameters={type="object", properties={
@@ -49,19 +47,11 @@ local tools = {
       max_line_length={type="number", description="Maximum line length to return (default 200)"}
     }, required={"pattern"}}
   }},
-  {type="function", ["function"]={
-    name="glob",
-    description="Find files matching a glob pattern, recursively. Returns matching paths relative to path (one per line). Supports '*' (within a path segment) and '**' (across segments), e.g. '*.lua' or 'lib/**/*.lua'. path is the starting directory (default: current directory).",
-    parameters={type="object", properties={
-      pattern={type="string", description="Glob pattern to match (e.g. '*.lua', 'lib/**/*.lua')"},
-      path={type="string", description="Starting directory (default: current directory)"}
-    }, required={"pattern"}}
-  }},
 }
 
 -- ═══════════════════════════════════════════════════════════════
--- search_files / glob — grep/glob file search (ported from oc-ai
--- lib/cmn-utils/grep.lua and lib/cmn-utils/glob.lua).
+-- search_files — grep 风格文件内容搜索 (ported from oc-ai
+-- lib/cmn-utils/grep.lua).
 --
 -- Path handling is deliberately portable: io.open works in every
 -- environment (real OpenOS, host mock, tests), so it is the primary
@@ -88,17 +78,6 @@ local function utf8_cut(s, n)
   end
   if cut < 0 then cut = 0 end
   return s:sub(1, cut)
-end
-
--- Convert a glob pattern to a Lua pattern. Supports '*' (within a
--- path segment) and '**' (across segments): e.g. '*.lua', 'lib/**/*.lua'.
-local function glob_to_lua_pattern(glob_pat)
-  local pat = glob_pat
-  pat = (pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1"))
-  pat = (pat:gsub("%*%*", "\001"))
-  pat = (pat:gsub("%*", "[^/]*"))
-  pat = (pat:gsub("\001", ".*"))
-  return "^" .. pat .. "$"
 end
 
 -- Simple name glob match ('*' = anything), used for the search_files
@@ -239,43 +218,6 @@ local function search_files_code(args)
   return table.concat(out, "\n")
 end
 
--- glob: recursive glob pattern match over relative paths.
--- args: pattern, path.
-local function glob_code(args)
-  local ok_fs, fs = pcall(require, "filesystem")
-  local pattern = args.pattern
-  if type(pattern) ~= "string" or pattern == "" then
-    error("pattern must be a non-empty string")
-  end
-  local base = (args.path ~= nil and args.path ~= "") and args.path or "."
-  local lua_pat = glob_to_lua_pattern(pattern)
-  local matches = {}
-
-  local function walk(dir, prefix)
-    if classify_path(dir, fs) ~= "dir" then return end
-    local ok_list, it = pcall(function() return fs.list(dir) end)
-    if not ok_list or type(it) ~= "function" then return end
-    for entry in it do
-      local full = dir .. "/" .. entry
-      local rel = prefix == "" and entry or (prefix .. "/" .. entry)
-      if classify_path(full, fs) == "dir" then
-        walk(full, rel)
-      else
-        if rel:match(lua_pat) then
-          matches[#matches + 1] = rel
-        end
-      end
-    end
-  end
-
-  walk(base, "")
-  table.sort(matches)
-  if #matches == 0 then
-    return "No files match '" .. tostring(args.pattern) .. "' in " .. base
-  end
-  return table.concat(matches, "\n")
-end
-
 local function exec(name, args, deps)
   if name == "read_file" then
     local ok, result = pcall(function()
@@ -411,24 +353,8 @@ local function exec(name, args, deps)
     end)
     return ok and result or ("Error: " .. tostring(result))
 
-  elseif name == "list_directory" then
-    local ok, result = pcall(function()
-      local fs = require("filesystem")
-      local parts = {}
-      for f in fs.list(args.path or "/") do
-        parts[#parts + 1] = f
-      end
-      if #parts == 0 then return "(empty)" end
-      return table.concat(parts, "\n")
-    end)
-    return ok and result or ("Error: " .. tostring(result))
-
   elseif name == "search_files" then
     local ok, result = pcall(search_files_code, args)
-    return ok and result or ("Error: " .. tostring(result))
-
-  elseif name == "glob" then
-    local ok, result = pcall(glob_code, args)
     return ok and result or ("Error: " .. tostring(result))
   end
 

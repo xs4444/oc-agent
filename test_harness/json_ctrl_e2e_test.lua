@@ -47,7 +47,7 @@ local messages = {
   {role = "system", content = "You are a concise test assistant. Reply with exactly: OK_OK"},
   {role = "user", content = "please reply OK"},
   {role = "assistant", content = "",
-   tool_calls = {{id = "t1", type = "function", ["function"] = {name = "calc", arguments = '{"expression":"1+1"}'}}}},
+   tool_calls = {{id = "t1", type = "function", ["function"] = {name = "read_file", arguments = '{"path":"/x"}'}}}},
   {role = "tool", tool_call_id = "t1", content = ctrl_content},
   {role = "user", content = "continue"},
 }

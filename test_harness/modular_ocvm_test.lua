@@ -73,13 +73,12 @@ check("agent_test.wait_modem_message", ok_load and type(agent_test.wait_modem_me
 check("global json table (compat)", type(json) == "table" and type(json.encode) == "function")
 
 local tools = agent_test.TOOLS
-check("TOOLS count = 19", type(tools) == "table" and #tools == 19, tools and #tools)
--- 19 个工具集合齐全（顺序来自 BUILTIN 模块顺序：file/data/component/search/shell/subagent/network）
+-- v0.3.124: 工具从 19 精简到 11（删 list_directory/glob/json_query/calc/
+-- text_ops/component_list/component_doc/component_invoke）
+check("TOOLS count = 11", type(tools) == "table" and #tools == 11, tools and #tools)
+-- 11 个工具集合齐全（顺序来自 BUILTIN 模块顺序：file/search/shell/subagent/question/compact）
 local EXPECTED = {
-  "read_file","edit_file","append_file","write_file","list_directory",
-  "search_files","glob",
-  "json_query","calc","text_ops",
-  "component_list","component_doc","component_invoke",
+  "read_file","edit_file","append_file","write_file","search_files",
   "web_search","shell_execute",
   "subagent_call","subagent_discover","ask_user","compact_history",
 }

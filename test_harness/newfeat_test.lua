@@ -1,6 +1,10 @@
 -- ocvm verification for new features: json_query/calc/text_ops tools,
 -- compaction, and retry-enabled http_post (via chat with mock-free real API)
 -- NOTE: OpenOS lua has no `arg` global; use varargs.
+--
+-- OBSOLETE (v0.3.124): json_query/calc/text_ops 工具已删（模型自身能力），
+-- 本脚本的 1/2/3 段（工具验证）现会打印 "Unknown tool: ..."；compaction 与
+-- http_post retry 段仍有效。如需验证新工具集，改用 search_tools_test.lua。
 local base = ...
 if base == nil then base = "/mnt/df4" end
 _TEST_MODE = true
