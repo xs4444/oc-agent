@@ -36,49 +36,31 @@ local function read_file(path)
   return content
 end
 
--- Recursively list *.lua files under dir, returning relpaths (forward
--- slashes) prefixed with `prefix`. Uses Windows `dir /B` (files) and
--- `dir /B /AD` (subdirectories); falls back to an explicit two-level
--- walk if popen is unavailable.
-local function scan_lua_files(dir, prefix)
-  local out = {}
-  local ok, p = pcall(io.popen, 'dir /B "' .. dir .. '"')
-  if ok and p then
-    local listing = p:read("*a")
-    p:close()
-    for entry in listing:gmatch("[^\r\n]+") do
-      if entry:match("%.lua$") then
-        out[#out + 1] = prefix .. entry
+-- Recursively list *.lua files under root, returning relpaths (forward
+-- slashes). Cross-platform (2026-09-03: 项目迁移到 Linux 主机后原
+-- `dir /B` 不可用)——优先 Unix `find`，回退 Windows `dir /S /B`。
+local function scan_lua_files(root)
+  -- 依次尝试各命令，取第一个产出匹配者（Windows 有 find.exe 但语义不同，
+  -- 会空输出，故不能只看 popen 是否成功）。
+  for _, cmd in ipairs({
+    'find "' .. root .. '" -type f -name "*.lua"',
+    'dir /S /B "' .. root .. '*.lua"',
+  }) do
+    local ok, p = pcall(io.popen, cmd)
+    if ok and p then
+      local out = {}
+      for line in p:lines() do
+        local rel = line:sub(#root + 2):gsub("\\", "/")
+        if rel:match("%.lua$") then out[#out + 1] = rel end
       end
-    end
-  else
-    -- fallback: explicit known layout (src/agent/*.lua + src/agent/tools/*.lua)
-    for _, name in ipairs({ "init", "json", "http", "config", "session",
-                            "tools", "execute", "chat", "subagent" }) do
-      out[#out + 1] = prefix .. name .. ".lua"
-    end
-    for _, name in ipairs({ "file", "data", "component", "search",
-                            "shell", "subagent" }) do
-      out[#out + 1] = prefix .. "tools/" .. name .. ".lua"
+      p:close()
+      if #out > 0 then return out end
     end
   end
-  local okd, pd = pcall(io.popen, 'dir /B /AD "' .. dir .. '"')
-  if okd and pd then
-    local sub = pd:read("*a")
-    pd:close()
-    for entry in sub:gmatch("[^\r\n]+") do
-      if entry ~= "." and entry ~= ".." then
-        local nested = scan_lua_files(dir .. "/" .. entry, prefix .. entry .. "/")
-        for _, f in ipairs(nested) do
-          out[#out + 1] = f
-        end
-      end
-    end
-  end
-  return out
+  return {}
 end
 
-local relpaths = scan_lua_files(SRC, "")
+local relpaths = scan_lua_files(SRC)
 table.sort(relpaths)
 
 if #relpaths == 0 then

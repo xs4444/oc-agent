@@ -28,17 +28,17 @@ local history_path = config_mod.history_path
 --   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
 -- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
 -- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
--- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 200K 上下文目标）:
+-- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 2026-09-03 256K 窗口目标）:
 -- 硬常量按 config_mod.mem_scale（= totalMemory/2MB）的**平方**缩放——
 -- 内存翻倍 → 可承载请求体 4 倍（4MB 机器 MAX_HISTORY=480 条/1.2MB
--- 历史表，配合用户 context_window=200000 达成 200K 上下文；2MB 机器
+-- 历史表，配合 /preset-256k（262144）达成 256K 窗口；2MB 机器
 -- scale=1 时 120 条/300KB——比旧 60 条/200KB 大，字节预算与编码峰值
 -- 实测安全）。显式 config（mem_load_budget 等）仍优先——此处仅模块级
 -- 硬常量。
 local MEM_SCALE = config_mod.mem_scale or 1
 local MEM_SCALE2 = MEM_SCALE * MEM_SCALE
 local MAX_HISTORY = math.floor(120 * MEM_SCALE2)
-local MAX_HISTORY_BYTES = math.floor(300000 * MEM_SCALE2)  -- ~300KB×scale²; 4MB=1.2MB 历史表（200K 上下文装载）
+local MAX_HISTORY_BYTES = math.floor(300000 * MEM_SCALE2)  -- ~300KB×scale²; 4MB=1.2MB 历史表（256K 窗口装载）
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 -- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
 -- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。

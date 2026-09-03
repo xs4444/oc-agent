@@ -1169,8 +1169,15 @@ print("════════════════════════�
 
 -- session history: subagent keeps per-session JSONL histories (same format
 -- as main history). Verify format + replay + path sanitization locally.
+-- 跨平台 shell（2026-09-03 项目迁移 Linux 主机；原为 Windows-only cmd 语法）
+local IS_WIN = package.config:sub(1, 1) == "\\"
+local function sh_mkdir(d) os.execute(IS_WIN and ("mkdir " .. d .. " 2>nul")
+  or ("mkdir -p " .. d .. " 2>/dev/null")) end
+local function sh_rmdir(d) os.execute(IS_WIN and ("rmdir " .. d .. " 2>nul")
+  or ("rmdir " .. d .. " 2>/dev/null")) end
+
 local session_file = "test_session_temp/history.jsonl"
-os.execute("mkdir test_session_temp 2>nul")
+sh_mkdir("test_session_temp")
 os.remove(session_file)
 
 local function sim_append(path, msg)
@@ -1207,7 +1214,7 @@ test("session id sanitize",
   string.format("a=%q b=%q c=%q", san_a, san_b, san_c))
 
 os.remove(session_file)
-os.execute("rmdir test_session_temp 2>nul")
+sh_rmdir("test_session_temp")
 
 print("")
 print("═══════════════════════════════════════")
@@ -2657,7 +2664,7 @@ print("════════════════════════�
 do  -- 包裹成块: 主 chunk 局部变量贴 200 上限时 VM 寄存器错乱（boolean 当函数调）
   -- list_sessions: 扫描会话目录的 *.jsonl（/new 归档 .txt 不列入）
   local sdir = "test_sessions_tmp"
-  os.execute("mkdir " .. sdir .. " 2>nul")
+  sh_mkdir(sdir)
   local s_a = io.open(sdir .. "/alpha.jsonl", "w")
   s_a:write(json.encode({role = "user", content = "a1"}) .. "\n")
   s_a:write(json.encode({role = "assistant", content = "a2"}) .. "\n")

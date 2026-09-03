@@ -579,7 +579,7 @@ local function load()
     -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
     -- 模型上下文窗口（token）: /ctx 显示、60% 压缩引导、80% 硬保护、
     -- 请求估算的基准。**窗口是模型属性，与硬件无关，不随内存自动缩放**
-    -- ——在 4MB 机器跑 200K 上下文需显式配置 context_window=200000
+    -- ——在 4MB 机器跑 256K 上下文需 /preset-256k（context_window=262144）
     --（字节类阈值已按内存 scale² 放大：4MB 下 byte_budget/prefold/
     -- load_budget=800KB，足以承载 200K tokens ≈700KB 中文历史）。
     if not data.context_window then data.context_window = 128000 end
@@ -609,7 +609,7 @@ local function load()
     -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
     -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 200KB×scale²
     --（2026-08-10: 内存翻倍 → 可承载请求体 4 倍——4MB 机器 800KB 才
-    -- 折叠，配合用户配置 context_window=200000 可跑 200K 上下文；
+    -- 折叠，配合 /preset-256k（262144）中文长史可跑至 ~230K tokens；
     -- 2MB 机器 scale=1 时 200KB 略高于旧 100KB——2MB 下编码峰值
     -- 137-230KB 实测仍安全，且 byte_budget 兜底裁剪），先于 mem_pressure
     -- 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节真实下降。
@@ -718,17 +718,17 @@ local history_path = config_mod.history_path
 --   - 压缩: 窗口比例驱动（估算 tokens ≥ 窗口 60%）+ 条数 48 兜底
 -- 梯度保持: 压缩触发点 < trim 截断点。旧固定阈值（16条/40KB）导致每轮
 -- 工具对话必压缩 → 每轮调 LLM 摘要 + 破坏缓存前缀。
--- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 200K 上下文目标）:
+-- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 2026-09-03 256K 窗口目标）:
 -- 硬常量按 config_mod.mem_scale（= totalMemory/2MB）的**平方**缩放——
 -- 内存翻倍 → 可承载请求体 4 倍（4MB 机器 MAX_HISTORY=480 条/1.2MB
--- 历史表，配合用户 context_window=200000 达成 200K 上下文；2MB 机器
+-- 历史表，配合 /preset-256k（262144）达成 256K 窗口；2MB 机器
 -- scale=1 时 120 条/300KB——比旧 60 条/200KB 大，字节预算与编码峰值
 -- 实测安全）。显式 config（mem_load_budget 等）仍优先——此处仅模块级
 -- 硬常量。
 local MEM_SCALE = config_mod.mem_scale or 1
 local MEM_SCALE2 = MEM_SCALE * MEM_SCALE
 local MAX_HISTORY = math.floor(120 * MEM_SCALE2)
-local MAX_HISTORY_BYTES = math.floor(300000 * MEM_SCALE2)  -- ~300KB×scale²; 4MB=1.2MB 历史表（200K 上下文装载）
+local MAX_HISTORY_BYTES = math.floor(300000 * MEM_SCALE2)  -- ~300KB×scale²; 4MB=1.2MB 历史表（256K 窗口装载）
 local MAX_TOOL_RESULT = 3000     -- per-tool-result cap (exported: agent.lua uses it in process_exchange)
 -- head+tail 双保（reasonix 借鉴）: 超限结果保留前/后各 TOOL_RESULT_KEEP 字节，
 -- 总预算与 MAX_TOOL_RESULT 一致（3000），中间部分以标记提示。
@@ -7942,12 +7942,14 @@ local function handle_command(cmd, config, messages)
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
-  elseif command == "/preset-200k" then
-    -- 一键 200K 上下文配置（2026-08-10 用户需求）: context_window=200000。
-    -- 字节预算（byte_budget/mem_prefold_bytes/mem_load_budget）已按内存
-    -- scale² 自动放大（4MB→800KB，可承载 ~200K tokens 中文），无需
-    -- 改动——本命令只写窗口并校验硬件是否匹配。2MB 平台警告但照设
-    -- （窗口是模型属性，与硬件无关；只是历史装不满会被折叠浪费）。
+  elseif command == "/preset-256k" or command == "/preset-200k" then
+    -- 一键 256K 上下文配置（2026-08-10 用户需求，2026-09-03 200K→256K）:
+    -- context_window=262144。/preset-200k 为兼容别名（旧命令/输入历史不报错）。
+    -- 字节预算（byte_budget/mem_prefold_bytes/mem_load_budget）按内存 scale²
+    -- 放大（4MB→800KB ≈ ~230K tokens 中文），本命令只写窗口并校验硬件
+    -- 是否匹配——纯中文长史在 4MB 下会在喂满 256K 窗口前触发折叠，英文/
+    -- 代码为主（1-2 字节/token）可喂满。2MB 平台警告但照设（窗口是模型
+    -- 属性，与硬件无关；只是历史装不满会被折叠浪费）。
     local ok_c, comp = pcall(require, "computer")
     local total = 0
     if ok_c and type(comp) == "table" and comp.totalMemory then
@@ -7956,21 +7958,21 @@ local function handle_command(cmd, config, messages)
     end
     local cfg_ok, cfg_p = pcall(load_config)
     local cfg_d = cfg_ok and cfg_p or {}
-    cfg_d.context_window = 200000
+    cfg_d.context_window = 262144
     local ok_s, err_s = pcall(save_config, cfg_d)
     if not ok_s then
-      print("[preset-200k] 写入失败: " .. tostring(err_s))
+      print("[preset-256k] 写入失败: " .. tostring(err_s))
     else
-      print("[preset-200k] context_window=200000 已写入 config")
+      print("[preset-256k] context_window=262144 已写入 config")
       if total > 0 and total < 4194304 then
-        print("[preset-200k] ⚠️ 当前内存 " .. math.floor(total / 1048576)
+        print("[preset-256k] ⚠️ 当前内存 " .. math.floor(total / 1048576)
           .. "MB < 4MB——字节预算约 " .. math.floor(200000 / 3.5 / 1000)
           .. "K tokens（中文），窗口喂不满会被折叠浪费；建议装 4MB 内存条")
       else
-        print("[preset-200k] 内存充足（4MB+）：字节预算已按 scale² 放大，"
-          .. "可承载 ~200K tokens 中文 ✓")
+        print("[preset-256k] 内存充足（4MB+）：字节预算已按 scale² 放大，"
+          .. "可承载 ~230K tokens 中文（英文/代码可喂满 256K 窗口）✓")
       end
-      print("[preset-200k] 重启 agent 后生效（当前进程仍用旧窗口）")
+      print("[preset-256k] 重启 agent 后生效（当前进程仍用旧窗口）")
     end
   elseif command == "/ctx" then
     cmd_ctx(config, messages)
@@ -8025,7 +8027,7 @@ local function handle_command(cmd, config, messages)
     print("  /session <name> Switch to (or create) a named session; default = main")
     print("  /resume [n|name] Resume history: picker (no args), by number or name; also restores /new archives")
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
-    print("  /preset-200k    One-shot: set context_window=200000 (+ memory check)")
+    print("  /preset-256k    One-shot: set context_window=262144 (+ memory check)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /browse         Keyboard browse/select mode (hjkl move, Space select, y copy, q quit)")
     print("  /search <text>  Search content history (jump + highlight; /snext /sprev repeat)")
@@ -8122,8 +8124,8 @@ local function ensure_context_budget(messages, config, persist, session)
   -- （结果 + parts 数组 + 输入）。真机实证：ctx 43%（55K tokens≈190KB 文本）
   -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
   -- 独立字节预算（config.byte_budget 可调，默认 200KB×scale²——4MB 机器
-  -- 800KB：可承载 200K tokens 中文文本（≈700KB），用户配
-  -- context_window=200000 即达成 200K 上下文目标；2MB 机器 scale=1 时
+  -- 800KB：可承载 ~230K tokens 中文文本（≈800KB），配合
+  -- /preset-256k（262144）即开 256K 窗口；2MB 机器 scale=1 时
   -- 200KB，真机 encode 峰值实测 137-230KB 安全），作为自动折叠
   -- （mem_prefold_bytes）之后的最终兜底：超限直接裁剪早期消息
   -- （保留 head 锚点 + 最近 5 条）。
@@ -8349,9 +8351,9 @@ local function process_exchange(messages, config, user_input, persist, session, 
   local final_text = {}
   local retried_400 = false
   -- 工具循环轮次上限（oc-ai maxSteps / reasonix tool-round cap 借鉴）:
-  -- 安全网防无限循环；正常探索不触发（opencode 默认 Infinity）。可配
-  -- config.max_tool_steps 覆盖。
-  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps) or 40
+  -- **默认关闭**（opencode 默认 Infinity，2026-09-03 用户要求）——仅当
+  -- config.max_tool_steps 显式配置整数时启用（安全网防无限循环）。
+  local MAX_TOOL_STEPS = tonumber(config.max_tool_steps)
   local tool_steps = 0
   local tool_cap_reached = false
   local retried_empty = false  -- 空回答重试网（reasonix 借鉴，限一次）
@@ -8486,7 +8488,8 @@ local function process_exchange(messages, config, user_input, persist, session, 
     local has_tool_calls = response.tool_calls and #response.tool_calls > 0
     -- 任务1: 本轮触顶（超过轮次上限且模型还想调用工具）——不执行本轮工具，
     -- 注入提示后做最后一次收尾请求
-    local cap_trigger = has_tool_calls and not tool_cap_reached and tool_steps > MAX_TOOL_STEPS
+    local cap_trigger = has_tool_calls and not tool_cap_reached
+      and MAX_TOOL_STEPS ~= nil and tool_steps > MAX_TOOL_STEPS
 
     -- ── 重复调用检测（doom-loop 护栏，opencode 借鉴）──
     -- 签名 = name:arguments 摘要（前 120 字符）。基于此前轮次记录的
@@ -8754,7 +8757,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
 
     -- ── 静默停滞检测 + 进度 nudge（reasonix todoStallPause 借鉴）──
     -- 按轮检测: 本轮零文本输出（content 空/纯空白）→ streak +1，有输出
-    -- → 清零并重新武装。连续 N 轮（默认 12 ≈ MAX_TOOL_STEPS 40 的 1/3）
+    -- → 清零并重新武装。连续 N 轮（默认 12；轮次上限启用时约为其 1/3）
     -- 静默 → 注入一次进度提醒——请模型汇报一句进展，不强制收尾
     -- （真机实证: 正当长工具链轻松超 5 轮，旧版以"final_text 整体为空"
     -- 计数且 5 轮即催最终回答，长任务被拦腰打断；且 final_text 累积
@@ -9072,7 +9075,7 @@ local function main(config, ...)
       end)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/resume", "/reset", "/compact", "/hist",
-        "/sessions", "/session", "/relocate", "/preset-200k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
+        "/sessions", "/session", "/relocate", "/preset-256k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
