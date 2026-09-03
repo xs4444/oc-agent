@@ -44,11 +44,12 @@ local function test(label, cond, detail)
   end
 end
 
--- 隔离临时目录
+-- 隔离临时目录（2026-09-03 跨平台：原为 Windows-only cmd 语法）
+local IS_WIN = package.config:sub(1, 1) == "\\"
 local tmp = "danger_tmp"
-os.execute("rmdir /s /q " .. tmp .. " 2>nul")
-os.execute("mkdir " .. tmp)
-os.execute("mkdir " .. tmp .. "\\agent\\tools")
+os.execute(IS_WIN and ("rmdir /s /q " .. tmp .. " 2>nul") or ("rm -rf " .. tmp))
+os.execute(IS_WIN and ("mkdir " .. tmp .. "\\agent\\tools")
+  or ("mkdir -p " .. tmp .. "/agent/tools"))
 
 -- 让 require("agent.tools.xxx") 能解析到临时目录（插件扫描测试）
 package.path = tmp .. "/?.lua;" .. package.path
@@ -57,12 +58,23 @@ package.path = tmp .. "/?.lua;" .. package.path
 -- （场景 1/6 的目标文件用这份副本，绝不触碰真实 agent.lua）
 local deployed_root = tmp .. "/agent"
 local function copy_tree(src_dir, dst_dir)
-  local handle = io.popen('cmd /c dir /b "' .. src_dir .. '" 2>nul')
-  if not handle then return end
-  for line in handle:lines() do
+  -- 目录枚举跨平台（2026-09-03：ls -1 优先，空结果回退 Windows dir）
+  local listing
+  local ok, p = pcall(io.popen, 'ls -1 "' .. src_dir .. '" 2>/dev/null')
+  if ok and p then
+    listing = p:read("*a")
+    p:close()
+  end
+  if not listing or listing == "" then
+    local h = io.popen('cmd /c dir /b "' .. src_dir:gsub("/", "\\") .. '" 2>nul')
+    if not h then return end
+    listing = h:read("*a")
+    h:close()
+  end
+  for line in (listing or ""):gmatch("[^\r\n]+") do
     if line ~= "" then
       local s = src_dir .. "/" .. line
-      local d = dst_dir .. "\\" .. line
+      local d = dst_dir .. "/" .. line
       local fi = io.open(s, "rb")
       if fi then
         local content = fi:read("*a")
@@ -75,10 +87,9 @@ local function copy_tree(src_dir, dst_dir)
       end
     end
   end
-  handle:close()
 end
 copy_tree("../src/agent", deployed_root)
-copy_tree("../src/agent/tools", deployed_root .. "\\tools")
+copy_tree("../src/agent/tools", deployed_root .. "/tools")
 
 -- 加载 agent 入口（src 版，_TEST_MODE 跳过 main()）
 local ok_load, load_err = pcall(dofile, "../src/agent/init.lua")
@@ -165,7 +176,8 @@ local ok_big, big_err = pcall(function()
 end)
 test("large file write succeeds without crash", ok_big, big_err)
 -- 4b. 不可写路径（错误注入路径）：写失败返回 Error 而非崩溃
-local r5 = run_tool("write_file", {path = tmp .. "\\no_such_dir\\file.txt", content = "x"})
+-- 路径分隔符用 /（io.open 双平台均接受；\ 在 Linux 是合法文件名字符）
+local r5 = run_tool("write_file", {path = tmp .. "/no_such_dir/file.txt", content = "x"})
 print("  write to missing dir returned: " .. tostring(r5))
 test("write to unwritable path returns error, not crash", r5:find("Error") ~= nil, r5)
 -- 4c. 配额注入：mock filesystem.open 对超限文件返回 not enough space
@@ -250,7 +262,7 @@ print("  subagent self-call returned: " .. tostring(r10))
 test("subagent_call to self times out gracefully", type(r10) == "string" and r10:find("timeout") ~= nil, r10)
 
 -- 清理
-os.execute("rmdir /s /q " .. tmp .. " 2>nul")
+os.execute(IS_WIN and ("rmdir /s /q " .. tmp .. " 2>nul") or ("rm -rf " .. tmp))
 
 print("\n======================================")
 print(string.format("DANGER TESTS: %d pass, %d fail out of %d", pass, fail, pass + fail))

@@ -440,17 +440,29 @@ function mock_filesystem.exists(path)
   return false
 end
 function mock_filesystem.list(path)
-  -- real-dir enumeration via cmd (Windows). Returns a proper OC-style
+  -- real-dir enumeration, cross-platform (2026-09-03: 原仅
+  -- `cmd /c dir /b` Windows 版，项目迁移 Linux 后加 `ls -1` 优先、
+  -- 空结果回退 dir)。Returns a proper OC-style
   -- iterator (single function level) so callers can use
   -- `for f in fs.list(path) do` — used by agent.lua's list_directory
   -- and by agent.tools directory scanning.
   local parts = {}
-  local handle = io.popen('cmd /c dir /b "' .. tostring(path):gsub("/", "\\") .. '" 2>nul')
+  local p = tostring(path)
+  local handle = io.popen('ls -1 "' .. p .. '" 2>/dev/null')
   if handle then
     for line in handle:lines() do
       if line ~= "" then parts[#parts + 1] = line end
     end
     handle:close()
+  end
+  if #parts == 0 then
+    handle = io.popen('cmd /c dir /b "' .. p:gsub("/", "\\") .. '" 2>nul')
+    if handle then
+      for line in handle:lines() do
+        if line ~= "" then parts[#parts + 1] = line end
+      end
+      handle:close()
+    end
   end
   local i = 0
   return function()

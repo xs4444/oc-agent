@@ -102,7 +102,7 @@ local function load()
     -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
     -- 模型上下文窗口（token）: /ctx 显示、60% 压缩引导、80% 硬保护、
     -- 请求估算的基准。**窗口是模型属性，与硬件无关，不随内存自动缩放**
-    -- ——在 4MB 机器跑 200K 上下文需显式配置 context_window=200000
+    -- ——在 4MB 机器跑 256K 上下文需 /preset-256k（context_window=262144）
     --（字节类阈值已按内存 scale² 放大：4MB 下 byte_budget/prefold/
     -- load_budget=800KB，足以承载 200K tokens ≈700KB 中文历史）。
     if not data.context_window then data.context_window = 128000 end
@@ -132,7 +132,7 @@ local function load()
     -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
     -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 200KB×scale²
     --（2026-08-10: 内存翻倍 → 可承载请求体 4 倍——4MB 机器 800KB 才
-    -- 折叠，配合用户配置 context_window=200000 可跑 200K 上下文；
+    -- 折叠，配合 /preset-256k（262144）中文长史可跑至 ~230K tokens；
     -- 2MB 机器 scale=1 时 200KB 略高于旧 100KB——2MB 下编码峰值
     -- 137-230KB 实测仍安全，且 byte_budget 兜底裁剪），先于 mem_pressure
     -- 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节真实下降。
