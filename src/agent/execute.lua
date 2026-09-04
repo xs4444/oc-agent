@@ -17,7 +17,7 @@ local REGISTRY = tools.registry()
 -- execute_lua was removed in a previous version; keep the old guard
 -- message (run_tests asserts it) without any actual executor.
 local EXECUTE_LUA_GUARD =
-  "Error: execute_lua has been removed. Do math/JSON/text work yourself; for exact arithmetic verify with `lua -e 'print(...)'` via shell_execute."
+  "Error: execute_lua has been removed. Do math/JSON/text work yourself; for exact arithmetic write a script with write_file that writes the answer to a file, then run `lua /tmp/v.lua; cat /tmp/v_out.txt` via shell_execute (the lua wrapper has no -e flag)."
 
 local M = {}
 

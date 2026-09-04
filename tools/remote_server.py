@@ -46,6 +46,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 HOLD_DEFAULT = 12        # /poll 无命令时最长 hold（秒）—— agent 侧读 deadline 30s
 RESULT_TTL = 3600        # 结果保留（秒）
+MAX_CMD_WIRE = 100000    # /cmd 入队的线上 JSON 字节上限（agent MAX_POLL_BODY=131072 之下留余量）
 ALLOWED_OPS = {"ping", "exec", "read", "write", "list"}
 
 
@@ -85,7 +86,13 @@ def make_handler(state):
             return True
 
         def _send(self, code, obj):
-            body = json.dumps(obj).encode("utf-8")
+            # ensure_ascii=False（v0.3.125r2）: 默认 True 把 emoji 等非
+            # BMP 字符编码成 \uD83C\uDF0D 代理对——agent json.lua 的
+            # \u 解码无 surrogate 合并 → 孤立代理变无效 UTF-8 → 回传
+            # decode(replace) 成 U+FFFD（实证: echo 你好🌍中文 回 "??????"；
+            # 3 字节中文 <U+2048 走 \u handler 不受影响）。直接发 UTF-8
+            # 原始字节（RFC 8259 合法，agent json 字节透明）。
+            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -159,6 +166,19 @@ def make_handler(state):
                     self._send(400, {"error": "unknown op: %s" % op})
                     return
                 cmd = {"id": None, "op": op, "args": req.get("args") or {}}
+                # 线上大小拒收（v0.3.125r2）: agent poll 响应上限
+                # MAX_POLL_BODY=131072——超限命令入队后 poll 响应整体被
+                # agent 丢弃，命令永不执行永不报告（实证坑: 200KB write
+                # 触发 10 次 "poll response too large"，命令 c48 失踪）。
+                # 按重建后 cmd 的线上 JSON 字节数（含转义膨胀）判，
+                # 留 ~28KB 余量防边界。
+                wire = len(json.dumps(cmd, ensure_ascii=False).encode("utf-8"))
+                if wire > MAX_CMD_WIRE:
+                    self._send(413, {
+                        "error": "command too large: %d bytes on the wire "
+                                 "(max %d); split into smaller pieces"
+                                 % (wire, MAX_CMD_WIRE)})
+                    return
                 with state.cond:
                     cmd["id"] = state.new_id()
                     state.queues.setdefault(state.token, deque())
