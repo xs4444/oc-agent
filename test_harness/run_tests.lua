@@ -2808,9 +2808,124 @@ do
       test("remote: ping returns json ok", is3 == false and tostring(s3):find('"data"') ~= nil, tostring(s3):sub(1, 120))
       test("remote: sh_quote basic", int.sh_quote("a b") == "'a b'", int.sh_quote("a b"))
       test("remote: sh_quote single quote", int.sh_quote("a'b") == "'a'\\''b'", int.sh_quote("a'b"))
+      -- v0.3.125r4: shutdown（/exit 安全网——守护 active 时 /exit 冻死 VM 的
+      -- 修复，2026-09-05 真机实证：孤儿 PipedCommand + 主循环 97% 自旋）
+      test("remote: shutdown exports", type(remote.shutdown) == "function")
+      local so1, serr1 = remote.shutdown(1)
+      test("remote: shutdown rejected when not running",
+        so1 == false and serr1 == "not running", tostring(serr1))
+      do
+        local st = int._state
+        st.running = true
+        st.active_handle = nil
+        local closed = false
+        st.active_handle = { close = function() closed = true end }
+        local so2, serr2 = remote.shutdown(1)
+        test("remote: shutdown closes active handle + sets stop flag",
+          so2 == true and closed == true and st.stop_flag == true
+            and st.active_handle == nil, tostring(serr2))
+        st.running = false
+        st.stop_flag = false
+      end
+      -- v0.3.125r3: report 崩溃持久化往返（mock fs 走宿主真 FS，用 /tmp）
+      local p = int._persist
+      if p then
+        local base = "/tmp/remote_persist_test_" .. tostring(os.time())
+        os.execute("rm -rf " .. base)
+        os.execute("mkdir -p " .. base .. "/remote_pending")
+        -- 乱序 ts 落盘 → 回载按 ts 排序
+        for _, c in ipairs({{"c1", 100}, {"c3", 200}, {"c2", 300}}) do
+          local f = io.open(base .. "/remote_pending/" .. c[1] .. ".json", "w")
+          if f then
+            f:write(json.encode({id = c[1], ts = c[2],
+              payload = '{"id":"' .. c[1] .. '","ok":true,"result":"p"}'}))
+            f:close()
+          end
+        end
+        -- 垃圾文件 → 回载时清掉
+        local g = io.open(base .. "/remote_pending/c99.json", "w")
+        if g then g:write("not-json") g:close() end
+        p.set_pending_dir(base .. "/remote_pending")
+        p.load_pending_from_disk()
+        local q = p.get_pending()
+        test("persist: 回载按 ts 排序（100/200/300 → c1,c3,c2）",
+          #q == 3 and q[1].id == "c1" and q[2].id == "c3" and q[3].id == "c2",
+          #q .. " / " .. tostring(q[1] and q[1].id))
+        local gf = io.open(base .. "/remote_pending/c99.json", "r")
+        test("persist: 垃圾盘文件回载即清", gf == nil, "c99.json still exists")
+        if gf then gf:close() end
+        -- 上限淘汰: 再写 52 个 → 只留最新 50
+        for i = 1, 52 do
+          local f = io.open(string.format("%s/remote_pending/e%02d.json", base, i), "w")
+          if f then
+            f:write(json.encode({id = "e" .. string.format("%02d", i),
+              ts = 1000 + i, payload = "{\"ok\":true}"}))
+            f:close()
+          end
+        end
+        p.clear_pending()
+        p.load_pending_from_disk()
+        q = p.get_pending()
+        test("persist: >50 条最旧淘汰（留 50）", #q == 50, tostring(#q))
+        -- 写盘往返 + 送达删除
+        p.persist_to_disk("cX", '{"id":"cX","ok":false,"result":"err"}')
+        local rf = io.open(base .. "/remote_pending/cX.json", "r")
+        local ok_rt = rf ~= nil
+        local content = ok_rt and (rf:read("*a")) or ""
+        if ok_rt then rf:close() end
+        test("persist: 写盘往返含 payload",
+          ok_rt and content:find('"cX"', 1, true) ~= nil, tostring(content):sub(1, 120))
+        p.delete_pending_file("cX")
+        local rf2 = io.open(base .. "/remote_pending/cX.json", "r")
+        test("persist: 送达即删盘", rf2 == nil, "cX.json still exists")
+        if rf2 then rf2:close() end
+        -- 不可用目录 → 静默禁用（置 nil 不崩）
+        p.set_pending_dir("/nonexistent_zz/remote_pending")
+        p.load_pending_from_disk()
+        test("persist: 目录不可用静默禁用", true, "load ok without crash")
+        os.execute("rm -rf " .. base)
+      end
     else
       test("remote: _internal test hook exposed under _TEST_MODE", false, "_internal nil")
     end
+  end
+end
+
+-- ═══════════════════════════════════════════
+-- 结构化 is_err（v0.3.125r3）: 工具层返回 (text, is_err)，远程路径不再
+-- 字符串前缀嗅探——假阳回归: 以 "Error:" 开头的合法输出不得判错。
+-- （超时路径 mock thread 同步执行无法覆盖，由 VM 驱动 exec_timeout_param 实证）
+-- ═══════════════════════════════════════════
+do
+  local ex_ok, ex = pcall(require, "agent.execute")
+  test("is_err: agent.execute module loads", ex_ok and type(ex) == "table", tostring(ex))
+  if ex_ok then
+    local deps = {json = json}
+    local t1, e1 = ex.run("shell_execute",
+      '{"command":"echo \'Error: not-a-real-error\'"}', deps)
+    test("is_err: 'Error: ...' 字面输出 → is_err=false（假阳回归）",
+      type(e1) == "boolean" and e1 == false
+      and tostring(t1):find("not-a-real-error", 1, true) ~= nil,
+      tostring(t1) .. " / " .. tostring(e1))
+    local t2, e2 = ex.run("shell_execute", '{"command":"wc -c /tmp/x"}', deps)
+    test("is_err: guard 拒绝 → is_err=true",
+      e2 == true and tostring(t2):find("rejected by guard") ~= nil, tostring(t2))
+    local t4, e4 = ex.run("no_such_tool_zzz", '{}', deps)
+    test("is_err: unknown tool → is_err=true（修隐藏假阴）",
+      e4 == true and tostring(t4):find("Unknown tool") ~= nil, tostring(t4))
+    local t5, e5 = ex.run("execute_lua", '{"code":"return 1"}', deps)
+    test("is_err: execute_lua 护栏 → is_err=true",
+      e5 == true and tostring(t5):find("removed") ~= nil, tostring(t5))
+    local t6, e6 = ex.run("read_file", 'not-json-at-all', deps)
+    test("is_err: 参数解析失败 → is_err=true",
+      e6 == true and tostring(t6):find("Error parsing arguments") ~= nil, tostring(t6))
+    local t7, e7 = ex.run("read_file", '{"path":"/nonexistent_zz/none.txt"}', deps)
+    test("is_err: read_file 文件缺失 → is_err=true",
+      e7 == true and tostring(t7):find("file not found") ~= nil, tostring(t7))
+    local t8, e8 = ex.run("write_file",
+      '{"path":"/tmp/is_err_rt.txt","content":"ok"}', deps)
+    test("is_err: write_file 成功 → is_err=false",
+      e8 == false and tostring(t8):find("Written to") ~= nil, tostring(t8))
   end
 end
 

@@ -55,7 +55,7 @@ local function exec(name, args, deps)
   if name == "shell_execute" then
     local ok_guard, guard_err = guard_command(args.command)
     if not ok_guard then
-      return guard_err
+      return guard_err, true
     end
 
     -- 执行前内存护栏（真机第四次 OOM 根因，gist 59379f，free=35KB）:
@@ -74,46 +74,55 @@ local function exec(name, args, deps)
         local cfg = (deps and deps.load_config and deps.load_config()) or {}
         local min_free = tonumber(cfg.mem_exec_min_free) or 500000
         if free < min_free then
-          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
+          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。", true
         end
       end
     end
 
     local timeout = tonumber(args.timeout) or 60
-    local ok, result = pcall(function()
+    -- v0.3.125r3: 结构化错误标志 (text, is_err)——内层各返回点自带语义，
+    -- 远程通道不再靠字符串前缀猜（消除 "Error: ..." 合法输出的假阳）。
+    local ok, result, is_err = pcall(function()
       local thread_ok, thread = pcall(require, "thread")
       if not thread_ok then
         -- no thread library (mock/legacy): direct execution with popen capture
         local handle = io.popen(args.command .. " 2>&1")
-        if not handle then return "Error: failed to execute command" end
+        if not handle then return "Error: failed to execute command", true end
         local output = handle:read("*a")
         handle:close()
-        return output ~= "" and output or "(no output)"
+        return (output ~= "" and output or "(no output)"), false
       end
       local sh = require("shell")
       local done = false
-      local out = nil
+      local out, out_err = nil, false
       local t = thread.create(function()
-        local okc, res = pcall(function()
+        local okc, res, res_err = pcall(function()
           -- Capture stdout+stderr via io.popen instead of shell.execute
           -- (shell.execute returns only exit status, not output)
           local handle = io.popen(args.command .. " 2>&1")
-          if not handle then return "Error: failed to execute command" end
+          if not handle then return "Error: failed to execute command", true end
           local output = handle:read("*a")
           handle:close()
-          return output ~= "" and output or "(no output)"
+          return (output ~= "" and output or "(no output)"), false
         end)
-        out = okc and res or ("Error: " .. tostring(res))
+        if okc then
+          out, out_err = res, res_err
+        else
+          out, out_err = "Error: " .. tostring(res), true
+        end
         done = true
       end)
       local wok, werr = thread.waitForAll({t}, timeout)
       if not wok then
         pcall(t.kill, t)
-        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command)
+        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command), true
       end
-      return out or "(no output)"
+      return (out or "(no output)"), out_err
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    if not ok then
+      return "Error: " .. tostring(result), true
+    end
+    return result, is_err
   end
 
   return nil  -- not handled by this module

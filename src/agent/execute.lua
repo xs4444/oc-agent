@@ -21,6 +21,12 @@ local EXECUTE_LUA_GUARD =
 
 local M = {}
 
+-- 返回 (text, is_err)：
+--   text   — 工具结果字符串（成功输出或错误信息，chat 路径消费这个）
+--   is_err — 结构化错误标志：本层判定的错误（参数解析失败 / execute_lua
+--            护栏 / Unknown tool / 工具 pcall 崩溃）= true；工具层自带的
+--            标志（file/shell 模块返回）透传；工具未提供（插件等）= nil，
+--            调用方可回退字符串前缀判定。
 function M.run(name, args_str, deps)
   deps = deps or {}
   local json = deps.json
@@ -50,23 +56,23 @@ function M.run(name, args_str, deps)
     else
       err_info = tostring(decoded)
     end
-    return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200)
+    return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200), true
   end
 
   if name == "execute_lua" then
-    return EXECUTE_LUA_GUARD
+    return EXECUTE_LUA_GUARD, true
   end
 
   local exec = REGISTRY[name]
   if not exec then
-    return "Unknown tool: " .. tostring(name)
+    return "Unknown tool: " .. tostring(name), true
   end
 
-  local ok_run, result = pcall(exec, name, args, deps)
+  local ok_run, result, tool_err = pcall(exec, name, args, deps)
   if not ok_run then
-    return "Error: " .. tostring(result)
+    return "Error: " .. tostring(result), true
   end
-  return result
+  return result, tool_err
 end
 
 return M
