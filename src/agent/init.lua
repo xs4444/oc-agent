@@ -204,7 +204,9 @@ DEPS.ask_user = ask_user_repl
 -- agent.tools). This thin wrapper delegates to execute.lua with the
 -- cached DEPS table.
 function execute_tool(name, args_str)
-  return execute_mod.run(name, args_str, DEPS)
+  -- v0.3.125r3: 括号截断 execute.run 的第二返回值 (is_err)——chat 路径保持
+  -- 纯字符串契约（LLM 对话历史只见结果文本）；结构化标志仅远程通道消费。
+  return (execute_mod.run(name, args_str, DEPS))
 end
 
 -- ── Section 7: REPL & Main Loop ────────────────────────────────
@@ -1087,9 +1089,10 @@ local function handle_command(cmd, config, messages)
         print("remote: not configured（/remote url <http://host:port> + /remote token <t>）")
       else
         print(string.format(
-          "remote: %s | %s | polls=%d cmds=%d errs=%d rep_errs=%d last=%s(%s)%s",
+          "remote: %s | %s | polls=%d cmds=%d errs=%d rep_errs=%d pend=%d last=%s(%s)%s",
           remote.is_running() and "RUNNING" or "stopped", st.url,
           st.polls, st.cmds, st.errors, st.report_errors,
+          st.pending or 0,
           tostring(st.last_op or "-"), tostring(st.last_ok == nil and "-" or (st.last_ok and "ok" or "ERR")),
           st.last_err and (" | " .. tostring(st.last_err):sub(1, 80)) or ""))
       end
@@ -1101,7 +1104,8 @@ local function handle_command(cmd, config, messages)
         local ok2, err2 = remote.start({
           url = config.remote_url,
           token = config.remote_token,
-          deps = {json = json, load_config = load_config},
+          deps = {json = json, load_config = load_config,
+                  data_dir = config_mod.writable_base},
         })
         if not ok2 then
           print("remote start failed: " .. tostring(err2))
@@ -1239,6 +1243,14 @@ local function handle_command(cmd, config, messages)
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
   elseif command == "/exit" then
+    -- v0.3.125r4: 远控守护 active 时 /exit 会冻死 VM（守护线程被杀在半途
+    -- poll → PipedCommand 未 close → 孤儿 wget + 主循环 97% CPU 自旋 +
+    -- shell 无响应，2026-09-05 r3 真机实证）。先 shutdown 守护：设标志 +
+    -- close 活动 handle + 有界等待（3s）线程退出，再走正常退出。
+    local ok_rm, remote = pcall(require, "agent.remote")
+    if ok_rm and type(remote) == "table" and remote.shutdown then
+      pcall(remote.shutdown, 3)
+    end
     return true, config, messages
   else
     print("Unknown command: " .. command .. ". Type /help for commands.")
@@ -2019,7 +2031,8 @@ local function main(config, ...)
       pcall(remote.start, {
         url = config.remote_url,
         token = config.remote_token,
-        deps = {json = json, load_config = load_config},
+        deps = {json = json, load_config = load_config,
+                data_dir = config_mod.writable_base},
       })
     end
   end

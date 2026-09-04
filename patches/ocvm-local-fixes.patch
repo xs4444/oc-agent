@@ -12,7 +12,7 @@ index ed9b0c0..34b4dbe 100644
  LUA_CFLAGS  := $(shell pkg-config --cflags $(lua) --silence-errors)
  LUA_LDFLAGS := $(shell pkg-config --libs $(lua) --silence-errors)
 diff --git a/client.cfg b/client.cfg
-index cc0a76d..ae97d8d 100644
+index cc0a76d..b90bfe2 100644
 --- a/client.cfg
 +++ b/client.cfg
 @@ -18,7 +18,7 @@
@@ -24,7 +24,7 @@ index cc0a76d..ae97d8d 100644
          -- filesystem
          -- 1. source: uri for readonly loot, nil/false for hdd, and true for tmpfs
          -- 2. label
-@@ -41,7 +41,7 @@
+@@ -41,9 +41,9 @@
      },
      system =
      {
@@ -32,12 +32,23 @@ index cc0a76d..ae97d8d 100644
 +        timeout = 120, -- defaults to 5
          allowGC = false, -- defaults to false
          allowBytecode = false, -- defaults to false
-         maxTcpConnections = 4, --defaults to 4
+-        maxTcpConnections = 4, --defaults to 4
++        maxTcpConnections = 16, --defaults to 4; 本地修复: 远控守护轮询+wget 子进程下 4 触顶太快
+     }
+ }
 diff --git a/drivers/internet_http.cpp b/drivers/internet_http.cpp
-index ede6609..4c7ff91 100644
+index ede6609..8e45328 100644
 --- a/drivers/internet_http.cpp
 +++ b/drivers/internet_http.cpp
-@@ -35,22 +35,7 @@ static string trim(const string& value)
+@@ -1,5 +1,7 @@
+ #include "internet_http.h"
+ #include <fcntl.h>
++#include <cerrno>
++#include <signal.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
+@@ -35,22 +37,7 @@ static string trim(const string& value)
  
  static string escape(const string& text)
  {
@@ -61,20 +72,33 @@ index ede6609..4c7ff91 100644
  }
  
  ////////////////// PIPED COMMAND ////////////////////////
-@@ -148,7 +133,11 @@ int PipedCommand::id() const
+@@ -148,7 +135,24 @@ int PipedCommand::id() const
  
  void PipedCommand::close()
  {
 -  ::close(_child_id);
 +  if (_child_id > 0)
 +  {
-+    ::waitpid(_child_id, nullptr, WNOHANG);
++    // 先 SIGKILL 再阻塞 waitpid 确保收割: 旧版只 WNOHANG 一次就
++    // _child_id=-1 放弃跟踪——子进程（wget）仍在跑时被弃置:
++    // ocvm 退出留 wget 孤儿（实证: /exit 后残留 wget 75% CPU 自旋），
++    // 且槽位随弃置进程悬挂。kill 对已退出的 pid 无害（ESRCH 忽略）。
++    ::kill(_child_id, SIGKILL);
++    int wstatus = 0;
++    while (::waitpid(_child_id, &wstatus, 0) < 0)
++    {
++      if (errno == EINTR)
++      {
++        continue;
++      }
++      break;  // ECHILD: 已被收割
++    }
 +    _child_id = -1;
 +  }
  }
  
  /////////////////////////////////////////////////////////////////////////////////////////////////
-@@ -163,7 +152,7 @@ HttpObject::HttpObject(const HttpAddress& addr, const string& post, const map<st
+@@ -163,7 +167,7 @@ HttpObject::HttpObject(const HttpAddress& addr, const string& post, const map<st
    vector<string> args{ "-q", "-S", "--no-check-certificate", "-O", "/proc/self/fd/1" };
    if (post.size())
    {

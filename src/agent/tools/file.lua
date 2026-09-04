@@ -284,7 +284,7 @@ local function exec(name, args, deps)
       end
       return out
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "edit_file" then
     local ok, result = pcall(function()
@@ -331,7 +331,7 @@ local function exec(name, args, deps)
       fw:close()
       return "Replaced " .. (args.replace_all and count or 1) .. " occurrence(s) in " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "append_file" then
     local ok, result = pcall(function()
@@ -341,7 +341,7 @@ local function exec(name, args, deps)
       f:close()
       return "Appended " .. (#(args.content or "") ) .. " bytes to " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "write_file" then
     local ok, result = pcall(function()
@@ -351,11 +351,11 @@ local function exec(name, args, deps)
       f:close()
       return "Written to " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "search_files" then
     local ok, result = pcall(search_files_code, args)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
   end
 
   return nil  -- not handled by this module

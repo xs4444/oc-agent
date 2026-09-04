@@ -539,6 +539,12 @@ local patch = require("agent.patch")
 local now = patch.now
 
 local POLL_TIMEOUT = 30      -- poll 读 deadline（秒）: 连接后 30s 无响应判超时
+local REPORT_TIMEOUT = 10    -- report 读 deadline（秒）: 短于 poll 的 30s——
+                             -- 实证坑: report POST 卡满 30s 占用单线程守护
+                             -- （期间不 poll、off 不响应）；失败进 pending
+                             -- 延迟队列，不值得卡 30s
+local MAX_PENDING = 10       -- report 延迟队列: 条数上限（最旧淘汰）
+local MAX_PENDING_BYTES = 131072 -- report 延迟队列: payload 总量上限（128KB）
 local BACKOFF_BASE = 2       -- 失败退避基数（秒）
 local BACKOFF_CAP = 60       -- 退避封顶（秒）
 local MAX_RESULT = 65536     -- 回传结果截断（字节）: 64KB
@@ -557,9 +563,16 @@ local state = {
   last_ok = nil,
   last_err = nil,
   backoff = BACKOFF_BASE,
+  -- v0.3.125r4: 当前 poll 的 internet handle——shutdown() 用它立即解除
+  -- 阻塞（close → 读迭代器 EOF）。read_guarded 返回后清除。
+  active_handle = nil,
 }
 
 local opts = nil  -- {url, token, deps}
+-- v0.3.125r3: report 延迟队列——report 发送失败（10s 超时/重试仍败）的
+-- payload 暂存于此，poll 成功（=服务器可达）后逐条冲刷。守护进程崩溃
+-- 丢失的窗口由 /result 端 lost 标记兜底（服务器侧）。
+local pending = {}
 
 local function url_encode(s)
   return (tostring(s):gsub("[^%w%-%_%.%~]", function(c)
@@ -586,15 +599,16 @@ end
 --    run_tests 的 oc_mock 环境——其 internet mock 无 thread 语义）。
 
 -- 同步读循环（fallback 用；与 v0.3.125r1 行为一致）
-local function read_sync(handle, limit)
+local function read_sync(handle, limit, timeout)
+  timeout = timeout or POLL_TIMEOUT
   local chunks = {}
   local total = 0
   local aborted = nil
-  local deadline = now() + POLL_TIMEOUT
+  local deadline = now() + timeout
   local ok_it, err_it = pcall(function()
     for chunk in handle do
       if interrupt.poll() then aborted = "interrupted" return end
-      if now() >= deadline then aborted = "read timeout after " .. POLL_TIMEOUT .. "s" return end
+      if now() >= deadline then aborted = "read timeout after " .. timeout .. "s" return end
       total = total + #chunk
       if total > limit then aborted = "response too large" return end
       chunks[#chunks + 1] = chunk
@@ -610,11 +624,12 @@ local function read_sync(handle, limit)
 end
 
 -- 看门狗读: 子线程读 + waitForAll(deadline)；任何路径都 close handle。
--- 返回 body, err。
-local function read_guarded(handle, limit)
+-- 返回 body, err。timeout 可覆盖（report 用 10s 短超时）。
+local function read_guarded(handle, limit, timeout)
+  timeout = timeout or POLL_TIMEOUT
   local ok_th, thread = pcall(require, "thread")
   if not ok_th or not thread or not thread.create or not thread.waitForAll then
-    local body, err = read_sync(handle, limit)
+    local body, err = read_sync(handle, limit, timeout)
     pcall(function() handle:close() end)
     return body, err
   end
@@ -634,11 +649,11 @@ local function read_guarded(handle, limit)
     end)
     done = true
   end)
-  local ok_w, completed = pcall(thread.waitForAll, {reader}, POLL_TIMEOUT)
+  local ok_w, completed = pcall(thread.waitForAll, {reader}, timeout)
   pcall(function() handle:close() end)  -- 所有路径 close（防泄漏+尽力解阻塞）
   if not ok_w or not completed then
     if aborted then return nil, aborted end
-    return nil, "read timeout after " .. POLL_TIMEOUT .. "s"
+    return nil, "read timeout after " .. timeout .. "s"
   end
   if aborted then return nil, aborted end
   if total == 0 then
@@ -660,16 +675,21 @@ local function http_get(url)
   if not ok_i then return nil, "no internet module" end
   local ok, handle = pcall(function() return internet.request(url) end)
   if not ok then return nil, "connection failed: " .. tostring(handle) end
-  return read_guarded(handle, MAX_POLL_BODY)
+  state.active_handle = handle
+  local body, err = read_guarded(handle, MAX_POLL_BODY)
+  state.active_handle = nil
+  return body, err
 end
 
--- POST: 返回 err（nil=成功）。
-local function http_post(url, body)
+-- POST: 返回 err（nil=成功）。timeout 可覆盖（report 用 10s 短超时）。
+local function http_post(url, body, timeout)
   local ok_i, internet = pcall(require, "internet")
   if not ok_i then return "no internet module" end
   local ok, handle = pcall(function() return internet.request(url, body) end)
   if not ok then return "connection failed: " .. tostring(handle) end
-  local _resp, err = read_guarded(handle, 16384)
+  state.active_handle = handle
+  local _resp, err = read_guarded(handle, 16384, timeout)
+  state.active_handle = nil
   return err
 end
 
@@ -767,21 +787,161 @@ local function execute_op(cmd)
   end
   local ok_a, encoded = pcall(json.encode, tool_args)
   if not ok_a then return "args encode failed: " .. tostring(encoded), true end
-  local ok_r, result = pcall(execute_mod.run, tool, encoded, opts.deps)
+  local ok_r, result, tool_is_err = pcall(execute_mod.run, tool, encoded, opts.deps)
   if not ok_r then return "tool crash: " .. tostring(result), true end
   local s = tostring(result)
-  -- 工具失败约定: "Error: ..." 前缀（shell/file 模块一致）。
+  -- v0.3.125r3: 结构化错误标志——file/shell 工具层直接返回 (text, is_err)，
+  -- 不再靠字符串前缀猜（实证假阳: cat error.log 等合法输出以 "Error:"
+  -- 开头被误判失败）。is_err=true 的合法场景: 工具 pcall 崩溃、参数解析
+  -- 失败、Unknown tool、guard 拒绝、内存护栏、超时杀进程、文件错误。
+  if type(tool_is_err) == "boolean" then
+    return s, tool_is_err
+  end
+  -- 工具未提供标志（插件工具等）: 回退三前缀判定。
   -- v0.3.125r2: 护栏拒绝与超时杀进程也以错误语义回传——实证坑:
   -- "rejected by guard: ..." 与 "shell_execute timeout after Ns
-  -- (command killed): ..." 均不以 Error 开头 → 旧判定 ok=true（假阴），
-  -- 而合法输出 "Error: ..." 又被判假阳。三前缀并集。
+  -- (command killed): ..." 均不以 Error 开头 → 旧判定 ok=true（假阴）。
   local is_err = s:match("^Error") ~= nil
     or s:match("^rejected by guard") ~= nil
     or s:match("^shell_execute timeout") ~= nil
   return s, is_err
 end
 
--- ── 回传 ────────────────────────────────────────────────────────
+-- ── 回传（v0.3.125r3: 10s 短超时 + pending 延迟队列 + 崩溃持久化）──
+--
+-- 实证坑（内存风暴期）: report POST 卡满 30s 读 deadline → 单线程守护
+-- 被占（期间不 poll、off 不响应），命令结果丢失（服务器端永远
+-- pending，客户端只见到期超时）。对策:
+-- ① report 读 deadline 10s（REPORT_TIMEOUT）——不值得卡满 poll 的 30s
+-- ② 失败立即重试一次（幂等 upsert），仍败入 pending 延迟队列
+--    （≤10 条/128KB，最旧淘汰），poll 成功后逐条冲刷——poll 成功
+--    = 服务器可达，是最佳重发窗口
+-- ③ 守护崩溃窗口: pending 条目同时落盘（data_dir/remote_pending/
+--    <id>.json），守护启动时回载入队列，首次 poll 成功冲刷——覆盖
+--    "重命令执行后 agent OOM/崩溃，结果无人重发"的最坏窗口
+-- ④ 全部丢失时由服务器 /result 的 lost 标记兜底（客户端可判死）
+
+local MAX_DISK_PENDING = 50   -- 磁盘 pending 上限（ts 序最旧淘汰）
+
+local function safe_name(id)
+  return (tostring(id):gsub("[^%w%-_%.]", "_"))
+end
+
+-- 目录可用性: fs.list 能列即真; 失败则 shell mkdir -p 一次重试
+-- （OpenOS 无 fs.mkdir）。全程不可用 → nil（静默禁用持久化——
+-- 持久化是增强，不能成为新故障源）。
+local function pending_dir_available(dir)
+  local ok_fs, fs = pcall(require, "filesystem")
+  if not ok_fs or not fs then return nil end
+  local function listable()
+    local ok_l, iter = pcall(fs.list, dir)
+    return (ok_l and type(iter) == "function") and true or false
+  end
+  if listable() then return dir end
+  local ok_s, shell = pcall(require, "shell")
+  if ok_s and shell and shell.execute then
+    pcall(shell.execute, "mkdir -p " .. dir)
+  end
+  if listable() then return dir end
+  return nil
+end
+
+local function persist_to_disk(id, payload)
+  if not opts.pending_dir then return end
+  local ok_e, obj = pcall(json.encode, {id = id, ts = now(), payload = payload})
+  if not ok_e then return end
+  local path = opts.pending_dir .. "/" .. safe_name(id) .. ".json"
+  local f = io.open(path, "w")
+  if not f then
+    -- 目录可能消失（换盘/清理）: 重建一次，仍失败则禁用持久化
+    if pending_dir_available(opts.pending_dir) then
+      f = io.open(path, "w")
+    else
+      opts.pending_dir = nil
+    end
+  end
+  if f then
+    pcall(f.write, f, obj)
+    f:close()
+  end
+end
+
+local function delete_pending_file(id)
+  if not opts.pending_dir then return end
+  pcall(os.remove, opts.pending_dir .. "/" .. safe_name(id) .. ".json")
+end
+
+-- 守护启动: 磁盘 pending 回载（ts 序，>MAX_DISK_PENDING 的视为过旧删除）
+local function load_pending_from_disk()
+  local dir = pending_dir_available(opts.pending_dir)
+  if not dir then
+    opts.pending_dir = nil
+    return
+  end
+  local ok_fs, fs = pcall(require, "filesystem")
+  local items = {}
+  for name in fs.list(dir) do
+    if name:match("%.json$") then
+      local f = io.open(dir .. "/" .. name, "r")
+      if f then
+        local raw = f:read("*a")
+        f:close()
+        local ok_d, obj = pcall(json.decode, raw)
+        if ok_d and type(obj) == "table" and type(obj.payload) == "string" then
+          items[#items + 1] = {
+            name = name,
+            id = tostring(obj.id or (name:gsub("%.json$", ""))),
+            ts = tonumber(obj.ts) or 0,
+            payload = obj.payload,
+          }
+        else
+          pcall(os.remove, dir .. "/" .. name)  -- 垃圾文件清掉
+        end
+      end
+    end
+  end
+  table.sort(items, function(a, b) return a.ts < b.ts end)
+  local drop = #items - MAX_DISK_PENDING
+  for i = 1, math.max(drop, 0) do
+    pcall(os.remove, dir .. "/" .. items[i].name)
+  end
+  for i = math.max(drop, 0) + 1, #items do
+    pending[#pending + 1] = {id = items[i].id, payload = items[i].payload}
+  end
+  if #pending > 0 then
+    print("[remote] restored " .. #pending .. " pending report(s) from disk")
+  end
+end
+
+local function send_report(id, payload)
+  local url = opts.url .. "/report?token=" .. url_encode(opts.token)
+    .. "&id=" .. url_encode(tostring(id))
+  local err = http_post(url, payload, REPORT_TIMEOUT)
+  if err then
+    os.sleep(2)  -- P0 补丁（可中断）
+    err = http_post(url, payload, REPORT_TIMEOUT)
+  end
+  return err  -- nil = 成功
+end
+
+-- poll 成功后冲刷延迟队列: 按入队顺序单发（10s 超时，不做二次重试——
+-- 失败留在队列，下轮 poll 再试）。最坏 10×10s 阻塞仅发生在服务器
+-- 收连接但全部吞 report 的病态场景。
+local function flush_pending()
+  local i = 1
+  while i <= #pending and not state.stop_flag do
+    local p = pending[i]
+    local url = opts.url .. "/report?token=" .. url_encode(opts.token)
+      .. "&id=" .. url_encode(tostring(p.id))
+    local err = http_post(url, p.payload, REPORT_TIMEOUT)
+    if not err then
+      table.remove(pending, i)
+      delete_pending_file(p.id)  -- 送达即删盘（幂等: 重发无副作用）
+    else
+      i = i + 1
+    end
+  end
+end
 
 local function report(id, s, is_err)
   local total = #s
@@ -795,21 +955,22 @@ local function report(id, s, is_err)
     state.last_err = "report encode failed: " .. tostring(payload)
     return
   end
-  local url = opts.url .. "/report?token=" .. url_encode(opts.token)
-    .. "&id=" .. url_encode(tostring(id))
-  local err = http_post(url, payload)
-  if err then
-    -- v0.3.125r2: 失败重试一次——实证坑: 内存风暴期单次 report POST
-    -- 卡满 30s 超时，命令结果丢失（服务器端永远 pending，客户端只见
-    -- 超时）。幂等（服务器按 id upsert），重试覆盖"请求已到但响应
-    -- 丢失"场景。sleep 走 P0 补丁（可中断）。
-    os.sleep(2)
-    err = http_post(url, payload)
+  local err = send_report(id, payload)
+  if not err then return end
+  -- 入延迟队列; 超上限（条数/总字节）淘汰最旧（盘上同步删）
+  pending[#pending + 1] = {id = id, payload = payload}
+  persist_to_disk(id, payload)
+  local pbytes = 0
+  for _, p in ipairs(pending) do pbytes = pbytes + #p.payload end
+  while #pending > MAX_PENDING or pbytes > MAX_PENDING_BYTES do
+    local ev = table.remove(pending, 1)
+    delete_pending_file(ev.id)
+    pbytes = 0
+    for _, p in ipairs(pending) do pbytes = pbytes + #p.payload end
   end
-  if err then
-    state.report_errors = state.report_errors + 1
-    state.last_err = "report failed (after retry): " .. tostring(err)
-  end
+  state.report_errors = state.report_errors + 1
+  state.last_err = "report failed (queued, " .. #pending
+    .. " pending): " .. tostring(err)
 end
 
 -- ── 守护循环 ────────────────────────────────────────────────────
@@ -822,6 +983,8 @@ local function loop()
     if body then
       state.backoff = BACKOFF_BASE
       state.polls = state.polls + 1
+      -- v0.3.125r3: poll 成功 = 服务器可达，先冲刷延迟 report 队列
+      flush_pending()
       local ok_j, cmd = pcall(json.decode, body)
       if not ok_j or type(cmd) ~= "table" or type(cmd.op) ~= "string" then
         state.errors = state.errors + 1
@@ -871,7 +1034,18 @@ local function start(o)
   if not ok_t or type(thread) ~= "table" or type(thread.create) ~= "function" then
     return false, "no thread library (headless/test env)"
   end
-  opts = {url = o.url:gsub("/+$", ""), token = o.token, deps = o.deps or {json = json}}
+  opts = {
+    url = o.url:gsub("/+$", ""),
+    token = o.token,
+    deps = o.deps or {json = json},
+    -- v0.3.125r3: 崩溃持久化目录（data_dir/remote_pending）——未提供或
+    -- 不可用时静默禁用（回载函数会置 nil）
+    pending_dir = (type(o.data_dir) == "string" and o.data_dir ~= "")
+      and (o.data_dir .. "/remote_pending") or nil,
+  }
+  if opts.pending_dir then
+    load_pending_from_disk()
+  end
   state.stop_flag = false
   state.running = true
   state.thread = thread.create(loop)
@@ -886,6 +1060,31 @@ local function stop()
   return true, nil
 end
 
+-- v0.3.125r4: /exit 安全网（2026-09-05 r3 真机实证）: 守护 active 时
+-- 直接 /exit——进程退出把守护线程杀在半途 poll，PipedCommand 从未
+-- close() → 孤儿 wget + ocvm 主循环在坏管道上自旋（97% CPU 用户态，
+-- wchan=0）+ shell 彻底冻结（/exit 后无提示符、按键无回显）。
+-- stop() 只设标志（等当前 ≤30s poll 自然结束才退出——/exit 等不起）;
+-- shutdown() 额外: 立即 close 活动 handle（wget 被 SIGKILL、管道 EOF、
+-- 读迭代器解阻塞）+ 有界等待守护线程真正退出后再让调用方继续。
+-- timeout_s 内线程未退出（如正执行长命令）则放弃等待直接返回——
+-- /exit 的提示性优先于完美回收（罕见窗口残留旧风险，文档已注）。
+local function shutdown(timeout_s)
+  if not state.running then return false, "not running" end
+  state.stop_flag = true
+  local h = state.active_handle
+  state.active_handle = nil
+  if h then
+    pcall(function() h:close() end)
+  end
+  local ok_t, thread = pcall(require, "thread")
+  local th = state.thread
+  if ok_t and type(thread) == "table" and thread.waitForAll and th then
+    pcall(thread.waitForAll, {th}, timeout_s or 3)
+  end
+  return true, nil
+end
+
 local function is_running()
   return state.running
 end
@@ -897,6 +1096,7 @@ local function status()
     cmds = state.cmds,
     errors = state.errors,
     report_errors = state.report_errors,
+    pending = #pending,
     last_op = state.last_op,
     last_ok = state.last_ok,
     last_err = state.last_err,
@@ -907,10 +1107,25 @@ end
 return {
   start = start,
   stop = stop,
+  shutdown = shutdown,
   is_running = is_running,
   status = status,
   -- 测试钩子（_TEST_MODE 才暴露）
-  _internal = _TEST_MODE and {execute_op = execute_op, sh_quote = sh_quote} or nil,
+  _internal = _TEST_MODE and {
+    execute_op = execute_op,
+    sh_quote = sh_quote,
+    -- v0.3.125r4: shutdown 测试用（状态表引用——只读检查+合成状态注入）
+    _state = state,
+    _persist = {
+      safe_name = safe_name,
+      persist_to_disk = persist_to_disk,
+      delete_pending_file = delete_pending_file,
+      load_pending_from_disk = load_pending_from_disk,
+      set_pending_dir = function(d) opts = opts or {}; opts.pending_dir = d end,
+      get_pending = function() return pending end,
+      clear_pending = function() pending = {} end,
+    },
+  } or nil,
 }
 end
 
@@ -1955,6 +2170,12 @@ local EXECUTE_LUA_GUARD =
 
 local M = {}
 
+-- 返回 (text, is_err)：
+--   text   — 工具结果字符串（成功输出或错误信息，chat 路径消费这个）
+--   is_err — 结构化错误标志：本层判定的错误（参数解析失败 / execute_lua
+--            护栏 / Unknown tool / 工具 pcall 崩溃）= true；工具层自带的
+--            标志（file/shell 模块返回）透传；工具未提供（插件等）= nil，
+--            调用方可回退字符串前缀判定。
 function M.run(name, args_str, deps)
   deps = deps or {}
   local json = deps.json
@@ -1984,23 +2205,23 @@ function M.run(name, args_str, deps)
     else
       err_info = tostring(decoded)
     end
-    return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200)
+    return "Error parsing arguments (decode failed: " .. err_info .. "): " .. tostring(cleaned):sub(1, 200), true
   end
 
   if name == "execute_lua" then
-    return EXECUTE_LUA_GUARD
+    return EXECUTE_LUA_GUARD, true
   end
 
   local exec = REGISTRY[name]
   if not exec then
-    return "Unknown tool: " .. tostring(name)
+    return "Unknown tool: " .. tostring(name), true
   end
 
-  local ok_run, result = pcall(exec, name, args, deps)
+  local ok_run, result, tool_err = pcall(exec, name, args, deps)
   if not ok_run then
-    return "Error: " .. tostring(result)
+    return "Error: " .. tostring(result), true
   end
-  return result
+  return result, tool_err
 end
 
 return M
@@ -6284,7 +6505,7 @@ local function exec(name, args, deps)
       end
       return out
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "edit_file" then
     local ok, result = pcall(function()
@@ -6331,7 +6552,7 @@ local function exec(name, args, deps)
       fw:close()
       return "Replaced " .. (args.replace_all and count or 1) .. " occurrence(s) in " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "append_file" then
     local ok, result = pcall(function()
@@ -6341,7 +6562,7 @@ local function exec(name, args, deps)
       f:close()
       return "Appended " .. (#(args.content or "") ) .. " bytes to " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "write_file" then
     local ok, result = pcall(function()
@@ -6351,11 +6572,11 @@ local function exec(name, args, deps)
       f:close()
       return "Written to " .. args.path
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
 
   elseif name == "search_files" then
     local ok, result = pcall(search_files_code, args)
-    return ok and result or ("Error: " .. tostring(result))
+    return ok and result or ("Error: " .. tostring(result)), not ok
   end
 
   return nil  -- not handled by this module
@@ -6522,7 +6743,7 @@ local function exec(name, args, deps)
   if name == "shell_execute" then
     local ok_guard, guard_err = guard_command(args.command)
     if not ok_guard then
-      return guard_err
+      return guard_err, true
     end
 
     -- 执行前内存护栏（真机第四次 OOM 根因，gist 59379f，free=35KB）:
@@ -6541,46 +6762,55 @@ local function exec(name, args, deps)
         local cfg = (deps and deps.load_config and deps.load_config()) or {}
         local min_free = tonumber(cfg.mem_exec_min_free) or 500000
         if free < min_free then
-          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。"
+          return "Error: 空闲内存 " .. free .. "B < " .. min_free .. "B（shell 执行护栏）。OpenOS 所有进程共享 2MB 内存，子进程运行期峰值无法复查，此时执行重命令（探针脚本/HTTP 请求/大输出）会 OOM 崩进程。请先调用 compact_history 压缩历史释放内存，或改用 read_file/search_files 等轻量工具，或用 write_file 把脚本写成文件后分小段处理。", true
         end
       end
     end
 
     local timeout = tonumber(args.timeout) or 60
-    local ok, result = pcall(function()
+    -- v0.3.125r3: 结构化错误标志 (text, is_err)——内层各返回点自带语义，
+    -- 远程通道不再靠字符串前缀猜（消除 "Error: ..." 合法输出的假阳）。
+    local ok, result, is_err = pcall(function()
       local thread_ok, thread = pcall(require, "thread")
       if not thread_ok then
         -- no thread library (mock/legacy): direct execution with popen capture
         local handle = io.popen(args.command .. " 2>&1")
-        if not handle then return "Error: failed to execute command" end
+        if not handle then return "Error: failed to execute command", true end
         local output = handle:read("*a")
         handle:close()
-        return output ~= "" and output or "(no output)"
+        return (output ~= "" and output or "(no output)"), false
       end
       local sh = require("shell")
       local done = false
-      local out = nil
+      local out, out_err = nil, false
       local t = thread.create(function()
-        local okc, res = pcall(function()
+        local okc, res, res_err = pcall(function()
           -- Capture stdout+stderr via io.popen instead of shell.execute
           -- (shell.execute returns only exit status, not output)
           local handle = io.popen(args.command .. " 2>&1")
-          if not handle then return "Error: failed to execute command" end
+          if not handle then return "Error: failed to execute command", true end
           local output = handle:read("*a")
           handle:close()
-          return output ~= "" and output or "(no output)"
+          return (output ~= "" and output or "(no output)"), false
         end)
-        out = okc and res or ("Error: " .. tostring(res))
+        if okc then
+          out, out_err = res, res_err
+        else
+          out, out_err = "Error: " .. tostring(res), true
+        end
         done = true
       end)
       local wok, werr = thread.waitForAll({t}, timeout)
       if not wok then
         pcall(t.kill, t)
-        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command)
+        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command), true
       end
-      return out or "(no output)"
+      return (out or "(no output)"), out_err
     end)
-    return ok and result or ("Error: " .. tostring(result))
+    if not ok then
+      return "Error: " .. tostring(result), true
+    end
+    return result, is_err
   end
 
   return nil  -- not handled by this module
@@ -7063,7 +7293,9 @@ DEPS.ask_user = ask_user_repl
 -- agent.tools). This thin wrapper delegates to execute.lua with the
 -- cached DEPS table.
 function execute_tool(name, args_str)
-  return execute_mod.run(name, args_str, DEPS)
+  -- v0.3.125r3: 括号截断 execute.run 的第二返回值 (is_err)——chat 路径保持
+  -- 纯字符串契约（LLM 对话历史只见结果文本）；结构化标志仅远程通道消费。
+  return (execute_mod.run(name, args_str, DEPS))
 end
 
 -- ── Section 7: REPL & Main Loop ────────────────────────────────
@@ -7946,9 +8178,10 @@ local function handle_command(cmd, config, messages)
         print("remote: not configured（/remote url <http://host:port> + /remote token <t>）")
       else
         print(string.format(
-          "remote: %s | %s | polls=%d cmds=%d errs=%d rep_errs=%d last=%s(%s)%s",
+          "remote: %s | %s | polls=%d cmds=%d errs=%d rep_errs=%d pend=%d last=%s(%s)%s",
           remote.is_running() and "RUNNING" or "stopped", st.url,
           st.polls, st.cmds, st.errors, st.report_errors,
+          st.pending or 0,
           tostring(st.last_op or "-"), tostring(st.last_ok == nil and "-" or (st.last_ok and "ok" or "ERR")),
           st.last_err and (" | " .. tostring(st.last_err):sub(1, 80)) or ""))
       end
@@ -7960,7 +8193,8 @@ local function handle_command(cmd, config, messages)
         local ok2, err2 = remote.start({
           url = config.remote_url,
           token = config.remote_token,
-          deps = {json = json, load_config = load_config},
+          deps = {json = json, load_config = load_config,
+                  data_dir = config_mod.writable_base},
         })
         if not ok2 then
           print("remote start failed: " .. tostring(err2))
@@ -8098,6 +8332,14 @@ local function handle_command(cmd, config, messages)
     print("  /help           Show this help")
     print("  /exit           Quit the agent")
   elseif command == "/exit" then
+    -- v0.3.125r4: 远控守护 active 时 /exit 会冻死 VM（守护线程被杀在半途
+    -- poll → PipedCommand 未 close → 孤儿 wget + 主循环 97% CPU 自旋 +
+    -- shell 无响应，2026-09-05 r3 真机实证）。先 shutdown 守护：设标志 +
+    -- close 活动 handle + 有界等待（3s）线程退出，再走正常退出。
+    local ok_rm, remote = pcall(require, "agent.remote")
+    if ok_rm and type(remote) == "table" and remote.shutdown then
+      pcall(remote.shutdown, 3)
+    end
     return true, config, messages
   else
     print("Unknown command: " .. command .. ". Type /help for commands.")
@@ -8878,7 +9120,8 @@ local function main(config, ...)
       pcall(remote.start, {
         url = config.remote_url,
         token = config.remote_token,
-        deps = {json = json, load_config = load_config},
+        deps = {json = json, load_config = load_config,
+                data_dir = config_mod.writable_base},
       })
     end
   end

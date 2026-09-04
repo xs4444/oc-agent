@@ -26,7 +26,7 @@ client 模式（一次性命令，需 serve 已在跑）:
     POST /cmd?token=T               body {"op":...,"args":{...}} → {"id":...}
     GET  /result?token=T&id=I&wait=N
                                          → {"ready":true,"ok":..,"result":..}
-                                         | {"ready":false}
+                                         | {"ready":false[, "lost":true]}
 
 仅用 Python 标准库。
 """
@@ -46,6 +46,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 HOLD_DEFAULT = 12        # /poll 无命令时最长 hold（秒）—— agent 侧读 deadline 30s
 RESULT_TTL = 3600        # 结果保留（秒）
+LOST_AFTER = 120         # /result lost 标记: 命令入队后 N 秒仍无 report
+                         # → 判死（agent 崩溃/OOM/重启，或 report 通道断）；
+                         # 迟到的 report 仍会 upsert 覆盖（lost 只是查询提示）
 MAX_CMD_WIRE = 100000    # /cmd 入队的线上 JSON 字节上限（agent MAX_POLL_BODY=131072 之下留余量）
 ALLOWED_OPS = {"ping", "exec", "read", "write", "list"}
 
@@ -135,17 +138,24 @@ def make_handler(state):
                 rid = qs.get("id", [None])[0]
                 wait = min(float(qs.get("wait", [state.hold])[0] or 0), 120.0)
                 deadline = time.time() + wait
+                lost = False
                 with state.cond:
                     while True:
                         r = state.results.get(rid)
                         if r and r.get("ready"):
                             self._send(200, r)
                             return
+                        # v0.3.125r3: lost 标记——命令入队后 LOST_AFTER 秒
+                        # 仍无 report（agent 崩溃/OOM/重启，或 report 通道
+                        # 断），客户端可判死不必等到自己 deadline
+                        if r and time.time() - r.get("queued_at",
+                                                      time.time()) > LOST_AFTER:
+                            lost = True
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             break
                         state.cond.wait(min(remaining, 2.0))
-                    self._send(200, {"ready": False})
+                    self._send(200, {"ready": False, "lost": lost})
             else:
                 self._send(404, {"error": "not found"})
 
@@ -181,13 +191,18 @@ def make_handler(state):
                     return
                 with state.cond:
                     cmd["id"] = state.new_id()
+                    # v0.3.125r3: 入队占位（/result 的 lost 判定基准；
+                    # report 到达时 upsert 覆盖为 ready）
+                    state.results.setdefault(cmd["id"], {
+                        "ready": False, "queued_at": time.time()})
                     state.queues.setdefault(state.token, deque())
                     state.queues[state.token].append(cmd)
                     state.cond.notify_all()
-                    # 顺带清过期结果
+                    # 顺带清过期结果（占位条目无 at 字段，回退 queued_at，
+                    # 否则每次 /cmd 都会把占位立即清掉）
                     cutoff = time.time() - RESULT_TTL
                     for k in [k for k, v in state.results.items()
-                              if v.get("at", 0) < cutoff]:
+                              if v.get("at", v.get("queued_at", 0)) < cutoff]:
                         del state.results[k]
                 log("cmd %s queued (%s)" % (cmd["id"], op))
                 self._send(200, {"id": cmd["id"]})
@@ -297,6 +312,12 @@ def cmd_client(args):
                 print("[remote: 执行报错]", file=sys.stderr)
                 return 1
             return 0
+        if r.get("lost"):
+            # v0.3.125r3: 服务器判死（入队 >LOST_AFTER s 无 report）
+            print("lost: 命令入队后 %ds 无 agent 报告（agent 崩溃/OOM/重启，"
+                  "或 report 通道断？）——查 agent 端 /remote 状态与 pending 队列"
+                  % LOST_AFTER, file=sys.stderr)
+            return 4
         if time.time() >= deadline:
             print("timeout: %ds 内未收到结果（agent 在线？/remote 状态？）" %
                   args.wait, file=sys.stderr)
