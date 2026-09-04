@@ -1071,6 +1071,68 @@ local function handle_command(cmd, config, messages)
         print("Get one at https://github.com/settings/tokens (scope: gist)")
       end
     end
+  elseif command == "/remote" then
+    -- 远程控制守护（v0.3.125）: 后台线程 long-poll 控制服务器
+    -- （tools/remote_server.py）取命令执行（ping/exec/read/write/list）。
+    --   /remote            状态
+    --   /remote on|off     启动/停止（需 config.remote_url + remote_token）
+    --   /remote url <u>    设置服务器地址（http://host:port，不带尾部 /）
+    --   /remote token <t>  设置共享 token
+    local ok_rm, remote = pcall(require, "agent.remote")
+    if not ok_rm then
+      print("remote module unavailable: " .. tostring(remote))
+    elseif not parts[2] or parts[2] == "status" then
+      local st = remote.status()
+      if not st.url then
+        print("remote: not configured（/remote url <http://host:port> + /remote token <t>）")
+      else
+        print(string.format(
+          "remote: %s | %s | polls=%d cmds=%d errs=%d rep_errs=%d last=%s(%s)%s",
+          remote.is_running() and "RUNNING" or "stopped", st.url,
+          st.polls, st.cmds, st.errors, st.report_errors,
+          tostring(st.last_op or "-"), tostring(st.last_ok == nil and "-" or (st.last_ok and "ok" or "ERR")),
+          st.last_err and (" | " .. tostring(st.last_err):sub(1, 80)) or ""))
+      end
+    elseif parts[2] == "on" then
+      if not (config.remote_url and config.remote_token and
+              config.remote_url ~= "" and config.remote_token ~= "") then
+        print("remote: 需先 /remote url <http://host:port> 和 /remote token <t>")
+      else
+        local ok2, err2 = remote.start({
+          url = config.remote_url,
+          token = config.remote_token,
+          deps = {json = json, load_config = load_config},
+        })
+        if not ok2 then
+          print("remote start failed: " .. tostring(err2))
+        end
+      end
+    elseif parts[2] == "off" then
+      local ok2, err2 = remote.stop()
+      if ok2 then
+        print("remote: stop requested（当前 poll 结束后退出，≤30s）")
+      else
+        print(tostring(err2))
+      end
+    elseif parts[2] == "url" then
+      if parts[3] then
+        config.remote_url = parts[3]
+        save_config(config)
+        print("remote_url: " .. parts[3])
+      else
+        print("Usage: /remote url <http://host:port>")
+      end
+    elseif parts[2] == "token" then
+      if parts[3] then
+        config.remote_token = parts[3]
+        save_config(config)
+        print("remote token set")
+      else
+        print("Usage: /remote token <shared_secret>")
+      end
+    else
+      print("Usage: /remote [status|on|off|url <u>|token <t>]")
+    end
   elseif command == "/tools" then
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
@@ -1168,6 +1230,7 @@ local function handle_command(cmd, config, messages)
     print("  /debug          Collect debug report (version+config+history), write locally + upload to GitHub gist if token set")
     print("  /mouseprobe     Print raw touch/drag/drop events for 30s (mouse input chain debug)")
     print("  /selftest       Run on-device selftest (env/json/fs/session/config/net/interrupt/tools/mem), write + upload report")
+    print("  /remote         Remote control daemon: status|on|off|url <u>|token <t> (long-poll tools/remote_server.py)")
     print("  /gist-token <t> Save GitHub token for /debug auto-upload (scope: gist)")
     print("  /tools          List available tools the AI can use")
     print("  /ctx            Show context usage (tokens + progress bar, like opencode TUI)")
@@ -1941,6 +2004,25 @@ local function main(config, ...)
   --      + setReadTimeout 仅 POST + requestTimeout:0 无限——thread 包装
   --      30s 兜底抛错）
   require("agent.patch").install()
+
+  -- ── Remote control daemon (v0.3.125) auto-start ──────────────
+  -- 配置 remote_url + remote_token 时后台起守护线程（long-poll 控制
+  -- 服务器，ping/exec/read/write/list）。TUI/REPL/subagent 三态皆可
+  -- 跑——守护是独立线程，不占主循环。_TEST_MODE 跳过防测试污染。
+  -- 失败不阻断启动（守护是增强，不能成为新故障源）。
+  if not _TEST_MODE and type(config.remote_url) == "string"
+      and config.remote_url ~= ""
+      and type(config.remote_token) == "string"
+      and config.remote_token ~= "" then
+    local ok_rm, remote = pcall(require, "agent.remote")
+    if ok_rm then
+      pcall(remote.start, {
+        url = config.remote_url,
+        token = config.remote_token,
+        deps = {json = json, load_config = load_config},
+      })
+    end
+  end
 
   -- ── Subagent server mode: `lua agent.lua --subagent [port]` ──
   -- Listens on the modem network for task requests, runs them through the

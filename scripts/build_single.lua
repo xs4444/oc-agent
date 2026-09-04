@@ -19,6 +19,8 @@ local ROOT = script_dir .. "/.."
 local MODULES = {
   "agent.json",
   "agent.http",
+  -- v0.3.125: 远程控制守护（long-poll 控制服务器，/remote 命令）
+  "agent.remote",
   "agent.config",
   "agent.session",
   "agent.tools",
