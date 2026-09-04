@@ -2779,6 +2779,41 @@ do
   end
 end
 
+-- ═══════════════════════════════════════════
+-- remote 守护（v0.3.125）: 模块加载 + 参数校验 + op 分派
+-- （无网络/线程的测试环境——只验证不崩与参数路径）
+-- ═══════════════════════════════════════════
+do
+  local r_ok, remote = pcall(require, "agent.remote")
+  test("remote: module loads", r_ok and type(remote) == "table", tostring(remote))
+  if r_ok and type(remote) == "table" then
+    test("remote: exports start/stop/status",
+      type(remote.start) == "function" and type(remote.stop) == "function"
+      and type(remote.is_running) == "function" and type(remote.status) == "function")
+    local ok1, err1 = remote.start({})
+    test("remote: start without url rejected", ok1 == false and tostring(err1) == "url required", tostring(err1))
+    local ok2, err2 = remote.start({url = "http://x:1", token = ""})
+    test("remote: start without token rejected", ok2 == false and tostring(err2) == "token required", tostring(err2))
+    local st = remote.status()
+    test("remote: status structure",
+      type(st) == "table" and st.running == false and st.polls == 0
+      and st.cmds == 0 and st.errors == 0, tostring(st.running))
+    local int = remote._internal
+    if int then
+      local s, is_err = int.execute_op({op = "bogus"})
+      test("remote: unknown op rejected", is_err == true and tostring(s):find("unknown op") ~= nil, tostring(s))
+      local s2, is2 = int.execute_op({op = "exec"})
+      test("remote: exec without command rejected", is2 == true and tostring(s2):find("args.command") ~= nil, tostring(s2))
+      local s3, is3 = int.execute_op({op = "ping"})
+      test("remote: ping returns json ok", is3 == false and tostring(s3):find('"data"') ~= nil, tostring(s3):sub(1, 120))
+      test("remote: sh_quote basic", int.sh_quote("a b") == "'a b'", int.sh_quote("a b"))
+      test("remote: sh_quote single quote", int.sh_quote("a'b") == "'a'\\''b'", int.sh_quote("a'b"))
+    else
+      test("remote: _internal test hook exposed under _TEST_MODE", false, "_internal nil")
+    end
+  end
+end
+
 print("")
 print("═══════════════════════════════════════")
 print(string.format("FINAL: %d pass, %d fail out of %d tests", pass, fail, pass + fail))
