@@ -136,13 +136,39 @@ function json.decode(str)
           local hex = str:sub(pos+1, pos+4)
           pos = pos + 4
           local code = tonumber(hex, 16)
+          local combined = false
           if code then
-            if code < 128 then
-              result[#result+1] = string.char(code)
-            elseif code < 2048 then
-              result[#result+1] = string.char(192 + math.floor(code/64), 128 + code%64)
-            else
-              result[#result+1] = string.char(224 + math.floor(code/4096), 128 + math.floor(code/64)%64, 128 + code%64)
+            -- surrogate pair 合并（v0.3.125r2）: 高代理 \uD800-\uDBFF 后
+            -- 紧跟低代理 \uDC00-\uDFFF → 合并成 >0xFFFF 码元 → 4 字节
+            -- UTF-8（emoji 等，RFC 8259 surrogate pair 形式）。旧版无
+            -- 合并：孤立代理走 3 字节路径产出无效 UTF-8（实证坑: Python
+            -- json.dumps 默认 ensure_ascii=True 把 🌍 编成
+            -- \uD83C\uDF0D，agent 解码成 6 字节乱码，回传 decode
+            -- (replace) 显示 "??????"）。控制服务器/LLM 端点的代理对
+            -- 形式自此可解。孤立代理（无后续低代理）仍走原 3 字节路径
+            -- （与旧行为一致，容错不抛错）。
+            if code >= 0xD800 and code <= 0xDBFF
+              and str:sub(pos+1, pos+2) == "\\u" then
+              local code2 = tonumber(str:sub(pos+3, pos+6), 16)
+              if code2 and code2 >= 0xDC00 and code2 <= 0xDFFF then
+                local cp = 0x10000 + (code - 0xD800) * 0x400 + (code2 - 0xDC00)
+                result[#result+1] = string.char(
+                  240 + math.floor(cp / 262144),
+                  128 + math.floor(cp / 4096) % 64,
+                  128 + math.floor(cp / 64) % 64,
+                  128 + cp % 64)
+                pos = pos + 6  -- 吃掉第二半 \uXXXX（外层 +1 过其末位）
+                combined = true
+              end
+            end
+            if not combined then
+              if code < 128 then
+                result[#result+1] = string.char(code)
+              elseif code < 2048 then
+                result[#result+1] = string.char(192 + math.floor(code/64), 128 + code%64)
+              else
+                result[#result+1] = string.char(224 + math.floor(code/4096), 128 + math.floor(code/64)%64, 128 + code%64)
+              end
             end
           end
         else

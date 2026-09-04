@@ -28,7 +28,7 @@ local tools = {
 local GUARDS = {
   {pat = "^%s*uname", hint = "uname: not available in OpenOS. Use the `components` command for hardware, or read_file for system files."},
   {pat = "^%s*tail", hint = "tail: not available in OpenOS. Use read_file with offset=-N to read the last N lines."},
-  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Count lines with `lua -e` (io.lines loop) or estimate via read_file offset/limit."},
+  {pat = "^%s*wc", hint = "wc: not available in OpenOS. Count lines with a lua script (write_file an io.lines loop that writes the count to a file, then `lua /tmp/cnt.lua; cat /tmp/cnt_out.txt`) or estimate via read_file offset/limit."},
   {pat = "^%s*curl", hint = "curl: not available in OpenOS. OpenOS has `wget <url> [-O file]` for HTTP; or use web_search for web info."},
 }
 
@@ -39,7 +39,7 @@ local function guard_command(cmd)
   if type(cmd) ~= "string" then return nil, "command must be a string" end
   local stripped = cmd:gsub("%s*#.*$", "")
   if stripped:match("^%s*luac?%s*$") then
-    return nil, "rejected by guard: bare 'lua' starts an interactive REPL that blocks forever waiting for stdin. Always pass a script or -e: e.g. 'lua script.lua' or 'lua -e \"print(1)\"'."
+    return nil, "rejected by guard: bare 'lua' starts an interactive REPL that blocks forever waiting for stdin. Always pass a script FILE (the lua wrapper has no -e flag — its first arg is always a filename): e.g. 'lua /tmp/script.lua'."
   end
   for seg in (cmd .. "|"):gmatch("(.-)|") do
     for _, g in ipairs(GUARDS) do
