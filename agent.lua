@@ -506,7 +506,8 @@ package.preload["agent.remote"] = function()
 --
 -- 后台线程经 internet 卡 long-poll 外部控制服务器（tools/
 -- remote_server.py），取命令 → 用现有工具注册表执行（ping/exec/
--- read/write/list，护栏随 execute.run 生效）→ 回传结果。让外部
+-- read/write/list/lua/fetch，护栏随 execute.run 生效）→ 回传
+-- 结果。让外部
 -- 自动化（DSH）无需在游戏内交互即可对真机做基础读写执行。
 --
 -- 配置（agent_config.txt）: remote_url = "http://host:port"（不带
@@ -547,7 +548,12 @@ local MAX_PENDING = 10       -- report 延迟队列: 条数上限（最旧淘汰
 local MAX_PENDING_BYTES = 131072 -- report 延迟队列: payload 总量上限（128KB）
 local BACKOFF_BASE = 2       -- 失败退避基数（秒）
 local BACKOFF_CAP = 60       -- 退避封顶（秒）
-local MAX_RESULT = 65536     -- 回传结果截断（字节）: 64KB
+local MAX_RESULT = 65536     -- 回传结果块大小（字节）: 64KB（首块与 fetch 续块）
+local MAX_RESULT_HELD = 262144 -- v0.3.125r5: 大结果分页缓存上限（字节）: 256KB
+                               -- （4MB 机安全；超过的部分不可取回，meta.held
+                               --  < meta.total 即标志截断）
+local RESULT_TTL = 600       -- v0.3.125r5: 分页缓存有效期（秒）；过期 fetch 报
+                             -- expired 并清槽
 local MAX_POLL_BODY = 131072 -- poll 响应体上限（字节）: 命令 JSON 应远小于此
 
 -- 状态表（/remote 命令透出）
@@ -566,6 +572,10 @@ local state = {
   -- v0.3.125r4: 当前 poll 的 internet handle——shutdown() 用它立即解除
   -- 阻塞（close → 读迭代器 EOF）。read_guarded 返回后清除。
   active_handle = nil,
+  -- v0.3.125r5: 大结果分页缓存（单槽 {rid,text,total,held,ts}；新的大
+  -- 结果整体替换旧的——fetch 拿旧 rid 会报 unknown or replaced）
+  result_cache = nil,
+  result_seq = 0,
 }
 
 local opts = nil  -- {url, token, deps}
@@ -782,6 +792,46 @@ local function execute_op(cmd)
     local s = table.concat(entries, "\n")
     if s == "" then s = "(empty)" end
     return s, false
+  elseif op == "lua" then
+    if type(args.code) ~= "string" then
+      return "lua: args.code must be a string", true
+    end
+    -- v0.3.125r5: 执行服务器下发的 Lua 脚本（借鉴 RemoteOC 裸 Lua 模式——
+    -- 真机调试跑任意脚本不必拼 exec 命令串）。在守护线程上下文执行:
+    -- print 进 TUI（与 exec `lua script` 同一泄漏行为），return 值即
+    -- 结果。信任边界同 exec（token 保护通道），不加沙箱。
+    local loadfn = load or loadstring  -- Lua 5.2+ / 5.1 兼容
+    local f, lerr = loadfn(args.code)
+    if not f then
+      return "lua: load failed: " .. tostring(lerr), true
+    end
+    local ok_r, r = pcall(f)
+    if not ok_r then
+      return "lua: " .. tostring(r), true
+    end
+    if r == nil then return "(no return value)", false end
+    return tostring(r), false
+  elseif op == "fetch" then
+    -- v0.3.125r5: 大结果续取（report 首块 64KB + meta {rid,total,held,
+    -- more}；此处按 rid+offset 取下一块，块大小 MAX_RESULT）。offset 为
+    -- 0 基起始位置——首块已覆盖 0..MAX_RESULT-1，通常 offset=65536。
+    -- 客户端据 meta.held 自行判断终止（held < total = 截断）。
+    local rc = state.result_cache
+    if not rc or rc.rid ~= tostring(args.rid) then
+      return "fetch: unknown or replaced result id: " .. tostring(args.rid), true
+    end
+    if now() - rc.ts > RESULT_TTL then
+      state.result_cache = nil
+      return "fetch: result " .. rc.rid .. " expired (TTL " .. RESULT_TTL .. "s)", true
+    end
+    local offset = tonumber(args.offset) or 0
+    if offset < 0 or offset >= rc.held then
+      return "fetch: offset " .. tostring(offset) .. " out of range (held "
+        .. rc.held .. ")", true
+    end
+    local chunk = rc.text:sub(offset + 1, offset + MAX_RESULT)
+    if chunk == "" then return "(end of held result)", false end
+    return chunk, false
   else
     return "unknown op: " .. tostring(op), true
   end
@@ -943,23 +993,46 @@ local function flush_pending()
   end
 end
 
+-- v0.3.125r5: 大结果分页（借鉴 RemoteOC 分块上报，改为"客户端按需拉取"
+-- —— 比 128B 小块上传简单，且只在需要时才有额外流量）:
+--   结果 > 64KB → 缓存前 256KB（MAX_RESULT_HELD），回传首块 64KB +
+--   meta {rid, total, held, more}；外部驱动用 fetch op 按 offset 续取。
+--   单槽缓存: 新的大结果替换旧的；TTL 600s 过期清槽。
+--   held < total 时驱动知道结果被截断（4MB 机内存安全优先）。
 local function report(id, s, is_err)
   local total = #s
+  local meta = nil
+  local out = s
   if total > MAX_RESULT then
-    s = s:sub(1, MAX_RESULT) .. "…[truncated: " .. total .. " bytes total]"
+    local held = math.min(total, MAX_RESULT_HELD)
+    state.result_seq = state.result_seq + 1
+    local rid = "r" .. state.result_seq
+    state.result_cache = {
+      rid = rid, text = s:sub(1, held),
+      total = total, held = held, ts = now(),
+    }
+    meta = {rid = rid, total = total, held = held,
+            more = held > MAX_RESULT}
+    out = s:sub(1, MAX_RESULT)
   end
-  local ok_e, payload = pcall(json.encode,
-    {id = id, ok = not is_err, result = s})
+  local payload = {id = id, ok = not is_err, result = out}
+  if meta then
+    payload.rid = meta.rid
+    payload.total = meta.total
+    payload.held = meta.held
+    payload.more = meta.more
+  end
+  local ok_e, payload_enc = pcall(json.encode, payload)
   if not ok_e then
     state.report_errors = state.report_errors + 1
-    state.last_err = "report encode failed: " .. tostring(payload)
+    state.last_err = "report encode failed: " .. tostring(payload_enc)
     return
   end
-  local err = send_report(id, payload)
+  local err = send_report(id, payload_enc)
   if not err then return end
   -- 入延迟队列; 超上限（条数/总字节）淘汰最旧（盘上同步删）
-  pending[#pending + 1] = {id = id, payload = payload}
-  persist_to_disk(id, payload)
+  pending[#pending + 1] = {id = id, payload = payload_enc}
+  persist_to_disk(id, payload_enc)
   local pbytes = 0
   for _, p in ipairs(pending) do pbytes = pbytes + #p.payload end
   while #pending > MAX_PENDING or pbytes > MAX_PENDING_BYTES do
@@ -1114,6 +1187,14 @@ return {
   _internal = _TEST_MODE and {
     execute_op = execute_op,
     sh_quote = sh_quote,
+    -- v0.3.125r5: report 测试钩子 + URL 注入（mock internet 只对特定
+    -- URL 应答；测试环境 start() 走不到真实配置）
+    report = report,
+    set_url_token = function(u, t)
+      opts = opts or {}
+      opts.url = u:gsub("/+$", "")
+      opts.token = t
+    end,
     -- v0.3.125r4: shutdown 测试用（状态表引用——只读检查+合成状态注入）
     _state = state,
     _persist = {
