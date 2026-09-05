@@ -61,24 +61,69 @@ def http_json(url, body=None, timeout=20):
 
 
 def one_cmd(base, tok, op, args, wait=WAIT):
-    """发一条命令等结果。返回 (ok, result, err_note)。
-    err_note 非 None = 传输层/服务器层错误（非 agent 执行结果）。"""
+    """发一条命令等结果。返回 (ok, result, err_note, meta)。
+    err_note 非 None = 传输层/服务器层错误（非 agent 执行结果）。
+    meta（v0.3.125r5）: 大结果分页 meta dict 或 None。"""
     try:
         r = http_json("%s/cmd?token=%s" % (base, tok), {"op": op, "args": args})
     except urllib.error.HTTPError as e:
-        return None, None, "server HTTP %d: %s" % (e.code, e.read()[:200])
+        return None, None, "server HTTP %d: %s" % (e.code, e.read()[:200]), None
     except Exception as e:
-        return None, None, "send failed: %s" % e
+        return None, None, "send failed: %s" % e, None
     rid = r.get("id")
     deadline = time.time() + wait
     while time.time() < deadline:
         try:
             r = http_json("%s/result?token=%s&id=%s&wait=10" % (base, tok, rid))
         except Exception as e:
-            return None, None, "result query failed: %s" % e
+            return None, None, "result query failed: %s" % e, None
         if r.get("ready"):
-            return r.get("ok"), r.get("result", ""), None
-    return None, None, "timeout after %ds" % wait
+            meta = None
+            if r.get("more"):
+                meta = {k: r[k] for k in ("rid", "total", "held", "more")
+                        if k in r}
+            return r.get("ok"), r.get("result", ""), None, meta
+    return None, None, "timeout after %ds" % wait, None
+
+
+def fetch_all(base, tok, first, wait=WAIT):
+    """v0.3.125r5: 大结果自动分页——first 为 ready 记录（含 more/rid/
+    held 时循环 fetch 按 offset 续块，64KB/块，32 块防御上限）。
+    返回 (累积文本, first)。"""
+    result = first.get("result", "")
+    if not first.get("more"):
+        return result, first
+    offset = len(result)
+    held = first.get("held") or 0
+    for _ in range(32):
+        if offset >= held:
+            break
+        try:
+            r = http_json("%s/cmd?token=%s" % (base, tok),
+                          {"op": "fetch",
+                           "args": {"rid": first["rid"], "offset": offset}})
+            rid = r.get("id")
+        except Exception:
+            break
+        dl = time.time() + wait
+        fr = None
+        while time.time() < dl:
+            try:
+                fr = http_json("%s/result?token=%s&id=%s&wait=10" %
+                               (base, tok, rid))
+            except Exception:
+                fr = None
+                break
+            if fr.get("ready"):
+                break
+        if not fr:
+            break
+        chunk = fr.get("result", "")
+        if fr.get("ok") is False or not chunk:
+            break
+        result += chunk
+        offset += len(chunk)
+    return result, first
 
 
 # (name, op, args, expect, note)
@@ -154,6 +199,18 @@ def build_cases(with_stress):
          ("err", "file not found"), "read 缺失应 err"),
         ("p21_list_missing", "list", {"path": "/tmp/rp_no_such_dir_xyz"},
          ("err", "cannot access"), "list 缺失应 err（filesystem.list 实现）"),
+        # ── P10 op=lua + 大结果分页（v0.3.125r5）──
+        ("p22_lua_value", "lua", {"code": "return 6*7"},
+         ("ok", "42"), "op=lua return 值即结果"),
+        ("p23_lua_error", "lua", {"code": 'error("boom")'},
+         ("err", "boom"), "op=lua 运行错误应 err"),
+        ("p24_lua_loaderr", "lua", {"code": "local x ="},
+         ("err", "load failed"), "op=lua 语法错误应 err"),
+        ("p25_paged_200k", "lua", {"code": 'return string.rep("x", 200000)'},
+         ("paged", 200000, 200000), "200KB 结果分页全量取回（≤256KB 缓存）"),
+        ("p26_paged_300k", "lua", {"code": 'return string.rep("y", 300000)'},
+         ("paged", 262144, 300000),
+         "超缓存上限: 取回 256KB, meta.total=300000 标志截断"),
         # ── P9 清理 ──
         ("p22_cleanup", "exec",
          {"command": "rm -f /tmp/rp_probe_id.lua /tmp/rp_id.txt "
@@ -178,11 +235,25 @@ def main():
     t0 = time.time()
     for i, (name, op, args, expect, note) in enumerate(build_cases(a.with_stress)):
         t1 = time.time()
-        ok, result, err_note = one_cmd(a.base, a.token, op, args)
+        ok, result, err_note, meta = one_cmd(a.base, a.token, op, args)
         dt = time.time() - t1
 
         status, detail = None, ""
-        if err_note:
+        if expect[0] == "paged":
+            # v0.3.125r5: 大结果分页——自动 fetch 续块后比对总量
+            want_len, want_total = expect[1], expect[2]
+            first = dict(meta or {})
+            first["result"] = result or ""
+            first["more"] = bool(meta and meta.get("more"))
+            acc, _ = fetch_all(a.base, a.token, first)
+            got_total = (meta or {}).get("total")
+            if err_note is None and len(acc) == want_len and got_total == want_total:
+                status, detail = "PASS", "取回 %d 字符 (meta.total=%s)" % (
+                    len(acc), got_total)
+            else:
+                status, detail = "FAIL", "期望 %d 字符 total=%s 实际 %d (total=%s, err=%s)" % (
+                    want_len, want_total, len(acc), got_total, err_note)
+        elif err_note:
             if expect[0] == "http413" and "413" in err_note:
                 status, detail = "PASS", "服务器 413 拒收（设计行为）"
             else:

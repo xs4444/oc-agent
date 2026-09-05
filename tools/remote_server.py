@@ -2,9 +2,13 @@
 """remote_server.py — OC agent 远程控制守护的控制服务器（v0.3.125）。
 
 agent 侧（src/agent/remote.lua）是 long-poll 客户端：经 internet 卡
-主动轮询本服务器取命令（ping/exec/read/write/list），执行后经
-现有工具注册表回传结果。本服务器在宿主机（DSH 侧）运行，提供命令
-入队与结果查询。
+主动轮询本服务器取命令（ping/exec/read/write/list/lua/fetch），
+执行后经现有工具注册表回传结果。本服务器在宿主机（DSH 侧）运行，
+提供命令入队与结果查询。
+
+v0.3.125r5: 大结果分页——结果 > 64KB 时 agent 回传首块 + meta
+{rid,total,held,more}（缓存前 256KB 可取回），客户端/驱动用
+fetch op 按 offset 续取；client 模式自动分页。
 
 serve 模式（常驻）:
     python3 tools/remote_server.py serve --port 8765 --token SECRET \
@@ -50,7 +54,7 @@ LOST_AFTER = 120         # /result lost 标记: 命令入队后 N 秒仍无 repo
                          # → 判死（agent 崩溃/OOM/重启，或 report 通道断）；
                          # 迟到的 report 仍会 upsert 覆盖（lost 只是查询提示）
 MAX_CMD_WIRE = 100000    # /cmd 入队的线上 JSON 字节上限（agent MAX_POLL_BODY=131072 之下留余量）
-ALLOWED_OPS = {"ping", "exec", "read", "write", "list"}
+ALLOWED_OPS = {"ping", "exec", "read", "write", "list", "lua", "fetch"}
 
 
 class State:
@@ -215,12 +219,18 @@ def make_handler(state):
                     self._send(400, {"error": "bad json"})
                     return
                 with state.cond:
-                    state.results[rid] = {
+                    rec = {
                         "ready": True,
                         "ok": bool(rep.get("ok")),
                         "result": rep.get("result", ""),
                         "at": time.time(),
                     }
+                    # v0.3.125r5: 大结果分页 meta 透传（agent report 附带
+                    # rid/total/held/more 时）——客户端据此发 fetch 续取
+                    for k in ("rid", "total", "held", "more"):
+                        if k in rep:
+                            rec[k] = rep[k]
+                    state.results[rid] = rec
                     state.cond.notify_all()
                 log("report %s ok=%s (%d chars)" % (
                     rid, rep.get("ok"), len(rep.get("result", ""))))
@@ -254,6 +264,59 @@ def http_json(url, body=None, timeout=15):
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
+def wait_result(base, tok, rid, deadline):
+    """等一个已入队命令的 /result；ready/lost 即返回，超时返回 None。"""
+    while time.time() < deadline:
+        try:
+            r = http_json("%s/result?token=%s&id=%s&wait=%.1f" %
+                          (base, tok, rid, min(max(deadline - time.time(), 0.5), 15.0)),
+                          timeout=20)
+        except Exception:
+            return None
+        if r.get("ready") or r.get("lost"):
+            return r
+    return None
+
+
+def fetch_all(base, tok, first, deadline):
+    """v0.3.125r5: 大结果自动分页——first 为 /result 的 ready 记录
+    （含 more/rid/held/total 时循环 fetch 续块）。返回完整文本。"""
+    result = first.get("result", "")
+    if not first.get("more"):
+        return result
+    offset = len(result)
+    held = first.get("held") or 0
+    for _ in range(32):  # 防御: 32 块 × 64KB = 2MB 足够
+        if offset >= held:
+            break
+        try:
+            rf = http_json("%s/cmd?token=%s" % (base, tok),
+                           {"op": "fetch",
+                            "args": {"rid": first["rid"], "offset": offset}})
+            fr = wait_result(base, tok, rf.get("id"), deadline)
+        except Exception as e:
+            print("fetch 失败: %s（已取 %d 字符）" % (e, len(result)),
+                  file=sys.stderr)
+            break
+        if not fr or not fr.get("ready"):
+            print("fetch 结果丢失/超时（已取 %d 字符）" % len(result),
+                  file=sys.stderr)
+            break
+        chunk = fr.get("result", "")
+        if fr.get("ok") is False:
+            print("fetch 错误: %s" % chunk, file=sys.stderr)
+            break
+        if not chunk:
+            break
+        result += chunk
+        offset += len(chunk)
+    total = first.get("total")
+    if total and total > len(result):
+        print("[remote: 结果被 agent 端截断，取回 %d/%d 字符]"
+              % (len(result), total), file=sys.stderr)
+    return result
+
+
 def cmd_client(args):
     base = args.base.rstrip("/")
     tok = urllib.parse.quote(args.token)
@@ -282,8 +345,12 @@ def cmd_client(args):
         op_args["path"] = args.list
     elif args.ping:
         op = "ping"
+    elif args.lua is not None:
+        # v0.3.125r5: 服务器下发 Lua 脚本执行（return 值即结果）
+        op = "lua"
+        op_args = {"code": args.lua}
     else:
-        print("error: 需指定 --ping / --exec / --read / --write / --list",
+        print("error: 需指定 --ping / --exec / --read / --write / --list / --lua",
               file=sys.stderr)
         return 2
 
@@ -306,7 +373,8 @@ def cmd_client(args):
             return 2
         if r.get("ready"):
             ok = r.get("ok")
-            result = r.get("result", "")
+            # v0.3.125r5: 大结果自动分页（首块 64KB + fetch 续块）
+            result = fetch_all(base, tok, r, time.time() + args.wait)
             print(result if result != "" else "(no output)")
             if not ok:
                 print("[remote: 执行报错]", file=sys.stderr)
@@ -353,6 +421,9 @@ def main():
                     help="两参: PATH CONTENT；单参: PATH（内容取 --content）")
     pc.add_argument("--content", default=None)
     pc.add_argument("--list", metavar="PATH")
+    pc.add_argument("--lua", metavar="CODE",
+                    help="v0.3.125r5: 下发 Lua 脚本执行（return 值即结果，"
+                         "大结果自动分页取回）")
     pc.add_argument("--wait", type=int, default=60, help="结果等待上限（秒）")
     pc.set_defaults(func=cmd_client)
 
