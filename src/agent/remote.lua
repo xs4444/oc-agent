@@ -52,6 +52,10 @@ local MAX_RESULT_HELD = 262144 -- v0.3.125r5: 大结果分页缓存上限（字�
 local RESULT_TTL = 600       -- v0.3.125r5: 分页缓存有效期（秒）；过期 fetch 报
                              -- expired 并清槽
 local MAX_POLL_BODY = 131072 -- poll 响应体上限（字节）: 命令 JSON 应远小于此
+local MAX_EXEC_HARD_CAP = 600 -- v0.3.125r6: exec/lua 命令超时硬帽（秒）
+local WATCHDOG_MARGIN = 30    -- 看门狗余量（秒）: 外层 cap = 工具超时 + 余量
+                              -- 必须严格大于内层（shell 自带 timeout 先触发，
+                              -- 外层只是内层失灵的兜底）
 
 -- 状态表（/remote 命令透出）
 local state = {
@@ -104,6 +108,12 @@ end
 --    路径 pcall(handle.close)。
 -- ③ thread 库不可用（mock/精简环境）时回退原同步读循环（不破坏
 --    run_tests 的 oc_mock 环境——其 internet mock 无 thread 语义）。
+-- ④ v0.3.125r6: 等待机制从 thread.waitForAll 改为 wait_thread 轮询——
+--    ocvm 实证 waitForAll 内部单次 event.pull(deadline) 长超时注册
+--    不触发（看门狗 cap=35s 后守护 100s+ 零 poll，直到 TUI 事件
+--    碰巧唤醒才恢复；0.1s 分片 os.sleep 则可靠，r2b 退避节奏
+--    2/4/8/16/32s 实测准确）。子线程置 box.done + 父线程
+--    os.sleep(0.5) 轮询（P0 补丁版可被 Ctrl+C 打断）。
 
 -- 同步读循环（fallback 用；与 v0.3.125r1 行为一致）
 local function read_sync(handle, limit, timeout)
@@ -130,39 +140,61 @@ local function read_sync(handle, limit, timeout)
   return table.concat(chunks), nil
 end
 
--- 看门狗读: 子线程读 + waitForAll(deadline)；任何路径都 close handle。
+-- v0.3.125r6: 线程 join 超时实现（取代 thread.waitForAll）。
+-- ocvm 源码级根因（components/computer.cpp 机器循环 + system/machine.lua
+-- 单系统协程 + thread.lua 注册表共享）: 子线程 op 执行期间，父线程冻结
+-- 在共享 handlers 表的事件派发循环里（机器 resume 始终进最内层
+-- yield 源）——有限 op 完成即恢复（实证: 子 op 8s 期间 ping 在 op
+-- 结束后 ~1s 处理）；无限循环子线程则父线程永久冻结，Lua 层看门狗
+-- 无从下手（实证: os.sleep(0) 死循环 cap=35s 后守护 100s+ 零 poll）。
+-- waitForAll 的同型长超时 event.pull 更不可靠。真机 Java OC 机器
+-- 逐 process 拉取，无此冻结——本设计（子线程+轮询）在真机完整生效。
+-- 子线程置 box.done，父线程 os.sleep(0.5) 轮询（P0 版 0.1s 分片，
+-- 可被打断，Ctrl+C 不堵）。
+-- 返回 true=完成 / false=超时（调用方负责 t:kill）。
+local function wait_thread(box, timeout)
+  local waited = 0
+  while not box.done and waited < timeout do
+    if os.sleep then os.sleep(0.5) end
+    waited = waited + 0.5
+  end
+  return box.done
+end
+
+-- 看门狗读: 子线程读 + wait_thread 轮询；任何路径都 close handle。
 -- 返回 body, err。timeout 可覆盖（report 用 10s 短超时）。
 local function read_guarded(handle, limit, timeout)
   timeout = timeout or POLL_TIMEOUT
   local ok_th, thread = pcall(require, "thread")
-  if not ok_th or not thread or not thread.create or not thread.waitForAll then
+  if not ok_th or not thread or type(thread.create) ~= "function" then
     local body, err = read_sync(handle, limit, timeout)
     pcall(function() handle:close() end)
     return body, err
   end
   local chunks = {}
   local total = 0
-  local aborted = nil
-  local done = false
+  local box = {aborted = nil}
   local reader = thread.create(function()
     pcall(function()
       for chunk in handle do
-        if interrupt.poll() then aborted = "interrupted" return end
+        if interrupt.poll() then box.aborted = "interrupted" return end
         total = total + #chunk
-        if total > limit then aborted = "response too large" return end
+        if total > limit then box.aborted = "response too large" return end
         chunks[#chunks + 1] = chunk
         os.sleep(0.02)
       end
     end)
-    done = true
+    box.done = true
   end)
-  local ok_w, completed = pcall(thread.waitForAll, {reader}, timeout)
+  if not wait_thread(box, timeout) then
+    pcall(reader.kill, reader)  -- 硬杀读线程（卡 C++ 阻塞时下一让出点生效）
+  end
   pcall(function() handle:close() end)  -- 所有路径 close（防泄漏+尽力解阻塞）
-  if not ok_w or not completed then
-    if aborted then return nil, aborted end
+  if not box.done then
+    if box.aborted then return nil, box.aborted end
     return nil, "read timeout after " .. timeout .. "s"
   end
-  if aborted then return nil, aborted end
+  if box.aborted then return nil, box.aborted end
   if total == 0 then
     -- v0.3.125r2b: 零 chunk 干净 EOF（连接被 RST/服务器死掉）——
     -- 必须按错误处理: 服务器总回 JSON（noop 也非空），空响应只可能是
@@ -200,6 +232,62 @@ local function http_post(url, body, timeout)
   return err
 end
 
+-- ── v0.3.125r6: 硬帽看门狗（"命令卡死守护"防护）─────────────────
+--
+-- 实证坑: RemoteOC 客户端 `while true do end` 永久卡死单线程轮询
+-- （无租约/TTL，通道永久死，唯一恢复=重启 VM）；同形坑在我们通道
+-- = 某个 op 永不返回 → 守护单线程循环停摆 → 后续命令全部静默堵死
+-- （本机实证 10h 堵单槽队列）。工具层 shell_execute 自带 60s 超时+
+-- 子线程 kill，但 (a) kill 对卡死在 C++ 阻塞里的线程未必即时生效，
+-- (b) lua op（r5 任意脚本）原本完全没有超时——守护活性无保证。
+--
+-- 对策: 再套一层外层看门狗——op 放子线程执行 + wait_thread 轮询 cap，
+-- 超时 thread-kill 子线程。无论内层机制是否生效，外层 cap 保证守护
+-- 循环必然释放（不变量: "守护永不被单个命令永久占用"）。
+-- cap = 工具超时 + 余量，硬帽 MAX_EXEC_HARD_CAP。
+--
+-- 已知边界: OC 调度是协作式——子线程若跑无 os.sleep 的紧密死循环，
+-- kill 只在其让出点生效；看门狗保证守护释放，不保证子线程立即停
+-- （其占用资源持续到自愿让出）。下发脚本必须含 os.sleep。
+local function watchdog_cap(timeout_arg)
+  local t = tonumber(timeout_arg)
+  if not t or t <= 0 then t = 60 end  -- 与 shell_execute 默认一致
+  return math.min(t, MAX_EXEC_HARD_CAP) + WATCHDOG_MARGIN
+end
+
+-- fn 返回 (s, is_err)；超时/kill 失败返回 (timeout_msg, true)。
+-- 无 thread 库环境（mock/测试）回退内联执行。
+-- v0.3.125r6: 等待改 wait_thread 轮询（ocvm 实证 waitForAll 长超时
+-- event.pull 不触发——cap=35s 实测卡 100s+，守护活性不变量失守）。
+local function run_guarded(fn, cap, timeout_msg)
+  local ok_t, thread = pcall(require, "thread")
+  if not ok_t or type(thread) ~= "table" or type(thread.create) ~= "function" then
+    local ok_r, s, is_err = pcall(fn)
+    if not ok_r then return "tool crash: " .. tostring(s), true end
+    return s, is_err
+  end
+  local box = {}
+  local t = thread.create(function()
+    local ok_r, s, is_err = pcall(fn)
+    if not ok_r then s, is_err = "tool crash: " .. tostring(s), true end
+    box.s, box.e, box.done = s, is_err, true
+  end)
+  if not wait_thread(box, cap) then
+    pcall(t.kill, t)  -- 硬杀子线程（卡 C++ 阻塞时在下一让出点生效）
+    return timeout_msg, true
+  end
+  return box.s, box.e
+end
+
+-- v0.3.125r6: 错误信息清洗——单文件构建的 pcall 错误带内部路径
+-- （实证 cosmetic 坑: "Error: /mnt/14e/agent.lua:6104: file not found:
+-- /tmp/nope" 泄漏部署路径）。只剥 "xxx.lua:NNN: " 一段，普通 Error
+-- 文本与合法输出不动。
+local function clean_err(s)
+  if type(s) ~= "string" then return s end
+  return (s:gsub("^Error: [^:]+%.lua:[0-9]+: ", "Error: "))
+end
+
 -- ── 命令执行 ────────────────────────────────────────────────────
 
 local function sh_quote(s)
@@ -233,7 +321,7 @@ local function execute_op(cmd)
     if ok5 then return enc, false end
     return "ping encode failed: " .. tostring(enc), true
   end
-  local tool, tool_args
+  local tool, tool_args, guard_cap
   if op == "exec" then
     if type(args.command) ~= "string" then
       return "exec: args.command must be a string", true
@@ -241,6 +329,8 @@ local function execute_op(cmd)
     tool = "shell_execute"
     tool_args = {command = args.command}
     if args.timeout then tool_args.timeout = args.timeout end
+    -- v0.3.125r6: 硬帽看门狗（shell 自带超时失灵的兜底——10h 堵队列实证）
+    guard_cap = watchdog_cap(args.timeout)
   elseif op == "read" then
     if type(args.path) ~= "string" then
       return "read: args.path must be a string", true
@@ -294,20 +384,35 @@ local function execute_op(cmd)
       return "lua: args.code must be a string", true
     end
     -- v0.3.125r5: 执行服务器下发的 Lua 脚本（借鉴 RemoteOC 裸 Lua 模式——
-    -- 真机调试跑任意脚本不必拼 exec 命令串）。在守护线程上下文执行:
-    -- print 进 TUI（与 exec `lua script` 同一泄漏行为），return 值即
-    -- 结果。信任边界同 exec（token 保护通道），不加沙箱。
-    local loadfn = load or loadstring  -- Lua 5.2+ / 5.1 兼容
-    local f, lerr = loadfn(args.code)
-    if not f then
-      return "lua: load failed: " .. tostring(lerr), true
-    end
-    local ok_r, r = pcall(f)
-    if not ok_r then
-      return "lua: " .. tostring(r), true
-    end
-    if r == nil then return "(no return value)", false end
-    return tostring(r), false
+    -- 真机调试跑任意脚本不必拼 exec 命令串）。print 进 TUI（与 exec
+    -- `lua script` 同一泄漏行为），return 值即结果。信任边界同 exec
+    -- （token 保护通道），不加沙箱。
+    -- v0.3.125r6: 硬帽看门狗——r5 原版内联执行无超时，
+    -- `while true do end` 式脚本永久卡死守护（RemoteOC 砖机同形实证）。
+    -- timeout 参数（默认 60，硬帽 600）+ 余量。
+    local cap = watchdog_cap(args.timeout)
+    return run_guarded(function()
+      local loadfn = load or loadstring  -- Lua 5.2+ / 5.1 兼容
+      -- v0.3.125r6: 注入 computer 全局——OpenOS 脚本惯例可
+      -- require("computer")，但调试脚本常直接写 computer.uptime()
+      -- （TUI/shell 环境有 computer 全局）；守护线程上下文无此全局
+      -- （实证: attempt to index a nil value (global 'computer')）。
+      -- 信任边界不变（computer 组件对任何 OC 程序本就可用）。
+      local ok_c, comp = pcall(require, "computer")
+      local script_env = setmetatable(
+        (ok_c and type(comp) == "table") and {computer = comp} or {},
+        {__index = _G})
+      local f, lerr = loadfn(args.code, "remote-script", nil, script_env)
+      if not f then
+        return "lua: load failed: " .. tostring(lerr), true
+      end
+      local ok_r, r = pcall(f)
+      if not ok_r then
+        return "lua: " .. tostring(r), true
+      end
+      if r == nil then return "(no return value)", false end
+      return tostring(r), false
+    end, cap, "lua: timeout after " .. cap .. "s (watchdog killed the script)")
   elseif op == "fetch" then
     -- v0.3.125r5: 大结果续取（report 首块 64KB + meta {rid,total,held,
     -- more}；此处按 rid+offset 取下一块，块大小 MAX_RESULT）。offset 为
@@ -334,24 +439,32 @@ local function execute_op(cmd)
   end
   local ok_a, encoded = pcall(json.encode, tool_args)
   if not ok_a then return "args encode failed: " .. tostring(encoded), true end
-  local ok_r, result, tool_is_err = pcall(execute_mod.run, tool, encoded, opts.deps)
-  if not ok_r then return "tool crash: " .. tostring(result), true end
-  local s = tostring(result)
-  -- v0.3.125r3: 结构化错误标志——file/shell 工具层直接返回 (text, is_err)，
-  -- 不再靠字符串前缀猜（实证假阳: cat error.log 等合法输出以 "Error:"
-  -- 开头被误判失败）。is_err=true 的合法场景: 工具 pcall 崩溃、参数解析
-  -- 失败、Unknown tool、guard 拒绝、内存护栏、超时杀进程、文件错误。
-  if type(tool_is_err) == "boolean" then
-    return s, tool_is_err
+  local function do_run()
+    local ok_r, result, tool_is_err = pcall(execute_mod.run, tool, encoded, opts.deps)
+    if not ok_r then return "tool crash: " .. tostring(result), true end
+    local s = tostring(result)
+    -- v0.3.125r3: 结构化错误标志——file/shell 工具层直接返回 (text, is_err)，
+    -- 不再靠字符串前缀猜（实证假阳: cat error.log 等合法输出以 "Error:"
+    -- 开头被误判失败）。is_err=true 的合法场景: 工具 pcall 崩溃、参数解析
+    -- 失败、Unknown tool、guard 拒绝、内存护栏、超时杀进程、文件错误。
+    if type(tool_is_err) == "boolean" then
+      return clean_err(s), tool_is_err
+    end
+    -- 工具未提供标志（插件工具等）: 回退三前缀判定。
+    -- v0.3.125r2: 护栏拒绝与超时杀进程也以错误语义回传——实证坑:
+    -- "rejected by guard: ..." 与 "shell_execute timeout after Ns
+    -- (command killed): ..." 均不以 Error 开头 → 旧判定 ok=true（假阴）。
+    local is_err = s:match("^Error") ~= nil
+      or s:match("^rejected by guard") ~= nil
+      or s:match("^shell_execute timeout") ~= nil
+    return clean_err(s), is_err
   end
-  -- 工具未提供标志（插件工具等）: 回退三前缀判定。
-  -- v0.3.125r2: 护栏拒绝与超时杀进程也以错误语义回传——实证坑:
-  -- "rejected by guard: ..." 与 "shell_execute timeout after Ns
-  -- (command killed): ..." 均不以 Error 开头 → 旧判定 ok=true（假阴）。
-  local is_err = s:match("^Error") ~= nil
-    or s:match("^rejected by guard") ~= nil
-    or s:match("^shell_execute timeout") ~= nil
-  return s, is_err
+  if guard_cap then
+    -- v0.3.125r6: exec 走外层看门狗（内层 shell 超时 +30s 余量兜底）
+    return run_guarded(do_run, guard_cap,
+      "exec: watchdog timeout after " .. guard_cap .. "s (command killed)")
+  end
+  return do_run()
 end
 
 -- ── 回传（v0.3.125r3: 10s 短超时 + pending 延迟队列 + 崩溃持久化）──
@@ -694,6 +807,9 @@ return {
     end,
     -- v0.3.125r4: shutdown 测试用（状态表引用——只读检查+合成状态注入）
     _state = state,
+    -- v0.3.125r6: 看门狗 cap 计算 + 错误清洗（纯函数单测）
+    watchdog_cap = watchdog_cap,
+    clean_err = clean_err,
     _persist = {
       safe_name = safe_name,
       persist_to_disk = persist_to_disk,

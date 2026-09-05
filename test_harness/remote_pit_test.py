@@ -13,16 +13,23 @@ OBSERVE = 行为不确定/需要人眼确认的用例，打印实际输出供记
 """
 import argparse
 import json
+import os
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+from http.server import ThreadingHTTPServer
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+sys.path.insert(0, os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "tools")))
+import remote_server as rs  # noqa: E402  (服务器自检段复用其 Handler)
 
 WAIT = 45
 
@@ -65,10 +72,12 @@ CASES = [
      ("ok", r'a "b" c\\ d')),  # 单引号内: 引号原样, 反斜杠字面（OpenOS 字面引号语义）
     ("exec_unicode", "exec",
      {"command": "echo 你好🌍中文"},
-     # ocvm C++ unicode.cpp 上游 bug（4 字节分支按 3 字节解码+余字节终止迭代）:
-     # emoji 变 U+FFFD、其后文本丢失——真机 OC(Java codePoints) 无此问题。
-     # 期望按 ocvm 实际行为锁定（ok + 中文前缀），防输出形态再变。
-     ("ok", "你好")),
+     # v0.3.125r6 防护: 服务器默认 400 拒收 4 字节 UTF-8（非 BMP）——
+     # 旧实证坑: ocvm C++ unicode.cpp 上游 bug（4 字节按 3 字节解码+余
+     # 字节终止迭代）原生崩溃/其后文本丢失，一条命令可打崩测试 VM。
+     # 真机 OC(Java codePoints) 无此问题，--allow-emoji 服务器可放开
+     # （崩溃行为不可再经本通道触达，上游 bug 记录于注释）。
+     ("http400", "4-byte UTF-8")),
     ("exec_var_expand", "exec",
      {"command": "echo home=$HOME"},
      ("ok", r"home=/home")),
@@ -77,7 +86,10 @@ CASES = [
      ("ok", r"a; b \| c & d \$\(x\)")),
     ("exec_multiline", "exec",
      {"command": "echo l1\necho l2"},
-     ("ok", r"l1\nl2|l1[\s\S]*l2")),
+     # v0.3.125r6 防护: 服务器 400 拒收——旧实证坑是 OpenOS shell 把换行
+     # 拍平成空格（"l1 echo l2" 一条命令，静默错）；现提前拒收并提示
+     # &&/; 串联（r6 前本用例锁的是拍平行为）。
+     ("http400", "single line")),
     ("exec_nonzero_exit", "exec",
      {"command": "false"},
      ("observe",)),  # 预期 (no output)——exit code 是否丢失待确认
@@ -160,10 +172,11 @@ CASES = [
      ("ok", "Written to")),  # 413 边界下沿: 线上 ~90KB < MAX_CMD_WIRE=100000, 应成功
     ("write_120k", "write",
      {"path": "/tmp/big120k.txt", "content": "A" * 120000},
-     ("http413",)),  # v0.3.125r2: 服务器 /cmd 拒收 >100KB 线上字节 → HTTP 413 明确报错
+     # v0.3.125r2: 服务器 /cmd 拒收 >100KB 线上字节 → HTTP 413 明确报错
+     ("http413", "too large")),
     ("write_200k", "write",
      {"path": "/tmp/big200k.txt", "content": "B" * 200000},
-     ("http413",)),  # 同上
+     ("http413", "too large")),  # 同上
     ("write_overwrite", "write",
      {"path": "/tmp/ow.txt", "content": "second"},
      ("ok", "Written to")),
@@ -176,6 +189,16 @@ CASES = [
      ("observe",)),
     ("list_many50", "list", {"path": "/tmp/many"},
      ("ok", r"f50\.txt")),
+    # ── v0.3.125r6 守护侧硬帽看门狗 ──
+    ("lua_watchdog_kill", "lua",
+     {"code": "while true do os.sleep(0) end", "timeout": 3},
+     # 坑防护: 死循环脚本必须被看门狗在 timeout+30s 硬帽内 kill 并
+     # 回传错误（真机 Java OC: 机器逐 process 拉取，守护不冻结，
+     # cap 完整生效）。ocvm 已知限制（源码实证 components/computer.cpp
+     # + system/machine.lua + thread.lua 共享 handlers 表）: 无限循环
+     # 子线程冻结父线程派发循环，Lua 层看门狗无从下手——客户端等待
+     # 超时 + 守护 100~300s 后自行恢复（恢复 ping 验证）。
+     ("watchdog", "watchdog killed")),
     # ── ping 回归 ──
     ("ping", "ping", {}, ("ok", r'"os":"OpenOS')),
 ]
@@ -208,6 +231,150 @@ f = io.open("/tmp/setup_done", "w")
 f:write("setup-done")
 f:close()
 '''
+
+
+def start_helper(allow_emoji=False, queue_max=10 ** 9, lost_grace=120,
+                 hold=2):
+    """起一个独立控制服务器（临时端口，daemon 线程）——服务器侧防护自检
+    不与主服务器/真机守护纠缠。"""
+    st = rs.State("pittok", hold, allow_emoji=allow_emoji,
+                  queue_max=queue_max, lost_grace=lost_grace)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), rs.make_handler(st))
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return "http://127.0.0.1:%d" % port, httpd
+
+
+def server_self_tests(base_main, tok_main):
+    """v0.3.125r6 服务器侧防护自检（独立 helper 服务器，不需要 agent）:
+    ① exec 单行拒收 ② exec emoji 默认拒收/--allow-emoji 放开
+    ③ 队列满 429 ④ 按命令超时的 lost（派发基准+离线判死）
+    ⑤ /status 在线性（离线 helper 判 false，主服务器守护在线判 true）"""
+    results = []
+
+    def run_case(name, fn):
+        t0 = time.time()
+        try:
+            note = fn()
+            verdict, actual = ("PASS", "(ok)") if note is None \
+                else ("FAIL", note)
+        except Exception as e:
+            verdict, actual = "FAIL", "exception: %s" % e
+        dt = time.time() - t0
+        results.append((name, verdict, dt, actual))
+        print("%-24s %-8s %5.1fs  %s" %
+              (name, verdict, dt, actual), flush=True)
+
+    def post(b, op, args):
+        try:
+            return http_json("%s/cmd?token=pittok" % b,
+                             {"op": op, "args": args}), None
+        except urllib.error.HTTPError as e:
+            return None, "HTTP %d: %s" % (
+                e.code, e.read().decode("utf-8", "replace")[:200])
+        except Exception as e:
+            return None, "send failed: %s" % e
+
+    def expect_reject(name, b, op, args, frag):
+        def fn():
+            r, err = post(b, op, args)
+            if r is not None:
+                return "未被拒收（入队 %s）" % r
+            if err and frag.lower() in err.lower():
+                return None
+            return "拒收但消息不符: %s" % err
+        run_case(name, fn)
+
+    b1, _ = start_helper()  # 默认参数（emoji 拒收）
+    expect_reject("srv_reject_multiline", b1, "exec",
+                  {"command": "echo a\necho b"}, "single line")
+    expect_reject("srv_reject_emoji", b1, "exec",
+                  {"command": "echo 你好🌍"}, "4-byte utf-8")
+    # 中文（3 字节 BMP）不受 emoji 防护影响
+    def fn_cjk():
+        r, err = post(b1, "exec", {"command": "echo 你好"})
+        if r is None:
+            return "BMP 中文被误拒: %s" % err
+        return None
+    run_case("srv_allow_bmp_chinese", fn_cjk)
+    # --allow-emoji 放开
+    b2, _ = start_helper(allow_emoji=True)
+
+    def fn_emoji_on():
+        r, err = post(b2, "exec", {"command": "echo 你好🌍"})
+        if r is None:
+            return "allow_emoji 下仍被拒: %s" % err
+        return None
+    run_case("srv_allow_emoji_flag", fn_emoji_on)
+    # 队列满 429
+    b3, _ = start_helper(queue_max=3)
+
+    def fn_queue_full():
+        notes = []
+        for i in range(3):
+            r, err = post(b3, "ping", {})
+            if r is None:
+                return "第 %d 条意外被拒: %s" % (i + 1, err)
+        r4, err4 = post(b3, "ping", {})
+        if r4 is not None:
+            return "队列满仍入队: %s" % r4
+        if not (err4 and "429" in err4 and "queue full" in err4.lower()):
+            return "429 消息不符: %s" % err4
+        return None
+    run_case("srv_queue_full_429", fn_queue_full)
+    # 按命令超时的 lost（离线守护: 队列永不消费; 窗口=lost_grace）
+    b4, _ = start_helper(lost_grace=3)
+
+    def fn_lost_offline():
+        r, err = post(b4, "exec", {"command": "sleep 30", "timeout": 2})
+        if r is None:
+            return "入队失败: %s" % err
+        rid = r["id"]
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            res = http_json("%s/result?token=pittok&id=%s&wait=5" % (b4, rid))
+            if res.get("lost"):
+                return None
+            if res.get("ready"):
+                return "意外 ready（守护不该在轮询 helper）"
+        return "25s 内未判 lost（期望 ~3s 宽限后）"
+    run_case("srv_lost_offline", fn_lost_offline)
+    # 已 ready 的命令不受 lost 影响（report 补发后查询）
+    b5, _ = start_helper(lost_grace=1)
+
+    def fn_late_report():
+        r, err = post(b5, "ping", {})
+        if r is None:
+            return "入队失败: %s" % err
+        rid = r["id"]
+        http_json("%s/report?token=pittok&id=%s" % (b5, rid),
+                  {"ok": True, "result": "late"})
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            res = http_json("%s/result?token=pittok&id=%s" % (b5, rid))
+            if res.get("ready"):
+                return None if res.get("ok") else "ready 但 ok=false"
+        return "迟到的 report 未生效"
+    run_case("srv_late_report_overrides_lost", fn_late_report)
+    # /status: 离线 helper 判 false; 主服务器（真机守护在线）判 true
+    def fn_status_offline():
+        st = http_json("%s/status?token=pittok" % b1)
+        if st.get("online") is False and "queue_len" in st \
+                and "version" in st:
+            return None
+        return "status 结构/在线性不符: %s" % st
+    run_case("srv_status_offline", fn_status_offline)
+
+    def fn_status_online():
+        try:
+            st = http_json("%s/status?token=%s" % (base_main, tok_main))
+        except Exception as e:
+            return "主服务器查询失败: %s" % e
+        if st.get("online") is True:
+            return None
+        return "主服务器守护应在线: %s" % st
+    run_case("srv_status_online_main", fn_status_online)
+    return results
 
 
 def main():
@@ -244,15 +411,48 @@ def main():
             sys.exit(2)
         print("[setup] 测试文件就绪")
 
+    # v0.3.125r6: 服务器侧防护自检（helper 服务器，不占真机队列）
+    srv_results = server_self_tests(base, tok)
     results = []
     for name, op, op_args, expect in CASES_:
         t0 = time.time()
         ok, res, note = one_cmd(base, tok, op, op_args)
         dt = time.time() - t0
-        if expect[0] == "http413" and note and "server HTTP 413" in note \
-                and "too large" in note:
+        # 服务器拒收类期望（v0.3.125r2 413 过大 / v0.3.125r6 400 单行
+        # 与 emoji / 429 队列满）: note 带 HTTP 码 + 消息片段
+        # （兼容无片段的 1 元组 http 期望: 只校验码）
+        if expect[0].startswith("http") and len(expect[0]) == 7 and note \
+                and ("server HTTP %s" % expect[0][4:]) in note \
+                and (len(expect) < 2 or expect[1].lower() in note.lower()):
             verdict, actual = "PASS", note
-            expected = "server HTTP 413 too large"
+            expected = "server HTTP %s + /%s/" % (expect[0][4:], expect[1])
+        elif expect[0] == "watchdog":
+            # 双路径（见用例注释）: 真机=cap 内 kill 回 err; ocvm=冻结
+            # 限制（客户端等待超时）→ 必须验证守护恢复（≤300s ping 通）
+            if ok is False and re.search(expect[1], res or "", re.M):
+                verdict, expected = "PASS", "err + /%s/" % expect[1]
+                actual = res
+            elif note and note.startswith("timeout after"):
+                t_rec = time.time()
+                recovered = 0
+                while time.time() - t_rec < 300:
+                    okp, resp, notep = one_cmd(base, tok, "ping", {}, wait=15)
+                    if okp:
+                        recovered = int(time.time() - t_rec)
+                        break
+                if recovered:
+                    verdict, expected = "PASS", \
+                        "ocvm 冻结(已知限制) + %ds 恢复" % recovered
+                    actual = note + " → 恢复 %ds" % recovered
+                    dt = time.time() - t0
+                else:
+                    verdict, expected = "FAIL", \
+                        "冻结后 300s 守护未恢复"
+                    actual = note
+            else:
+                verdict, expected = "FAIL", \
+                    "watchdog err 或 ocvm 冻结+恢复"
+                actual = (res or note) or "(无)"
         elif note is not None:
             verdict, actual = "FAIL", note
             expected = ""
@@ -275,9 +475,11 @@ def main():
         print("%-22s %-8s %5.1fs  %s   # expect: %s" %
               (name, verdict, dt, shown, expected), flush=True)
 
-    n_fail = sum(1 for r in results if r[1] == "FAIL")
+    n_fail = sum(1 for r in results if r[1] == "FAIL") \
+        + sum(1 for r in srv_results if r[1] == "FAIL")
     n_obs = sum(1 for r in results if r[1] == "OBSERVE")
-    n_pass = sum(1 for r in results if r[1] == "PASS")
+    n_pass = sum(1 for r in results if r[1] == "PASS") \
+        + sum(1 for r in srv_results if r[1] == "PASS")
     print("\n== 汇总: %d PASS / %d FAIL / %d OBSERVE ==" %
           (n_pass, n_fail, n_obs))
     sys.exit(n_fail)

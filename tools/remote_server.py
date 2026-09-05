@@ -10,6 +10,19 @@ v0.3.125r5: 大结果分页——结果 > 64KB 时 agent 回传首块 + meta
 {rid,total,held,more}（缓存前 256KB 可取回），客户端/驱动用
 fetch op 按 offset 续取；client 模式自动分页。
 
+v0.3.125r6: 坑位防护（对照实测坑清单）:
+  - exec 单行强校验: OpenOS shell 把命令内换行拍平成空格（实证
+    `echo a\necho b` → "a echo b" 静默错）→ 400 拒收，提示 &&/; 串联
+  - exec 4 字节 UTF-8（emoji）默认拒收: ocvm C++ unicode.cpp 上游 bug
+    原生崩溃（真机 OC Java codePoints 无此问题）→ 400 拒收，
+    serve --allow-emoji 放开（write op 的 content 不受限——纯 Lua
+    fs 写路径，实证无损）
+  - 队列深度上限（默认 16，--queue-max）: 防离线积压无界 → 429
+  - lost 判定按命令超时计算: queued_at + 命令 timeout + --lost-grace
+    （默认 120s），不再一刀切 120s（长命令 timeout=600 不再假阳）
+  - GET /status: 守护在线性（last_poll）+ 队列长度 + 最近命令状态
+    ——离线/堵队列一眼可见（此前只能靠 /result 超时盲等推断）
+
 serve 模式（常驻）:
     python3 tools/remote_server.py serve --port 8765 --token SECRET \
         [--bind 0.0.0.0] [--hold 12]
@@ -36,9 +49,11 @@ client 模式（一次性命令，需 serve 已在跑）:
 """
 import argparse
 import json
+import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -50,7 +65,11 @@ if hasattr(sys.stdout, "reconfigure"):
 
 HOLD_DEFAULT = 12        # /poll 无命令时最长 hold（秒）—— agent 侧读 deadline 30s
 RESULT_TTL = 3600        # 结果保留（秒）
-LOST_AFTER = 120         # /result lost 标记: 命令入队后 N 秒仍无 report
+LOST_GRACE_DEFAULT = 120 # v0.3.125r6: lost 宽限（秒）——命令自身 timeout 到期后
+                          # 再多等这么久才判 lost（迟到的 report 仍会 upsert
+                          # 覆盖，lost 只是查询提示）。r5 前为固定 LOST_AFTER=120
+                          # 一刀切（长命令 timeout=600 时 120s 就假阳）
+QUEUE_MAX_DEFAULT = 16   # v0.3.125r6: 单 token 队列深度上限（防离线积压无界）
                          # → 判死（agent 崩溃/OOM/重启，或 report 通道断）；
                          # 迟到的 report 仍会 upsert 覆盖（lost 只是查询提示）
 MAX_CMD_WIRE = 100000    # /cmd 入队的线上 JSON 字节上限（agent MAX_POLL_BODY=131072 之下留余量）
@@ -58,12 +77,21 @@ ALLOWED_OPS = {"ping", "exec", "read", "write", "list", "lua", "fetch"}
 
 
 class State:
-    def __init__(self, token, hold):
+    def __init__(self, token, hold, allow_emoji=False, queue_max=QUEUE_MAX_DEFAULT,
+                 lost_grace=LOST_GRACE_DEFAULT):
         self.token = token
         self.hold = hold
+        # v0.3.125r6: 防护开关/参数
+        self.allow_emoji = allow_emoji
+        self.queue_max = queue_max
+        self.lost_grace = lost_grace
+        # v0.3.125r6: /status 在线性判据
+        self.last_poll = 0.0
         self.lock = threading.Lock()
         self.queues = {}          # token -> deque of cmd dicts
-        self.results = {}         # id -> {"ready":.., "ok":.., "result":.., "at":..}
+        # id -> {"ready":.., "ok":.., "result":.., "at":.., "queued_at":..,
+        #        "timeout":.. (v0.3.125r6: 按命令超时算 lost 窗口)}
+        self.results = {}
         self.cond = threading.Condition(self.lock)
         self.counter = 0
         self.started = time.time()
@@ -121,6 +149,7 @@ def make_handler(state):
             if not self._check_token(qs):
                 return
             if u.path == "/poll":
+                state.last_poll = time.time()  # v0.3.125r6: /status 在线性
                 deadline = time.time() + state.hold
                 with state.cond:
                     state.queues.setdefault(state.token, deque())
@@ -132,6 +161,11 @@ def make_handler(state):
                         state.cond.wait(min(remaining, 5.0))
                     if q:
                         cmd = q.popleft()
+                        # v0.3.125r6: 派发时刻（lost 判定改以此为基准——
+                        # 排队等待时间不算进执行窗口，FIFO 积压不再假阳）
+                        rec = state.results.get(cmd.get("id"))
+                        if rec is not None:
+                            rec["dispatched_at"] = time.time()
                         log("poll → %s %s" % (cmd["op"],
                                               json.dumps(cmd.get("args", {}),
                                                          ensure_ascii=False)[:120]))
@@ -149,17 +183,60 @@ def make_handler(state):
                         if r and r.get("ready"):
                             self._send(200, r)
                             return
-                        # v0.3.125r3: lost 标记——命令入队后 LOST_AFTER 秒
-                        # 仍无 report（agent 崩溃/OOM/重启，或 report 通道
-                        # 断），客户端可判死不必等到自己 deadline
-                        if r and time.time() - r.get("queued_at",
-                                                      time.time()) > LOST_AFTER:
-                            lost = True
+                        # v0.3.125r3: lost 标记——命令超时窗口内无 report
+                        # （agent 崩溃/OOM/重启，或 report 通道断），客户端
+                        # 可判死不必等到自己 deadline。
+                        # v0.3.125r6: 窗口 = 命令自身 timeout + 宽限
+                        # （r5 前固定 120s 一刀切，长命令假阳）；基准=派发
+                        # 时刻（排队等待不算——FIFO 积压不假阳）；仍未派发
+                        # 且守护离线 = 队列永不消费，宽限后判 lost
+                        if r:
+                            dispatch = r.get("dispatched_at")
+                            agent_offline = state.last_poll == 0 or \
+                                time.time() - state.last_poll > \
+                                max(state.hold * 3, 45)
+                            if dispatch:
+                                lost = time.time() - dispatch > \
+                                    r.get("timeout", 60) + state.lost_grace
+                            elif agent_offline:
+                                lost = time.time() - r.get(
+                                    "queued_at", time.time()) > state.lost_grace
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             break
                         state.cond.wait(min(remaining, 2.0))
                     self._send(200, {"ready": False, "lost": lost})
+            elif u.path == "/status":
+                # v0.3.125r6: 健康快照——守护在线性/队列深度/最近命令状态。
+                # 此前离线与堵队列只能靠 /result 超时盲等推断（10h 堵队列
+                # 坑的伴生盲区）。
+                with state.cond:
+                    q = state.queues.get(state.token, deque())
+                    pending_n = sum(1 for v in state.results.values()
+                                    if not v.get("ready"))
+                    online = state.last_poll > 0 and \
+                        time.time() - state.last_poll < max(state.hold * 3, 45)
+                    recent = []
+                    for k in list(state.results)[-20:]:
+                        v = state.results[k]
+                        recent.append({
+                            "id": k,
+                            "ready": bool(v.get("ready")),
+                            "ok": v.get("ok"),
+                            "age": round(time.time() - v.get(
+                                "at", v.get("queued_at", time.time())), 1),
+                        })
+                    self._send(200, {
+                        "version": "r6",
+                        "online": online,
+                        "last_poll_age": (round(time.time() - state.last_poll, 1)
+                                          if state.last_poll else None),
+                        "queue_len": len(q),
+                        "pending_results": pending_n,
+                        "hold": state.hold,
+                        "uptime": round(time.time() - state.started, 1),
+                        "recent": recent,
+                    })
             else:
                 self._send(404, {"error": "not found"})
 
@@ -179,6 +256,36 @@ def make_handler(state):
                 if op not in ALLOWED_OPS:
                     self._send(400, {"error": "unknown op: %s" % op})
                     return
+                # v0.3.125r6 防护①: exec 单行强校验——实证坑: OpenOS shell
+                # 把命令内换行拍平成空格（`echo a\necho b` → "a echo b"
+                # 一条命令，静默错且不报错）。提前拒收，提示 &&/; 串联。
+                # （lua op 的 code 允许多行——那是脚本，不是 shell 命令）
+                if op == "exec":
+                    command = (req.get("args") or {}).get("command")
+                    if isinstance(command, str) and re.search(r"[\r\n]", command):
+                        self._send(400, {
+                            "error": "exec command must be a single line: "
+                                     "OpenOS shell flattens newlines to "
+                                     "spaces (silently becomes ONE command); "
+                                     "chain with && or ;"})
+                        return
+                # v0.3.125r6 防护②: exec 4 字节 UTF-8（非 BMP/emoji）默认
+                # 拒收——ocvm C++ unicode.cpp 上游 bug（4 字节按 3 字节解码
+                # + 余字节终止迭代）原生崩溃/其后文本丢失，一条命令可把
+                # 测试 VM 打崩（真机 OC 用 Java codePoints 无此问题，
+                # serve --allow-emoji 放开）。write op 的 content 不受限
+                # （纯 Lua fs 写路径，emoji 实证无损）。
+                if op == "exec" and not state.allow_emoji:
+                    command = (req.get("args") or {}).get("command")
+                    if isinstance(command, str) and \
+                            any(ord(c) > 0xFFFF for c in command):
+                        self._send(400, {
+                            "error": "exec command contains 4-byte UTF-8 "
+                                     "(non-BMP/emoji): ocvm C++ unicode "
+                                     "upstream bug crashes on it; real OC "
+                                     "(Java) is fine — start server with "
+                                     "--allow-emoji to permit"})
+                        return
                 cmd = {"id": None, "op": op, "args": req.get("args") or {}}
                 # 线上大小拒收（v0.3.125r2）: agent poll 响应上限
                 # MAX_POLL_BODY=131072——超限命令入队后 poll 响应整体被
@@ -194,13 +301,33 @@ def make_handler(state):
                                  % (wire, MAX_CMD_WIRE)})
                     return
                 with state.cond:
+                    # v0.3.125r6 防护③: 队列深度上限——守护离线/堵队列时
+                    # 命令无界积压没有意义（agent 单槽 FIFO，积压越深
+                    # 越陈旧）。429 让发送方立刻知道该等。
+                    q = state.queues.setdefault(state.token, deque())
+                    if len(q) >= state.queue_max:
+                        self._send(429, {
+                            "error": "queue full: %d pending; agent offline "
+                                     "or busy — check GET /status" % len(q)})
+                        return
                     cmd["id"] = state.new_id()
                     # v0.3.125r3: 入队占位（/result 的 lost 判定基准；
                     # report 到达时 upsert 覆盖为 ready）
+                    # v0.3.125r6: 记录命令自身超时（exec/lua 的 timeout
+                    # 参数，缺省 60 与 shell 默认一致；其余 op 30s 足够）
+                    # ——lost 窗口 = timeout + lost_grace，不再一刀切
+                    args_tbl = req.get("args") or {}
+                    if op in ("exec", "lua"):
+                        try:
+                            tmo = max(5, int(args_tbl.get("timeout") or 60))
+                        except (TypeError, ValueError):
+                            tmo = 60
+                    else:
+                        tmo = 30
                     state.results.setdefault(cmd["id"], {
-                        "ready": False, "queued_at": time.time()})
-                    state.queues.setdefault(state.token, deque())
-                    state.queues[state.token].append(cmd)
+                        "ready": False, "queued_at": time.time(),
+                        "timeout": tmo})
+                    q.append(cmd)
                     state.cond.notify_all()
                     # 顺带清过期结果（占位条目无 at 字段，回退 queued_at，
                     # 否则每次 /cmd 都会把占位立即清掉）
@@ -242,11 +369,14 @@ def make_handler(state):
 
 
 def cmd_serve(args):
-    state = State(args.token, args.hold)
+    state = State(args.token, args.hold, allow_emoji=args.allow_emoji,
+                  queue_max=args.queue_max, lost_grace=args.lost_grace)
     httpd = ThreadingHTTPServer((args.bind, args.port), make_handler(state))
     httpd.daemon_threads = True
-    log("serving on %s:%d (hold=%ds); Ctrl+C to stop" %
-        (args.bind, args.port, args.hold))
+    log("serving on %s:%d (hold=%ds queue_max=%d lost_grace=%ds "
+        "emoji=%s); Ctrl+C to stop" %
+        (args.bind, args.port, args.hold, args.queue_max, args.lost_grace,
+         "allowed" if args.allow_emoji else "rejected"))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -320,6 +450,20 @@ def fetch_all(base, tok, first, deadline):
 def cmd_client(args):
     base = args.base.rstrip("/")
     tok = urllib.parse.quote(args.token)
+    if args.status:
+        # v0.3.125r6: 健康快照（在线性/队列/最近命令）
+        try:
+            r = http_json("%s/status?token=%s" % (base, tok))
+        except urllib.error.HTTPError as e:
+            print("error: server HTTP %d: %s" %
+                  (e.code, e.read().decode("utf-8", "replace")[:300]),
+                  file=sys.stderr)
+            return 2
+        except Exception as e:
+            print("error: %s（服务器在跑吗）" % e, file=sys.stderr)
+            return 2
+        print(json.dumps(r, ensure_ascii=False, indent=1))
+        return 0
     op_args = {}
     if args.exec is not None:
         op = "exec"
@@ -347,8 +491,11 @@ def cmd_client(args):
         op = "ping"
     elif args.lua is not None:
         # v0.3.125r5: 服务器下发 Lua 脚本执行（return 值即结果）
+        # v0.3.125r6: 支持 --timeout（守护侧硬帽看门狗，默认 60s）
         op = "lua"
         op_args = {"code": args.lua}
+        if args.timeout:
+            op_args["timeout"] = args.timeout
     else:
         print("error: 需指定 --ping / --exec / --read / --write / --list / --lua",
               file=sys.stderr)
@@ -356,6 +503,12 @@ def cmd_client(args):
 
     try:
         r = http_json("%s/cmd?token=%s" % (base, tok), {"op": op, "args": op_args})
+    except urllib.error.HTTPError as e:
+        # v0.3.125r6: 服务器拒收（400 单行/emoji、413 过大、429 队列满）
+        # 把原因打全，而不是笼统"发送失败"
+        print("error: server HTTP %d: %s" %
+              (e.code, e.read().decode("utf-8", "replace")[:300]), file=sys.stderr)
+        return 2
     except Exception as e:
         print("error: 发送命令失败（服务器在跑吗）: %s" % e, file=sys.stderr)
         return 2
@@ -381,10 +534,12 @@ def cmd_client(args):
                 return 1
             return 0
         if r.get("lost"):
-            # v0.3.125r3: 服务器判死（入队 >LOST_AFTER s 无 report）
-            print("lost: 命令入队后 %ds 无 agent 报告（agent 崩溃/OOM/重启，"
-                  "或 report 通道断？）——查 agent 端 /remote 状态与 pending 队列"
-                  % LOST_AFTER, file=sys.stderr)
+            # v0.3.125r3: 服务器判死（命令超时窗口内无 report）
+            # v0.3.125r6: 窗口 = 命令 timeout + --lost-grace，基准=派发时刻
+            print("lost: 命令超时窗口内无 agent 报告（窗口=命令 timeout+%ds "
+                  "宽限；agent 崩溃/OOM/重启，或 report 通道断，或命令仍在"
+                  "队列排队？）——先 client --status 看在线性与队列"
+                  % LOST_GRACE_DEFAULT, file=sys.stderr)
             return 4
         if time.time() >= deadline:
             print("timeout: %ds 内未收到结果（agent 在线？/remote 状态？）" %
@@ -405,15 +560,27 @@ def main():
     ps.add_argument("--token", required=True)
     ps.add_argument("--hold", type=int, default=HOLD_DEFAULT,
                     help="long-poll hold 秒数（默认 %d）" % HOLD_DEFAULT)
+    ps.add_argument("--allow-emoji", action="store_true",
+                    help="允许 exec 命令含 4 字节 UTF-8（emoji）。默认拒收"
+                         "——ocvm C++ unicode 上游 bug 会崩；真机 OC(Java) 无此"
+                         "问题，真机专用服务器建议放开")
+    ps.add_argument("--queue-max", type=int, default=QUEUE_MAX_DEFAULT,
+                    help="单 token 命令队列深度上限（默认 %d，满则 429）"
+                         % QUEUE_MAX_DEFAULT)
+    ps.add_argument("--lost-grace", type=int, default=LOST_GRACE_DEFAULT,
+                    help="lost 宽限秒数（命令 timeout 到期后再等这么久才判"
+                         " lost；默认 %d）" % LOST_GRACE_DEFAULT)
     ps.set_defaults(func=cmd_serve)
 
     pc = sub.add_parser("client", help="一次性命令")
     pc.add_argument("--base", default="http://127.0.0.1:8765")
     pc.add_argument("--token", required=True)
+    pc.add_argument("--status", action="store_true",
+                    help="打印守护健康快照（GET /status）后退出")
     pc.add_argument("--ping", action="store_true")
     pc.add_argument("--exec", metavar="CMD")
     pc.add_argument("--timeout", type=int, default=None,
-                    help="exec 的子命令超时（秒）")
+                    help="exec/lua 的命令超时（秒，默认 60）")
     pc.add_argument("--read", metavar="PATH")
     pc.add_argument("--offset", type=int, default=None)
     pc.add_argument("--limit", type=int, default=None)

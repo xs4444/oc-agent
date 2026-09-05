@@ -2808,6 +2808,27 @@ do
       test("remote: ping returns json ok", is3 == false and tostring(s3):find('"data"') ~= nil, tostring(s3):sub(1, 120))
       test("remote: sh_quote basic", int.sh_quote("a b") == "'a b'", int.sh_quote("a b"))
       test("remote: sh_quote single quote", int.sh_quote("a'b") == "'a'\\''b'", int.sh_quote("a'b"))
+      -- v0.3.125r6: 硬帽看门狗 cap 计算（坑: 10h 堵单槽队列 / RemoteOC 砖机）
+      test("remote: watchdog_cap nil→90 (60+30)",
+        type(int.watchdog_cap) == "function" and int.watchdog_cap(nil) == 90,
+        tostring(int.watchdog_cap and int.watchdog_cap(nil)))
+      test("remote: watchdog_cap 5→35",
+        int.watchdog_cap(5) == 35, tostring(int.watchdog_cap(5)))
+      test("remote: watchdog_cap 300→330",
+        int.watchdog_cap(300) == 330, tostring(int.watchdog_cap(300)))
+      test("remote: watchdog_cap 999→630 (hard cap 600+30)",
+        int.watchdog_cap(999) == 630, tostring(int.watchdog_cap(999)))
+      -- v0.3.125r6: 错误路径清洗（坑: 泄漏 agent.lua:NNNN 内部路径）
+      test("remote: clean_err strips single-file path",
+        int.clean_err("Error: /mnt/14e/agent.lua:6104: file not found: /tmp/nope")
+          == "Error: file not found: /tmp/nope",
+        int.clean_err("Error: /mnt/14e/agent.lua:6104: file not found: /tmp/nope"))
+      test("remote: clean_err leaves plain Error untouched",
+        int.clean_err("Error: cannot open for writing")
+          == "Error: cannot open for writing")
+      test("remote: clean_err leaves non-error untouched",
+        int.clean_err('{"ok":true}') == '{"ok":true}')
+      test("remote: clean_err nil safe", int.clean_err(nil) == nil)
       -- v0.3.125r4: shutdown（/exit 安全网——守护 active 时 /exit 冻死 VM 的
       -- 修复，2026-09-05 真机实证：孤儿 PipedCommand + 主循环 97% 自旋）
       test("remote: shutdown exports", type(remote.shutdown) == "function")
@@ -2888,6 +2909,44 @@ do
     else
       test("remote: _internal test hook exposed under _TEST_MODE", false, "_internal nil")
     end
+  end
+end
+
+-- ═══════════════════════════════════════════
+-- setup 配置 merge（v0.3.125r6）: first_run 不得无条件 3 字段覆盖——
+-- 实证坑 r5: boot writable base 漂移使旧 config "找不到"，覆盖后
+-- mem_exec_min_free/remote_url/remote_token 全丢。
+-- ═══════════════════════════════════════════
+do
+  local c_ok, cfg = pcall(require, "agent.config")
+  test("config: module loads", c_ok and type(cfg) == "table", tostring(cfg))
+  if c_ok and type(cfg._internal) == "table" then
+    local m = cfg._internal.merge_setup
+    local prev = {remote_url = "http://1.2.3.4:8765", remote_token = "t",
+                  mem_exec_min_free = 200000, model = "old-model"}
+    local c1 = m(prev, "", "", "")
+    test("config merge: 空答案继承旧值（remote_url/token/mem 保留）",
+      c1.remote_url == "http://1.2.3.4:8765" and c1.remote_token == "t"
+      and c1.mem_exec_min_free == 200000 and c1.model == "old-model",
+      json.encode(c1))
+    local c2 = m(prev, "KEY", "new-model", "http://api/x")
+    test("config merge: 非空答案覆盖 + 其余字段继承",
+      c2.api_key == "KEY" and c2.model == "new-model"
+      and c2.api_url == "http://api/x" and c2.remote_token == "t",
+      json.encode(c2))
+    local c3 = m(nil, "", "", "")
+    test("config merge: 无旧值走默认",
+      c3.model == "deepseek-v4-flash-free"
+      and c3.api_url == "https://opencode.ai/zen/v1/chat/completions"
+      and c3.api_key == "",
+      json.encode(c3))
+    local c4 = m({api_key = "old-key", data_dir = "/mnt/x"}, "", "", "")
+    test("config merge: 旧 api_key/data_dir 原样继承",
+      c4.api_key == "old-key" and c4.data_dir == "/mnt/x",
+      json.encode(c4))
+  else
+    test("config: _internal test hook exposed under _TEST_MODE", false,
+      "_internal nil")
   end
 end
 
