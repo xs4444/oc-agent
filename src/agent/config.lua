@@ -178,18 +178,83 @@ local function save(config)
   f:close()
 end
 
+-- v0.3.125r6: setup merge（实证坑 r5）: boot 时 writable base 漂移
+-- （fs.mounts() 顺序不稳/每 boot 新盘目录）使已存在的 config "找不到"
+-- → 旧 first_run 无条件只写 3 字段 → mem_exec_min_free/remote_url/
+-- remote_token 全丢（护栏回默认 + 远控守护不自启 + /remote on 拒）。
+-- 对策: 全盘查一份现存可解析 config，其字段全部继承；3 个 setup 字段
+-- 仅被非空答案覆盖。
+local function find_existing_config()
+  local ok_fs, fs = pcall(require, "filesystem")
+  local ser = require("serialization")
+  local seen = {}
+  local candidates = {"/home", writable_base}
+  if ok_fs and type(fs.mounts) == "function" then
+    local ok_m, mounts = pcall(fs.mounts)
+    if ok_m then
+      for _, mount in mounts do
+        if type(mount) == "string" and mount ~= "/" then
+          candidates[#candidates + 1] = mount
+        end
+      end
+    end
+  end
+  for _, base in ipairs(candidates) do
+    if not seen[base] then
+      seen[base] = true
+      local f = io.open(base .. "/agent_config.txt", "r")
+      if f then
+        local content = f:read("*a")
+        f:close()
+        local ok, data = pcall(ser.unserialize, content)
+        if ok and type(data) == "table" and next(data) ~= nil then
+          return data
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- 3 字段合并规则: 非空答案胜出; 空答案继承旧值; 无旧值走默认。
+-- 其余字段（mem_exec_min_free/remote_url/remote_token/data_dir/…）
+-- 原样继承。纯函数——first_run 调用，单测直接打。
+local function merge_setup(prev, api_key, model, api_url)
+  local config = {}
+  if type(prev) == "table" then
+    for k, v in pairs(prev) do config[k] = v end
+  end
+  if type(api_key) == "string" and api_key ~= "" then
+    config.api_key = api_key
+  end
+  if type(config.api_key) ~= "string" then config.api_key = "" end
+  if type(model) == "string" and model ~= "" then config.model = model end
+  if type(config.model) ~= "string" or config.model == "" then
+    config.model = "deepseek-v4-flash-free"
+  end
+  if type(api_url) == "string" and api_url ~= "" then
+    config.api_url = api_url
+  end
+  if type(config.api_url) ~= "string" or config.api_url == "" then
+    config.api_url = "https://opencode.ai/zen/v1/chat/completions"
+  end
+  return config
+end
+
 local function first_run()
   print("OC Agent - First Run Setup")
   io.write("API Key (empty for free OpenCode Zen model, or any OpenAI-compatible key): ")
   local api_key = io.read():gsub("\n", "")
   io.write("Model [deepseek-v4-flash-free]: ")
   local model = io.read():gsub("\n", "")
-  if model == "" then model = "deepseek-v4-flash-free" end
   io.write("API URL [https://opencode.ai/zen/v1/chat/completions]: ")
   local api_url = io.read():gsub("\n", "")
-  if api_url == "" then api_url = "https://opencode.ai/zen/v1/chat/completions" end
-
-  local config = {api_key = api_key, model = model, api_url = api_url}
+  -- v0.3.125r6: 继承现存配置（此前无条件 3 字段覆盖——实证坑 r5）
+  local prev = find_existing_config()
+  if prev then
+    print("Found existing config — merging (existing fields preserved)")
+  end
+  local config = merge_setup(prev, api_key, model, api_url)
   save(config)
   print("Configuration saved to " .. config_path)
   return config
@@ -206,4 +271,9 @@ return {
   -- 内存自适应缩放系数（totalMemory/2MB）: session.lua/init.lua 硬常量
   -- 同步缩放（MAX_HISTORY/MAX_HISTORY_BYTES/MAX_LOAD_HISTORY 等）
   mem_scale = MEM_SCALE,
+  -- v0.3.125r6: 测试钩子（_TEST_MODE 才暴露）
+  _internal = _TEST_MODE and {
+    find_existing_config = find_existing_config,
+    merge_setup = merge_setup,
+  } or nil,
 }
