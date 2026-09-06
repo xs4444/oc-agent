@@ -327,7 +327,12 @@ local function exec(name, args, deps)
       end
       local fw = io.open(args.path, "w")
       if not fw then error("cannot write: " .. args.path) end
-      fw:write(newContent)
+      -- v0.3.125r7: 检查写返回值——真机实证容量受限盘（GTNH fork /tmp=64KB
+      -- tmpfs, application.conf tmpSize:64）写满时 f:write 返回 (nil,
+      -- "not enough space") 不抛错，不检查则谎报 "Replaced/Written to"
+      -- 静默丢数据。
+      local wok, werr = fw:write(newContent)
+      if not wok then error("write failed: " .. tostring(werr)) end
       fw:close()
       return "Replaced " .. (args.replace_all and count or 1) .. " occurrence(s) in " .. args.path
     end)
@@ -337,7 +342,8 @@ local function exec(name, args, deps)
     local ok, result = pcall(function()
       local f = io.open(args.path, "a")
       if not f then error("cannot open for append: " .. args.path) end
-      f:write(args.content or "")
+      local wok, werr = f:write(args.content or "")
+      if not wok then error("write failed: " .. tostring(werr)) end
       f:close()
       return "Appended " .. (#(args.content or "") ) .. " bytes to " .. args.path
     end)
@@ -347,7 +353,8 @@ local function exec(name, args, deps)
     local ok, result = pcall(function()
       local f = io.open(args.path, "w")
       if not f then error("cannot open for writing: " .. args.path) end
-      f:write(args.content)
+      local wok, werr = f:write(args.content)
+      if not wok then error("write failed: " .. tostring(werr)) end
       f:close()
       return "Written to " .. args.path
     end)

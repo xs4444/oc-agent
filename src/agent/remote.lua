@@ -428,6 +428,11 @@ local function execute_op(cmd)
     end
     local ok_i, inet = pcall(require, "internet")
     if ok_i and type(inet) == "table" then injected.internet = inet end
+    -- v0.3.125r7: component 同形（守护线程上下文无 component 全局，实证
+    -- "attempt to index a nil value (local 'comp')"）——容量查询
+    -- (fs.spaceTotal/spaceUsed)、组件调试都要用
+    local ok_k, komp = pcall(require, "component")
+    if ok_k and type(komp) == "table" then injected.component = komp end
     local script_env = setmetatable(injected, {__index = _G})
     local f, lerr = loadfn(args.code, "remote-script", nil, script_env)
     if not f then
