@@ -17,12 +17,12 @@
     "tools/compact.lua": 3277,
     "tools/file.lua": 16361,
     "tools/question.lua": 2059,
-    "tools/search.lua": 12496,
+    "tools/search.lua": 12566,
     "tools/shell.lua": 7347,
     "tools/subagent.lua": 9228,
     "tui.lua": 101295,
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-07T0129"
+  "version": "2026-09-07T0132"
 }
