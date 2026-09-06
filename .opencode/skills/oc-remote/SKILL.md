@@ -61,8 +61,13 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
   /mnt/bb7/agent/**，入口 agent.lua ~119KB）、`/mnt/9ab` 2MB 41%；
   **`/tmp` 仅 64KB tmpfs**（fork `application.conf:918 tmpSize: 64`）——
   大文件写 /home 或 /mnt，别写 /tmp
-- **agent 部署=多文件树**（非单文件）：改代码只需覆盖对应文件（tools/file.lua、
-  remote.lua 等单个都 <100KB，write op 直达），然后用户游戏内重启 agent
+- **agent 部署=多文件树**（非单文件）：改代码覆盖对应文件，然后用户游戏内重启 agent。
+  上传法（**勿用 write op**——运行中 agent 内存里的 json 可能仍是 %c bug 旧版，
+  含 0xB1 字节的长串会被静默损坏）：用 **lua op 长字符串直写**（code 字段
+  decode 透明，r7b 实证）：`local f=io.open(P,"w") assert(f) f:write([==[内容]==]) f:close()`
+  （内容含 `]==]` 时升级定界符）；**>100KB 线上限制的文件分块**：第 1 块 "w" 模式
+  + 后续 "a" 追加（init.lua 119KB=3 块实证；Python 按 str 字符切分，多字节字符使
+  字符数<字节数，拼接完整即可）——部署后一律读回 n/sum 校验
 - LLM=用户自建 vLLM 端点（`<llm-endpoint>`，Qwen3.8-27B-INT4，
   ctx 128K）——与远控通道不同端口互不影响
 - 护栏空闲内存拒绝消息是中文：`空闲内存 X < NB（shell 执行护栏）`
