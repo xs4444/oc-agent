@@ -1,11 +1,11 @@
 {
   "files": {
-    "chat.lua": 20467,
+    "chat.lua": 20578,
     "config.lua": 13391,
     "debug.lua": 16478,
     "execute.lua": 3404,
-    "http.lua": 9872,
-    "init.lua": 119410,
+    "http.lua": 13201,
+    "init.lua": 119830,
     "interrupt.lua": 4297,
     "json.lua": 10581,
     "patch.lua": 6458,
@@ -20,9 +20,9 @@
     "tools/search.lua": 12566,
     "tools/shell.lua": 7347,
     "tools/subagent.lua": 9228,
-    "tui.lua": 101295,
+    "tui.lua": 101605,
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-07T0132"
+  "version": "2026-09-07T0345"
 }

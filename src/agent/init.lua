@@ -153,7 +153,7 @@ DEPS.rebuild_current = nil
 --               onAssistantText → assistant 输出走角色色，避免与日志
 --               一样渲染成灰色——历史记录与实时输出视觉一致）。
 local UI_INPUT = nil
-local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil}
+local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil, onWait = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -1618,6 +1618,10 @@ local function process_exchange(messages, config, user_input, persist, session, 
       on_retry = function(attempt, code, err, wait)
         if UI_HOOKS.onRetry then UI_HOOKS.onRetry(attempt, code, err, wait) end
       end,
+      -- v0.3.126r1: 读取期间心跳 → 状态栏 "Thinking... +Ns" 计时不冻结
+      on_wait = function(elapsed)
+        if UI_HOOKS.onWait then UI_HOOKS.onWait(elapsed) end
+      end,
     })
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
@@ -2314,6 +2318,9 @@ local function main(config, ...)
       -- （attempt/code/err/wait 来自 http_post 退避前回调——状态栏不再是
       -- 无限 thking, 用户能看到"在重试、第几次、等多久"）
       UI_HOOKS.onChatStart = function() ui.setStatus("Thinking...") end
+      -- v0.3.126r1: 请求读取期间（无 chunk prefill）状态栏耗时心跳——
+      -- tickStatus 重绘不重置计时（区别于 setStatus）
+      UI_HOOKS.onWait = function() ui.tickStatus() end
       UI_HOOKS.onRetry = function(attempt, code, err, wait)
         local why
         if code then
