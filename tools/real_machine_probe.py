@@ -42,12 +42,13 @@ f:close()
 print("probe-id done")
 '''
 
+# OC Lua 环境无 collectgarbage 全局（GC 由宿主管理: Java 常开/ocvm
+# client.cfg allowGC）——真机实测 p12b 曾因此 FAIL，勿调用。
 STRESS_SCRIPT = '''local t = {}
 for i = 1, 12000 do t[i] = string.rep("x", 32) end  -- ~400KB
 local f = io.open("/tmp/rp_stress.txt", "w")
 f:write("stress-ok n=" .. #t .. "\\n")
 f:close()
-collectgarbage("collect")
 print("probe-stress done")
 '''
 
