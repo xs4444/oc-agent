@@ -1,6 +1,7 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 18 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗）。
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 21 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗/
+LLM 无 chunk 挂起/OC internet 4xx 异常语义）。
 ---
 
 # OC 真机远程控制（oc-remote）
@@ -161,6 +162,30 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
     （上游默认 false→长跑 OOM，改后 grep 复核）；`maxTcpConnections=16`；
     二进制不可 relocate（只在 `~/oc-test/ocvm` 原地跑，见 patches/README.md）；
     盘目录复用固定 UUID（tmp_t/client.cfg 存在时非每 boot 新盘）；挂载短名=`ls /mnt` 查。
+ 19. **LLM 请求无 chunk 挂起（v0.3.126r1 前真 bug，commit 8b1bfb9 已修）**：vLLM 冷
+     prefill 长时间无首 chunk 时，旧 http.lua 的 interrupt/deadline 检查只在 chunk
+     循环体内执行（chunk 到达才跑）→ `for chunk in handle` 无限挂起 → 120s 超时
+     失效 + Ctrl+C 无法终止 + TUI 定格 "thinking...+0s"（重绘只在主循环跑）。
+     源码根因：OpenOS 迭代器无数据等待=`os.sleep(0)`（loot/openos/lib/internet.lua
+     :44-59 __call，即 interrupt 补丁版——FLAG 被设置但旧代码无 chunk 时永不 poll）；
+     Java read() 轮询后台 ConcurrentLinkedQueue（InternetCard.scala:432，threadPool
+     reader 填）数据独立于机器事件队列。修复：chunk 循环移入 thread.create 子线程，
+     主循环 os.sleep(0.2) 切片检查 interrupt/deadline→t:kill+handle:close()
+     （释放连接槽）；on_wait ~1/s 心跳→TUI tickStatus 让 +Ns 继续滚动。真机实证：
+     预置 FLAG→interrupted @0.10s；强制超时→"http read timeout after 3s"×6 重试
+     +预算耗尽、后续请求干净。卡住回合的恢复=游戏内重启 OC 电脑。
+ 20. **OC internet 组件把所有 4xx/5xx 转异常**（getInputStream 二调 re-throw，
+     InternetCard.scala）：404→`FileNotFoundException(url)`=**错误消息是裸 URL**，
+     其他→"Server returned HTTP response code: NNN for URL"。**响应码永不传给 Lua**
+     ——agent 的 429/5xx 重试实际全走 err 字符串路径，code 检查是死代码。排查
+     "连接失败"先想 404/429/5xx 而非真断网；vLLM 存活检查 POST /v1/models→405
+     =活着（404 裸 URL=模型名不匹配：探针实证 vLLM 服务 model=Qwen3.8-27B，config
+     里 Qwen3.8-27B-INT4-AWQ-GPTQ 名字 404——曾误判为通道问题）。
+ 21. **上传定界符 level-0 `--[[` 不可靠**：长字符串直写用 `--[[` 时实测一次远端
+     内容开头多出 1 个 `[`（0x5B，+1 字节 MISMATCH），另一脚本 parse 失败
+     （"unexpected symbol near 'local'"，与注释词法歧义相关）；`[==[` 多次上传
+     字节级一致。**规则：远控上传一律 `[==[` 及以上**，部署后读回 n/sum/head16
+     校验缺一不可。
 
 ## 真机部署/恢复配方
 
@@ -177,7 +202,13 @@ lua update.lua v0.3.125          -- 升级（走 tag；回滚=v0.3.124）
 
 ## 版本锚定
 
-通道协议 v0.3.125r7（r2b/r3/r4/r5/r6/r6b/r6d/r7 全含：看门狗/deadline 注入/结构化 is_err/
-fetch 分页 64KB 分块 + 256KB 封顶/report 重试/413/400 多行拒收/429 队列满/
-lost 判定/ensure_ascii=False/HTTP/1.1）。agent.lua 单文件构建
-（scripts/build_single.lua，21 preload）；发版走 Clash 7897 代理 push + tag。
+通道协议 v0.3.126r1（r2b/r3/r4/r5/r6/r6b/r6d/r7/r7b/web/无chunk防护 全含：看门狗/
+deadline 注入/结构化 is_err/fetch 分页 64KB 分块 + 256KB 封顶/report 重试/413/
+400 多行拒收/429 队列满/lost 判定/ensure_ascii=False/HTTP/1.1/写失败检查 r7/
+json %c 显式类 r7b/web_search Bing+web_fetch/LLM 无 chunk 挂起防护 8b1bfb9）。
+agent.lua 单文件构建（scripts/build_single.lua，21 preload）；发版走 Clash 7897
+代理 push + tag。
+
+**⚠️ 远端 tag 仍是 v0.3.125（不含 r7/r7b/web 工具/8b1bfb9 修复）**——真机跑的是
+手动部署的多文件树（/mnt/bb7/agent/，与 master 逐字节同步）；再跑 `update.lua`
+会用 tag 载荷覆盖并**回滚**。新 tag v0.3.126 待用户发话。
