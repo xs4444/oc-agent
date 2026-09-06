@@ -80,6 +80,13 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
   （worldtimeapi/httpbin 连接重置、time.is TLS 握手失败）、国内端点 TCP 超时
   （time1.cloud.tencent.com）、个别域名 DNS 失败。`os.date(fmt, epoch)` 的第二参数
   是**真 UNIX 时间戳格式化器**（1780000000→2026-05-28 精确）——拿到 epoch 可本地格式化
+- **`head` 只认 `--lines=N`**：`head -40` 被 shell.parse 拆成短选项 {4,0}→usage 分支
+  `print()` 写 TTY（游戏内屏幕）+`os.exit(1)`→管道捕获为空 "(no output)"（坑 17 放大器）。
+  真机实证：`ls X` 单独 56 行全捕获、`ls X | head -40` 空、`ls X | head --lines=40` 正常。
+  游戏内 agent 曾把此现象误诊为"ls 输出异常"——管道命令空输出先查**下游**命令。
+- **`grep` 是 Wobbo 移植=Lua pattern 非 POSIX**（源码 bin/grep.lua 首行自述）：
+  无 `\|` 交替、无 `-E`（"unexpected option: E"）；支持 -F -w -x -i -s -v -n -r
+  -l -L -H -h -o -q -c --max-count=N --file --label；要交替就跑多次 grep 或 lua 脚本
 - **`man` 在非 TTY 下不分页**（检测 io.output().tty 后全量输出）——exec 里安全；
   59 条 man 页在 /usr/man（34KB）。`ps` 给完整线程树（init→agent→守护线程→
   pipe_handler→当前命令，诊断用）；`df`/`lshw`/`du`/`tree`/`grep -r`（Wobbo 移植）
