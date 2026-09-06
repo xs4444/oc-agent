@@ -1,6 +1,6 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 12 坑清单（含磁盘图/世界 ticking/容量写满语义）。
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 16 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗）。
 ---
 
 # OC 真机远程控制（oc-remote）
@@ -69,17 +69,31 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
 - 错误判定=结构化 is_err（v0.3.125r3+：工具层直接返回布尔，`^Error` 前缀仅回退）——
   合法输出含 "Error:" 不误判
 - `update.lua` 升级后**必须重启 agent**（旧进程不带新代码，护栏文案可暴露版本）
+- **硬件清单**（components 实证）：eeprom、internet×1、keyboard/gpu/screen/computer、
+  filesystem×5、disk_drive×1、**modem×2**；当前**无 GT 组件挂载**（BEC/LSC/energy
+  驱动在模组里但没接硬件——接上后 agent 可直接 component.invoke 操作 GT 机器）
+- **`date` = 游戏内时间**（MC 世界钟，实测 1976-02-14），不是真实时间——
+  模型要用 date 查"现在几点"会拿到游戏钟；真实时间无 OC 侧通道
+- **`man` 在非 TTY 下不分页**（检测 io.output().tty 后全量输出）——exec 里安全；
+  59 条 man 页在 /usr/man（34KB）。`ps` 给完整线程树（init→agent→守护线程→
+  pipe_handler→当前命令，诊断用）；`df`/`lshw`/`du`/`tree`/`grep -r`（Wobbo 移植）
+  真机全可用
+- **/home 有用户历史调试残留 ~1MB**（diag1-6.lua/.out、e2e、fetch_wiki、gist_list、
+  exec_out_*、beemaster/ 279KB=Forestry 蜜蜂自动化套件含 nbt/zzlib 库）——
+  非本 agent 产物，只报告勿删；`/` 盘已用 54%（2.1M/4M）
 
 ## 坑（全部实证过）
 
 1. **同 token 双守护抢队列**：服务器单 token 单队列，两守护同 token 时命令随机被任一抢走。
    同时在线=一机一 token，或先 `/remote off` 另一台。测试 VM 惯例：真机调试期守护 OFF。
 2. **OC 协作式调度**：lua op 里无 `os.sleep` 的紧循环（`while true do end`）**冻结整台
-   机器**（timer/轮询全停，唯一恢复=重启 VM）。lua op 看门狗只在 sleep 点生效
+   机器**（ocvm：timer/轮询全停，唯一恢复=重启 VM）。lua op 看门狗只在 sleep 点生效
    （deadline 注入：sleep 提前终止报 "deadline exceeded"）。远程派 lua 前确认脚本有 sleep。
    **注意 lua timeout=t 实际 t+30s 才杀**（deadline=now+min(t,600)+30，+30 是 exec
    兜底余量对 lua 属语义缺陷；真机实证 timeout=3 → 33.9s 报 "deadline exceeded after
-   33s"）。
+   33s"）。**真机差异**：紧循环不会冻到永远——宿主 CPU 看门狗 ~5s 杀进程（见坑 13）；
+   但 lua op 的脚本跑在**守护线程内**，被杀≈守护进程死=通道掉线直到用户重启 agent
+   （未实测，按最坏打算；exec 路径的子进程被杀无此风险）。
 11. **世界 ticking=通道命脉**：玩家下线/走远/区块卸载→计算机停转→守护**静默停轮询**
     （真机实证一次 ~12 分钟空白），区块重载后自动恢复。`/status` 的 online 在
     last_poll_age>45s 才翻 false；离线期间命令滞留队列（≤16），恢复后 FIFO 执行。
@@ -88,6 +102,25 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
     **不抛错**；write_file/append_file/edit_file 原不检查返回值→谎报 "Written to"
     静默丢数据（90KB→0 字节实证）。r7 已修（三写点检查返回值）；未升级版本上
     大文件写后**必须回读校验**。
+ 13. **宿主 CPU 看门狗（真机特有，ocvm 无）**：Lua 进程**不让出调度器 ~4-5s**（世界
+    时间）→ 宿主**静默杀进程**（无 Lua 错误、pcall 抓不到、文件写到一半即止）。
+    实证边界：2s 循环存活；纯算术 120M@3.8s 存活、150M@4.7s 被杀；50×200KB gsub 循环
+    中途死。**I/O 密集安全**（fs 组件读=让出点：grep -rc "" /home 扫 1.7MB 16.6s 完成
+    无杀无冻结）。杀进程后**世界再卡 ~10s**（tick 停摆、事件不流动：popen EOF 送不到、
+    守护停轮询、整个 exec 链延迟——4.5s 死的脚本 wall 17s 才回结果），卡完自动恢复
+    （机器/守护存活，期间滞留命令 FIFO 补执行）。规则：CPU 密集脚本每 ≤4s 插
+    `os.sleep(0)` 或拆分；长命令优先 I/O 密集形态。
+ 14. **`luac`/`luaj` 是编译器不是解释器**：`luaj/luac file.lua` 编译字节码后退出、
+    **不执行脚本**（/usr/bin 不存在，三命令=OC 宿主内建，which 搜 PATH 搜不到）。
+    唯一的解释器是 `lua`（bin/lua.lua wrapper，pcall 同进程跑脚本）。对照实验若
+    "多个解释器结果一致"，先查输出文件 mtime——很可能读到的是第一个运行留下的
+    陈旧文件。
+ 15. **exec 超时杀丢部分输出**（r7 候选）：被 shell_execute 超时杀时，超时消息只带
+    命令名，管道已捕获的部分输出被丢弃（dmesg 实证："Press 'Ctrl-C' to exit" 前言被
+    捕获但未出现在结果里）。交互式命令（dmesg/edit/less/裸 lua REPL）要么带超时
+    预期丢输出，要么别用。
+ 16. **`which a; which b` 链在第一个失败处 return**（which.lua `return 1`）——
+    批量 which 要分开跑。
 3. **`/exit` 时守护活跃→冻结**（ocvm 非确定复现）：退出前 `/remote off` 并确认 stopped。
 4. **exec 多行被拒**（服务器 400）：换行拍平成空格不是两条命令；用 `&&`/`;`。
 5. **413 边界**：命令线上 JSON >100000 字节拒收；write content 有效上限 ≈99.9KB
