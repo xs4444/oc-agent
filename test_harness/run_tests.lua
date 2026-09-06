@@ -3073,7 +3073,7 @@ do
   if type(H) == "table" then
     test("search: urlencode 空格", H.urlencode("a b c") == "a%20b%20c", H.urlencode("a b c"))
     test("search: urlencode 中文逐字节", H.urlencode("\229\177\130") == "%E5%B1%82", H.urlencode("\229\177\130"))
-    test("search: decode_entities 命名", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;") == "&<>\" ", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;"))
+    test("search: decode_entities 命名", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;&ensp;") == "&<>\" \226\128\130", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;&ensp;"))
     test("search: decode_entities 数字", H.decode_entities("&#39;&#65;") == "'A", H.decode_entities("&#39;&#65;"))
     test("search: decode_entities 未知保留", H.decode_entities("&nope;") == "&nope;", H.decode_entities("&nope;"))
     test("search: utf8_char 3 字节", H.utf8_char(0x4E2D) == "\228\184\173", H.utf8_char(0x4E2D))
