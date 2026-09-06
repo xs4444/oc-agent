@@ -150,6 +150,38 @@ do
   end
 end
 
+-- v0.3.125r7: 长 CJK 字符串 encode 必须字节透明（raw UTF-8，无 \u 膨胀）。
+-- 背景: 真机 GTNH fork 原生 C Lua 的 %c 类对 ≥~450B 字符串的 0xB1 高字节
+-- 误判为控制字符（B1→\u00b1→decode 成 C2 B1，写文件静默损坏，实证
+-- 400B 干净/500B 起坏）。改用显式类 [\\\"%z\1-\31\127] 后，长 CJK 必须
+-- 原样透传（encode 长度 = 引号+原长，decode 往返恒等）。
+do
+  local long_cjk = string.rep("层不工具链测试。", 300)  -- 7200B，含多个 B1
+  local enc = json.encode(long_cjk)
+  if #enc == 2 + #long_cjk then
+    pass = pass + 1; print("  ✓ json long CJK raw passthrough (" .. #enc .. "B)")
+  else
+    fail = fail + 1; print("  ✗ json long CJK raw passthrough: enc len "
+      .. #enc .. " (expect " .. (2 + #long_cjk) .. ")")
+  end
+  local back = json.decode(enc)
+  if back == long_cjk then
+    pass = pass + 1; print("  ✓ json long CJK roundtrip identity")
+  else
+    fail = fail + 1; print("  ✗ json long CJK roundtrip identity: len "
+      .. tostring(#back))
+  end
+  -- 显式类对低控制字符的转义集合与旧 %c 一致（抽查 \1/\9/\127）
+  local ctrl2 = string.char(1) .. "\t" .. string.char(127)
+  local enc2 = json.encode(ctrl2)
+  if enc2 == '"\\u0001\\t\\u007f"' then
+    pass = pass + 1; print("  ✓ json explicit class escapes low ctrl identically")
+  else
+    fail = fail + 1; print("  ✗ json explicit class escapes low ctrl identically: "
+      .. tostring(enc2))
+  end
+end
+
 -- Arrays
 test_roundtrip("empty array", {})
 test_roundtrip("number array", {1, 2, 3})

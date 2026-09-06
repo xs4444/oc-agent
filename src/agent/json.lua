@@ -43,9 +43,16 @@ local function json_encode_to(out, val)
     end
   elseif t == "string" then
     -- 无转义字符时 gsub 返回原字符串引用（零复制）——直接进缓冲；
-    -- 引号/反斜杠/控制字符才产生转义副本（\u00XX 转义规则不变）
+    -- 引号/反斜杠/控制字符才产生转义副本（\u00XX 转义规则不变）。
+    -- v0.3.125r7: 控制字符用显式范围 %z\1-\31\127 而**不用 %c 类**——
+    -- 真机 GTNH fork 原生 C Lua 的 %c 类对长串（≥~450B）高字节误判
+    -- （0xB1 被当控制字符，实证: 9KB 中文 encode 后每个 B1 变 \u00b1，
+    -- decode 还原成 C2 B1，写文件静默损坏；短串/纯 %c 小字节不受影响，
+    -- 400B 干净 500B 起坏）。显式类语义对低控制字符完全一致（实证
+    -- \1/\9/\127 转义集合相同），高字节原样透传（RFC 8259 合法 raw
+    -- UTF-8）。
     out[#out + 1] = '"'
-    out[#out + 1] = val:gsub("[\\\"%c]", function(c)
+    out[#out + 1] = val:gsub("[\\\"%z\1-\31\127]", function(c)
       local esc = ESCAPES[c]
       if esc then return esc end
       return string.format("\\u%04x", c:byte())

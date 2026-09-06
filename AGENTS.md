@@ -17,3 +17,7 @@
 
 - clone 参考仓库遇到 IP 封禁（429/blocked）时，**不要自行寻找镜像或代理绕过——直接询问用户**。用户可手动下载源码放入 `repos/`（例：`repos/dnkl__foot` 即用户手动提供的 foot 源码，Codeberg 封禁后由用户下载）。
 - repos/ 是经典终端参考源码库（tmux/vim/mintty/opencomputers/foot 等），勘察时先看 repos/ 是否已有。
+
+## Real-machine deploys (真机部署同步)
+
+- **Any file you push to the real machine must also be committed to this repo — `update.lua` overwrites uncommitted changes on the next tag update.**
