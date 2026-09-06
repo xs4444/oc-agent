@@ -254,6 +254,35 @@ for i = 1, 10 do ml[i] = "line " .. i end
 test_tool("write multi-line", "write_file", json.encode({path=mpath, content=table.concat(ml, "\n")}),
   function(r) return r:find("Written") ~= nil end)
 
+-- v0.3.125r7: 真机实证（GTNH fork /tmp=64KB tmpfs, application.conf tmpSize:64）
+-- 容量写满时 f:write 返回 (nil, "not enough space") 不抛错——三个写点必须
+-- 检查返回值，否则谎报 "Written to"/"Appended"/"Replaced" 静默丢数据
+do
+  local real_open = io.open
+  io.open = function(path, mode)
+    if mode == "w" or mode == "a" then
+      return {
+        write = function() return nil, "not enough space" end,
+        close = function() return true end,
+      }
+    end
+    return real_open(path, mode)
+  end
+  test_tool("write_file 写失败→Error(不谎报成功)", "write_file",
+    json.encode({path=fpath, content="x"}),
+    function(r) return r:find("write failed: not enough space") ~= nil end)
+  test_tool("append_file 写失败→Error", "append_file",
+    json.encode({path=fpath, content="x"}),
+    function(r) return r:find("write failed: not enough space") ~= nil end)
+  test_tool("edit_file 写失败→Error", "edit_file",
+    json.encode({path=mpath, old_string="line 2", new_string="LINE 2"}),
+    function(r) return r:find("write failed") ~= nil end)
+  io.open = real_open
+  test_tool("write_file 恢复后正常", "write_file",
+    json.encode({path=fpath, content="test content 123"}),
+    function(r) return r:find("Written") ~= nil end)
+end
+
 test_tool("read_file offset", "read_file", json.encode({path=mpath, offset=3}),
   function(r) return r:find("^3%. line 3") ~= nil and r:find("10%. line 10") ~= nil and r:find("line 2") == nil end)
 
