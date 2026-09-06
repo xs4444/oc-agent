@@ -189,16 +189,15 @@ CASES = [
      ("observe",)),
     ("list_many50", "list", {"path": "/tmp/many"},
      ("ok", r"f50\.txt")),
-    # ── v0.3.125r6 守护侧硬帽看门狗 ──
+    # ── v0.3.125r6b 守护侧硬帽看门狗（deadline 注入版）──
     ("lua_watchdog_kill", "lua",
      {"code": "while true do os.sleep(0) end", "timeout": 3},
-     # 坑防护: 死循环脚本必须被看门狗在 timeout+30s 硬帽内 kill 并
-     # 回传错误（真机 Java OC: 机器逐 process 拉取，守护不冻结，
-     # cap 完整生效）。ocvm 已知限制（源码实证 components/computer.cpp
-     # + system/machine.lua + thread.lua 共享 handlers 表）: 无限循环
-     # 子线程冻结父线程派发循环，Lua 层看门狗无从下手——客户端等待
-     # 超时 + 守护 100~300s 后自行恢复（恢复 ping 验证）。
-     ("watchdog", "watchdog killed")),
+     # 坑防护: 死循环脚本必须在 timeout+30s 硬帽内被 deadline error
+     # kill 并回传 err（ocvm+真机同路径: 内联执行+包装 os.sleep，
+     # 子线程方案两次实证饿死全机后废弃 r6b）。watchdog 标签首分支
+     # = ok False + 命中 "deadline exceeded"；次分支 = 冻结→恢复
+     # 兜底（若 ocvm 另有行为）。
+     ("watchdog", "deadline exceeded")),
     # ── ping 回归 ──
     ("ping", "ping", {}, ("ok", r'"os":"OpenOS')),
 ]
