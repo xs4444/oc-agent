@@ -338,7 +338,7 @@ local function test_tools()
   end
   local EXPECTED = {
     "read_file","edit_file","append_file","write_file","search_files",
-    "web_search","shell_execute","subagent_call","subagent_discover",
+    "web_search","web_fetch","shell_execute","subagent_call","subagent_discover",
     "ask_user","compact_history",
   }
   local missing = {}
@@ -347,7 +347,7 @@ local function test_tools()
     for _, n in ipairs(names) do if n == e then found = true break end end
     if not found then missing[#missing + 1] = e end
   end
-  record("tools", #missing == 0 and #names == 11,
+  record("tools", #missing == 0 and #names == 12,
     "count=" .. #names .. " missing=" .. (#missing > 0 and table.concat(missing, ",") or "none"))
 end
 

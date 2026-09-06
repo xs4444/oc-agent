@@ -1,28 +1,28 @@
 {
   "files": {
-    "chat.lua": 19488,
+    "chat.lua": 20467,
     "config.lua": 13391,
     "debug.lua": 16478,
     "execute.lua": 3404,
     "http.lua": 9872,
-    "init.lua": 119335,
+    "init.lua": 119410,
     "interrupt.lua": 4297,
-    "json.lua": 10015,
+    "json.lua": 10581,
     "patch.lua": 6458,
-    "remote.lua": 37807,
-    "selftest.lua": 19500,
+    "remote.lua": 38151,
+    "selftest.lua": 19512,
     "session.lua": 31521,
     "subagent.lua": 11846,
     "tools.lua": 5913,
     "tools/compact.lua": 3277,
-    "tools/file.lua": 15821,
+    "tools/file.lua": 16361,
     "tools/question.lua": 2059,
-    "tools/search.lua": 4566,
+    "tools/search.lua": 12496,
     "tools/shell.lua": 7347,
     "tools/subagent.lua": 9228,
     "tui.lua": 101295,
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-06T1246"
+  "version": "2026-09-07T0129"
 }

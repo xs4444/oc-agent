@@ -448,7 +448,7 @@ local function handle_command(cmd, config, messages)
       if config.tavily_key then
         print("Tavily key: " .. config.tavily_key:sub(1, 8) .. "...")
       else
-        print("No Tavily key set. web_search uses Hacker News (keyless). Usage: /tavily <key>")
+        print("No Tavily key set. web_search uses Bing (keyless, general + Chinese), Hacker News as last resort. Usage: /tavily <key>")
       end
     end
   elseif command == "/url" then
@@ -1923,7 +1923,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
             local KEY_FIELD = {
               read_file="path", write_file="path", edit_file="path", append_file="path",
               search_files="pattern", shell_execute="command",
-              web_search="query", subagent_call="task",
+              web_search="query", web_fetch="url", subagent_call="task",
             }
             local param_str = ""
             local kf = KEY_FIELD[tool_name]
@@ -2127,7 +2127,7 @@ local function main(config, ...)
                 local READONLY = {
                   read_file = true,
                   search_files = true,
-                  web_search = true, subagent_discover = true,
+                  web_search = true, web_fetch = true, subagent_discover = true,
                 }
                 local FILE_PROXY_TOOLS = {
                   read_file = true,
