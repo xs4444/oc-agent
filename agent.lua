@@ -890,32 +890,58 @@ local function execute_op(cmd)
     -- 真机调试跑任意脚本不必拼 exec 命令串）。print 进 TUI（与 exec
     -- `lua script` 同一泄漏行为），return 值即结果。信任边界同 exec
     -- （token 保护通道），不加沙箱。
-    -- v0.3.125r6: 硬帽看门狗——r5 原版内联执行无超时，
-    -- `while true do end` 式脚本永久卡死守护（RemoteOC 砖机同形实证）。
-    -- timeout 参数（默认 60，硬帽 600）+ 余量。
+    -- v0.3.125r6b: 看门狗从子线程+kill 改为「内联执行+deadline 注入」。
+    -- 子线程方案在 ocvm 两次实证失败: ①waitForAll 长超时不可靠（守护
+    -- 卡 100s+）②os.sleep 自旋版仍卡——thread.create 子线程跑
+    -- `while true do os.sleep(0) end` 紧循环时 ocvm 调度器饿死全部
+    -- 其他线程（守护+TUI 同冻结，t.kill 无机会生效，TUI mem 行 3s 不
+    -- 刷新实证）。OC 协作式调度下 sleepless 紧循环本就不可杀
+    -- （平台约束，RemoteOC 砖机同形），唯一可靠锚点是脚本自己的
+    -- sleep 调用 → 包装注入的 os.sleep/computer.sleep，sleep 内精确
+    -- 到期即 error 杀（无超调）。无 sleep 的脚本=冻结机器（文档化，
+    -- 与 exec 子进程 C++ 层 kill 不同，lua 脚本跑在守护线程里）。
     local cap = watchdog_cap(args.timeout)
-    return run_guarded(function()
-      local loadfn = load or loadstring  -- Lua 5.2+ / 5.1 兼容
-      -- v0.3.125r6: 注入 computer 全局——OpenOS 脚本惯例可
-      -- require("computer")，但调试脚本常直接写 computer.uptime()
-      -- （TUI/shell 环境有 computer 全局）；守护线程上下文无此全局
-      -- （实证: attempt to index a nil value (global 'computer')）。
-      -- 信任边界不变（computer 组件对任何 OC 程序本就可用）。
-      local ok_c, comp = pcall(require, "computer")
-      local script_env = setmetatable(
-        (ok_c and type(comp) == "table") and {computer = comp} or {},
-        {__index = _G})
-      local f, lerr = loadfn(args.code, "remote-script", nil, script_env)
-      if not f then
-        return "lua: load failed: " .. tostring(lerr), true
+    local deadline = now() + cap
+    local function kill_at_deadline(s, real_sleep)
+      s = s or 0
+      local rem = deadline - now()
+      if rem < s then
+        if rem > 0 then os.sleep(rem) end
+        error("deadline exceeded after " .. cap .. "s (killed at sleep)", 0)
       end
-      local ok_r, r = pcall(f)
-      if not ok_r then
-        return "lua: " .. tostring(r), true
-      end
-      if r == nil then return "(no return value)", false end
-      return tostring(r), false
-    end, cap, "lua: timeout after " .. cap .. "s (watchdog killed the script)")
+      real_sleep(s)
+    end
+    local loadfn = load or loadstring  -- Lua 5.2+ / 5.1 兼容
+    -- v0.3.125r6: 注入常用全局——守护线程上下文无 computer/internet
+    -- 全局（实证: attempt to index a nil value (global 'computer')；
+    -- internet 同形），调试脚本直接写 computer.uptime()/
+    -- internet.request() 最顺手。信任边界不变（两模块对任何 OC
+    -- 程序本就可用）。
+    local injected = {}
+    local wos = {}
+    for k, v in pairs(os) do wos[k] = v end
+    wos.sleep = function(s) kill_at_deadline(s, os.sleep) end
+    injected.os = wos
+    local ok_c, comp = pcall(require, "computer")
+    if ok_c and type(comp) == "table" then
+      local wc = {}
+      for k, v in pairs(comp) do wc[k] = v end
+      wc.sleep = function(s) kill_at_deadline(s, function(x) comp.sleep(x) end) end
+      injected.computer = wc
+    end
+    local ok_i, inet = pcall(require, "internet")
+    if ok_i and type(inet) == "table" then injected.internet = inet end
+    local script_env = setmetatable(injected, {__index = _G})
+    local f, lerr = loadfn(args.code, "remote-script", nil, script_env)
+    if not f then
+      return "lua: load failed: " .. tostring(lerr), true
+    end
+    local ok_r, r = pcall(f)
+    if not ok_r then
+      return "lua: " .. tostring(r), true
+    end
+    if r == nil then return "(no return value)", false end
+    return tostring(r), false
   elseif op == "fetch" then
     -- v0.3.125r5: 大结果续取（report 首块 64KB + meta {rid,total,held,
     -- more}；此处按 rid+offset 取下一块，块大小 MAX_RESULT）。offset 为
