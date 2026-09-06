@@ -1,6 +1,6 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 16 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗）。
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 18 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗）。
 ---
 
 # OC 真机远程控制（oc-remote）
@@ -72,8 +72,14 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
 - **硬件清单**（components 实证）：eeprom、internet×1、keyboard/gpu/screen/computer、
   filesystem×5、disk_drive×1、**modem×2**；当前**无 GT 组件挂载**（BEC/LSC/energy
   驱动在模组里但没接硬件——接上后 agent 可直接 component.invoke 操作 GT 机器）
-- **`date` = 游戏内时间**（MC 世界钟，实测 1976-02-14），不是真实时间——
-  模型要用 date 查"现在几点"会拿到游戏钟；真实时间无 OC 侧通道
+- **`date` = 游戏内时间**（MC 世界钟，OSAPI.scala：os.time/os.date 都基于
+  machine.worldTime，1976 年那种）。**真实时间=`realtime` 命令**（仓库
+  `tools/realtime.lua`→真机 `/home/bin/realtime.lua`，PATH 默认含 /home/bin）：
+  `realtime`/`realtime -u`(UTC)，经 timeapi.io https 取宿主侧墙钟（~1.1s，
+  真机 Java TLS 对 Let's Encrypt 正常）。出口画像：Cloudflare 系被服务器出口封
+  （worldtimeapi/httpbin 连接重置、time.is TLS 握手失败）、国内端点 TCP 超时
+  （time1.cloud.tencent.com）、个别域名 DNS 失败。`os.date(fmt, epoch)` 的第二参数
+  是**真 UNIX 时间戳格式化器**（1780000000→2026-05-28 精确）——拿到 epoch 可本地格式化
 - **`man` 在非 TTY 下不分页**（检测 io.output().tty 后全量输出）——exec 里安全；
   59 条 man 页在 /usr/man（34KB）。`ps` 给完整线程树（init→agent→守护线程→
   pipe_handler→当前命令，诊断用）；`df`/`lshw`/`du`/`tree`/`grep -r`（Wobbo 移植）
@@ -121,6 +127,14 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
     预期丢输出，要么别用。
  16. **`which a; which b` 链在第一个失败处 return**（which.lua `return 1`）——
     批量 which 要分开跑。
+ 17. **`print()` 写 TTY 不写管道**（真机实证）：OpenOS 进程的 print/io.write 默认写
+     `io.output()`=机器终端（游戏内屏幕），popen 捕获管道只收 **`io.stdout`/`io.stderr`**
+     ——用户态命令脚本输出必须 `io.stdout:write(...)`（cat/echo 都是这么写的）；
+     `os.exit(1)` 不丢缓冲输出（rt2/rt3 探针实证，宿主补 "terminated" 尾巴）。
+     这也是坑 6 "lua 脚本 print 泄漏 TUI" 的根因。
+ 18. **shell.parse 把 `-u` 解析成短选项**（options.u），不是位置参数——
+     命令脚本读开关用 `local args, options = shell.parse(...)` 后查 `options.u`，
+     查 `args[1]=="-u"` 永远 nil。
 3. **`/exit` 时守护活跃→冻结**（ocvm 非确定复现）：退出前 `/remote off` 并确认 stopped。
 4. **exec 多行被拒**（服务器 400）：换行拍平成空格不是两条命令；用 `&&`/`;`。
 5. **413 边界**：命令线上 JSON >100000 字节拒收；write content 有效上限 ≈99.9KB
