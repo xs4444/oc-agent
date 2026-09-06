@@ -350,8 +350,65 @@ local MAX_RESPONSE_WAIT = 120
 -- 可调（chat() 每次请求前同步）
 local MAX_RESPONSE_BODY = 131072
 
+-- 单请求 chunk 收集（主线程/子线程共用）: interrupt/deadline/size 检查
+-- 每 chunk 执行（流式正常时按 chunk 粒度生效）。结果写入 box:
+--   box.chunks / box.timed_out / box.too_large / box.interrupted
+local function collect_chunks(handle, box)
+  -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
+  -- 建立后流可能永不结束，无超时则无限等（重试预算检查不到——预算在
+  -- once 返回后才执行）。v0.3.99: 用 patch.now()（uptime 墙钟）——
+  -- os.clock 是 CPU 时间，等待流数据期间不走 → deadline 永不触发。
+  local read_deadline = now() + MAX_RESPONSE_WAIT
+  local total = 0
+  for chunk in handle do
+    -- v0.3.86: Ctrl+C 中断——interrupt.install() 补丁的 os.sleep 检测到
+    -- interrupted 事件设标志; 每 chunk 检查, 提前终止响应读取
+    if interrupt.poll() then
+      box.interrupted = true
+      return
+    end
+    if now() >= read_deadline then
+      box.timed_out = true
+      return
+    end
+    -- 响应体累积字节检查（结构性上限）: 任何单次响应峰值不得超过
+    -- MAX_RESPONSE_BODY——超限立即返回明确 error（不静默截断，截断的
+    -- JSON 解析失败只会让错误更难诊断）。与超时 deadline 共存。
+    total = total + #chunk
+    if total > MAX_RESPONSE_BODY then
+      box.too_large = true
+      return
+    end
+    box.chunks[#box.chunks + 1] = chunk
+    -- Yield on EVERY chunk: OC's scheduler sees progress even while the
+    -- iterator waits for slow (reasoning) model responses. Otherwise the
+    -- computer crashes with "too long without yielding".
+    os.sleep(0.02)
+  end
+end
+
 -- Single request attempt. Returns code, body, err.
-local function http_post_once(url, headers, body)
+--
+-- v0.3.126r1 无 chunk 挂起防护（真机事故: vLLM 冷 prefill 长时间不产生
+-- 首 chunk——旧实现的 interrupt/deadline 检查只在 chunk 循环体内执行,
+-- `for chunk in handle` 无限等待时两者永不运行: 120s 超时失效 + Ctrl+C
+-- 的 interrupted 事件被迭代器带过滤等待丢弃（interrupt.lua:6-7）→ TUI
+-- 定格 "thinking...+0s" 且无法终止）。
+--
+-- 修复: chunk 循环移入子线程; 主线程有界等待——os.sleep(0.2) 切片
+-- （interrupt 补丁: 无过滤 event.pull, interrupted 设标志）+ 每片检查
+-- interrupt/deadline。超时/中断 → thread.kill（dead 标志, 子线程下个
+-- yield 点生效）+ handle:close()（释放连接槽——maxTcpConnections=4,
+-- 孤儿槽位持续到重启）。
+-- 安全性（真机实证依据）:
+--   1. Java internet read() 轮询后台 ConcurrentLinkedQueue
+--      （InternetCard.scala:432）——数据投递独立于机器事件队列,
+--      主线程事件泵不会饿死子线程数据。
+--   2. remote.lua read_guarded（thread.create + waitForAll）同形状,
+--      真机连跑数日健康。
+--   3. 子线程每 chunk os.sleep(0.02) yield——无紧循环调度器饿死
+--      （r6b ocvm 教训）。
+local function http_post_once(url, headers, body, on_wait)
   local internet = require("internet")
   local ok, handle = pcall(function()
     -- 3-arg form: body presence auto-selects POST (compatible with ocvm
@@ -362,61 +419,72 @@ local function http_post_once(url, headers, body)
     return nil, nil, "connection failed: " .. tostring(handle)
   end
 
-  local chunks = {}
-  local timed_out = false
-  local too_large = false
-  local interrupted = false
-  local iter_ok, iter_err = pcall(function()
-    local n = 0
-    -- 响应迭代 deadline（挂起保护）: 荒野大师 JVM internet 迭代器连接
-    -- 建立后流可能永不结束，无超时则无限等（重试预算检查不到——预算在
-    -- once 返回后才执行）。保持每 chunk os.sleep(0.02) yield——OC 调度器
-    -- 看到进展，避免 "too long without yielding" 崩溃。
-    -- v0.3.99: 用 patch.now()（uptime 墙钟）——os.clock 是 CPU 时间，
-    -- 等待流数据期间不走 → deadline 永不触发（v0.3.88 教训）。
+  local box = { chunks = {}, done = false }
+  local ok_th, thread = pcall(require, "thread")
+  if ok_th then
+    local t = thread.create(function()
+      local iter_ok, iter_err = pcall(collect_chunks, handle, box)
+      if not iter_ok then box.err = tostring(iter_err) end
+      box.done = true
+    end)
     local read_deadline = now() + MAX_RESPONSE_WAIT
-    local total = 0
-    for chunk in handle do
-      -- v0.3.86: Ctrl+C 中断——interrupt.install() 补丁的 os.sleep 检测到
-      -- interrupted 事件设标志; 每 chunk 检查, 提前终止响应读取
+    local call_start = now()
+    local last_tick = 0
+    while not box.done do
       if interrupt.poll() then
-        interrupted = true
-        return
+        interrupt.clear()
+        pcall(t.kill, t)
+        pcall(handle.close, handle)
+        return nil, nil, "interrupted"
       end
       if now() >= read_deadline then
-        timed_out = true
-        return
+        pcall(t.kill, t)
+        pcall(handle.close, handle)
+        return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
       end
-      -- 响应体累积字节检查（结构性上限）: 任何单次响应峰值不得超过
-      -- MAX_RESPONSE_BODY——超限立即返回明确 error（不静默截断，截断的
-      -- JSON 解析失败只会让错误更难诊断）。与超时 deadline 共存。
-      total = total + #chunk
-      if total > MAX_RESPONSE_BODY then
-        too_large = true
-        return
+      -- v0.3.126r1: on_wait 心跳——TUI 状态栏 "Thinking... +Ns" 在无 chunk
+      -- prefill 期间继续计时（此前 drawStatus 只在事件驱动重绘, 主循环冻结
+      -- 时 +0s 定格）。节流 ~1/s。
+      local t_now = now()
+      if on_wait and t_now - last_tick >= 1 then
+        last_tick = t_now
+        local ok_w, werr = pcall(on_wait, t_now - call_start)
       end
-      n = n + 1
-      chunks[#chunks + 1] = chunk
-      -- Yield on EVERY chunk: OC's scheduler sees progress even while the
-      -- iterator waits for slow (reasoning) model responses. Otherwise the
-      -- computer crashes with "too long without yielding".
-      os.sleep(0.02)
+      os.sleep(0.2)
     end
-  end)
-  if not iter_ok then
-    return nil, nil, "http read failed: " .. tostring(iter_err)
+    if box.err then
+      return nil, nil, "http read failed: " .. box.err
+    end
+    if box.timed_out then
+      return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
+    end
+    if box.too_large then
+      return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
+    end
+    if box.interrupted then
+      interrupt.clear()
+      return nil, nil, "interrupted"
+    end
+  else
+    -- thread 库不可用（降级环境）: 旧路径——检查在主线程按 chunk 执行。
+    -- 失去无 chunk 挂起防护（严格好于报错——保持服务）。
+    local iter_ok, iter_err = pcall(collect_chunks, handle, box)
+    if not iter_ok then
+      return nil, nil, "http read failed: " .. tostring(iter_err)
+    end
+    if box.timed_out then
+      return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
+    end
+    if box.too_large then
+      return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
+    end
+    if box.interrupted then
+      interrupt.clear()
+      return nil, nil, "interrupted"
+    end
   end
-  if timed_out then
-    return nil, nil, "http read timeout after " .. tostring(MAX_RESPONSE_WAIT) .. "s"
-  end
-  if too_large then
-    return nil, nil, "http response too large (>" .. tostring(MAX_RESPONSE_BODY) .. " bytes)"
-  end
-  if interrupted then
-    interrupt.clear()
-    return nil, nil, "interrupted"
-  end
-  local response_body = table.concat(chunks)
+
+  local response_body = table.concat(box.chunks)
 
   -- Some emulators (ocvm) fill the response asynchronously; retry briefly.
   local code
@@ -444,15 +512,17 @@ end
 -- v0.3.118: 可选第 4 参 on_retry(attempt, code, err, wait)——每轮退避前
 -- 触发（os.sleep 前）。状态栏透出"重试第 N 次/原因/退避多久"——否则
 -- 重试期间状态栏冻结在 "Thinking..."，用户看到的是无限 thking。
+-- v0.3.126r1: 可选第 5 参 on_wait(elapsed)——单次请求读取期间 ~1/s 心跳
+-- （无 chunk prefill 时状态栏 "Thinking... +Ns" 继续计时的数据源）。
 -- pcall 包裹: 回调异常不阻断重试（透出是增强，不能成为新故障源）。
-local function http_post(url, headers, body, on_retry)
+local function http_post(url, headers, body, on_retry, on_wait)
   local attempt = 0
   -- v0.3.99: patch.now() 墙钟——os.clock 是 CPU 时间，os.sleep 退避期间
   -- 不走 → 预算 deadline 永不触发（v0.3.88 教训）
   local deadline = now() + retry_budget
   while true do
     attempt = attempt + 1
-    local code, resp, err = http_post_once(url, headers, body)
+    local code, resp, err = http_post_once(url, headers, body, on_wait)
     -- v0.3.86: 用户中断——不重试，直接返回（Ctrl+C 语义: 立即停）
     if err == "interrupted" then
       return code, resp, err
@@ -2801,8 +2871,9 @@ local function chat(messages, config, opts)
 
   -- v0.3.118: opts.on_retry 透传给 http_post——重试过程状态透出
   -- （init.lua 注入 → 状态栏"重试第 N 次 (HTTP xxx) 退避 Xs"）
+  -- v0.3.126r1: opts.on_wait 透传——单次请求读取期间状态栏耗时心跳
   local code, resp, err = http_post(config.api_url or "https://opencode.ai/zen/v1/chat/completions",
-    headers, body, opts and opts.on_retry)
+    headers, body, opts and opts.on_retry, opts and opts.on_wait)
   if err then
     return {content = nil, tool_calls = nil, finish_reason = "error", error = err}
   end
@@ -4724,6 +4795,13 @@ end
 function tui.setStatus(msg)
   state.status = msg or "Ready"
   state.statusSince = now_seconds()  -- v0.3.118: 每次状态切换重新计时
+  pcall(tui.drawStatus)
+end
+
+-- v0.3.126r1: 长 LLM 等待期间重绘状态栏（"Thinking... +Ns" 的 +Ns 继续
+-- 滚动），但不重置 statusSince——区别于 setStatus（状态切换才重计）。
+-- 由 http 读取等待循环（http_post_once on_wait, ~1/s）调用。
+function tui.tickStatus()
   pcall(tui.drawStatus)
 end
 
@@ -7759,7 +7837,7 @@ DEPS.rebuild_current = nil
 --               onAssistantText → assistant 输出走角色色，避免与日志
 --               一样渲染成灰色——历史记录与实时输出视觉一致）。
 local UI_INPUT = nil
-local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil}
+local UI_HOOKS = {onToolCall = nil, onAssistantText = nil, onChatStart = nil, onRetry = nil, onWait = nil}
 
 -- ask_user: REPL 模式在 main() 里注入真实实现；subagent/无终端默认不可用。
 -- 实现读取用户输入（io.read），把答案返回给工具调用链。
@@ -9224,6 +9302,10 @@ local function process_exchange(messages, config, user_input, persist, session, 
       on_retry = function(attempt, code, err, wait)
         if UI_HOOKS.onRetry then UI_HOOKS.onRetry(attempt, code, err, wait) end
       end,
+      -- v0.3.126r1: 读取期间心跳 → 状态栏 "Thinking... +Ns" 计时不冻结
+      on_wait = function(elapsed)
+        if UI_HOOKS.onWait then UI_HOOKS.onWait(elapsed) end
+      end,
     })
     DIAG.chat_started = nil  -- chat 完成: 清除进行中标记
     DIAG.last_chat = {
@@ -9920,6 +10002,9 @@ local function main(config, ...)
       -- （attempt/code/err/wait 来自 http_post 退避前回调——状态栏不再是
       -- 无限 thking, 用户能看到"在重试、第几次、等多久"）
       UI_HOOKS.onChatStart = function() ui.setStatus("Thinking...") end
+      -- v0.3.126r1: 请求读取期间（无 chunk prefill）状态栏耗时心跳——
+      -- tickStatus 重绘不重置计时（区别于 setStatus）
+      UI_HOOKS.onWait = function() ui.tickStatus() end
       UI_HOOKS.onRetry = function(attempt, code, err, wait)
         local why
         if code then

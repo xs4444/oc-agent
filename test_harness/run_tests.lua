@@ -531,6 +531,20 @@ do
     and e_err:find("read timeout", 1, true) ~= nil,
     "err=" .. tostring(e_err))
 
+  -- 6b) v0.3.126r1 无 chunk 挂起防护: 预置中断标志 → collect_chunks
+  --      （mock thread=同步执行, 首 chunk 即检查）→ "interrupted" 且
+  --      不重试。真机的无 chunk 等待由主循环有界等待兜底（lua op 探针
+  --      实证: 子线程流式 + 主线程 patched-sleep 泵不饿死数据）。
+  local int_mod = require("agent.interrupt")
+  internet.request = function() return make_code_handle(200) end
+  int_mod.set()
+  local i_code, i_resp, i_err = http_post("https://mock/chat/completions", {}, "{}")
+  int_mod.clear()
+  internet.request = real_request
+  test("http interrupt flag → interrupted (no retry)",
+    i_err == "interrupted" and i_code == nil,
+    "err=" .. tostring(i_err) .. " code=" .. tostring(i_code))
+
   -- 7) chat() 层: 4xx 返回 error（不重试不挂起, init.lua 错误分支可见）
   internet.request = function() return make_code_handle(400, '{"error":"bad request"}') end
   local g_res = agent_test.chat({{role = "user", content = "hi"}},

@@ -451,6 +451,13 @@ function tui.setStatus(msg)
   pcall(tui.drawStatus)
 end
 
+-- v0.3.126r1: 长 LLM 等待期间重绘状态栏（"Thinking... +Ns" 的 +Ns 继续
+-- 滚动），但不重置 statusSince——区别于 setStatus（状态切换才重计）。
+-- 由 http 读取等待循环（http_post_once on_wait, ~1/s）调用。
+function tui.tickStatus()
+  pcall(tui.drawStatus)
+end
+
 -- 内容区边界（含滚动窗口高度）; scrollSafe 时整体上移一行（内容区少 1 行）。
 -- v0.3.112: 输入框自动增高 → 内容区高度 = 总高 - header(1) - status(1)
 -- - inputHeight（inputHeight=1 时与旧公式完全一致）。
