@@ -1,6 +1,6 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与坑清单。
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 12 坑清单（含磁盘图/世界 ticking/容量写满语义）。
 ---
 
 # OC 真机远程控制（oc-remote）
@@ -56,6 +56,15 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
 - 内存查询用 `computer.totalMemory()/freeMemory()`（`component.list("memory")()=0`
   两宿主皆空——memory 不在注册表）
 - 出口网络通（frp 隧道外）；中文/emoji 全链路无损
+- **磁盘图**（df 实证）：`/`=OpenOS 根盘 4MB（**/home 在此**，余 ~1.8MB）；
+  三驱动 `/mnt/857` 4MB 1%、`/mnt/bb7` 4MB 14%（**agent 多文件部署树
+  /mnt/bb7/agent/**，入口 agent.lua ~119KB）、`/mnt/9ab` 2MB 41%；
+  **`/tmp` 仅 64KB tmpfs**（fork `application.conf:918 tmpSize: 64`）——
+  大文件写 /home 或 /mnt，别写 /tmp
+- **agent 部署=多文件树**（非单文件）：改代码只需覆盖对应文件（tools/file.lua、
+  remote.lua 等单个都 <100KB，write op 直达），然后用户游戏内重启 agent
+- LLM=用户自建 vLLM 端点（`<llm-endpoint>`，Qwen3.8-27B-INT4，
+  ctx 128K）——与远控通道不同端口互不影响
 - 护栏空闲内存拒绝消息是中文：`空闲内存 X < NB（shell 执行护栏）`
 - 错误判定=结构化 is_err（v0.3.125r3+：工具层直接返回布尔，`^Error` 前缀仅回退）——
   合法输出含 "Error:" 不误判
@@ -68,6 +77,17 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
 2. **OC 协作式调度**：lua op 里无 `os.sleep` 的紧循环（`while true do end`）**冻结整台
    机器**（timer/轮询全停，唯一恢复=重启 VM）。lua op 看门狗只在 sleep 点生效
    （deadline 注入：sleep 提前终止报 "deadline exceeded"）。远程派 lua 前确认脚本有 sleep。
+   **注意 lua timeout=t 实际 t+30s 才杀**（deadline=now+min(t,600)+30，+30 是 exec
+   兜底余量对 lua 属语义缺陷；真机实证 timeout=3 → 33.9s 报 "deadline exceeded after
+   33s"）。
+11. **世界 ticking=通道命脉**：玩家下线/走远/区块卸载→计算机停转→守护**静默停轮询**
+    （真机实证一次 ~12 分钟空白），区块重载后自动恢复。`/status` 的 online 在
+    last_poll_age>45s 才翻 false；离线期间命令滞留队列（≤16），恢复后 FIFO 执行。
+12. **容量写满谎报成功=r7 前真 bug**：fork 的 Capacity 层（server/fs/Capacity.scala
+    CountingOutputHandle.write）空间不足时 f:write 返回 (nil,"not enough space")
+    **不抛错**；write_file/append_file/edit_file 原不检查返回值→谎报 "Written to"
+    静默丢数据（90KB→0 字节实证）。r7 已修（三写点检查返回值）；未升级版本上
+    大文件写后**必须回读校验**。
 3. **`/exit` 时守护活跃→冻结**（ocvm 非确定复现）：退出前 `/remote off` 并确认 stopped。
 4. **exec 多行被拒**（服务器 400）：换行拍平成空格不是两条命令；用 `&&`/`;`。
 5. **413 边界**：命令线上 JSON >100000 字节拒收；write content 有效上限 ≈99.9KB
@@ -98,7 +118,7 @@ lua update.lua v0.3.125          -- 升级（走 tag；回滚=v0.3.124）
 
 ## 版本锚定
 
-通道协议 v0.3.125（r2b/r3/r4/r5/r6/r6b/r6d 全含：看门狗/deadline 注入/结构化 is_err/
+通道协议 v0.3.125r7（r2b/r3/r4/r5/r6/r6b/r6d/r7 全含：看门狗/deadline 注入/结构化 is_err/
 fetch 分页 64KB 分块 + 256KB 封顶/report 重试/413/400 多行拒收/429 队列满/
 lost 判定/ensure_ascii=False/HTTP/1.1）。agent.lua 单文件构建
 （scripts/build_single.lua，21 preload）；发版走 Clash 7897 代理 push + tag。
