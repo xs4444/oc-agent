@@ -552,6 +552,33 @@ function mock_internet.request(url, data, headers, method)
     local body = '{"query":"' .. (data or "") .. '","results":[{"title":"Tavily Result 1","url":"https://tavily.example/1","content":"snippet one"},{"title":"Tavily Result 2","url":"https://tavily.example/2","content":"snippet two"}]}'
     return make_handle(body)
   end
+  -- Simulate Bing search results (fixture for web_search scrape path)
+  if url:match("^https://www%.bing%.com/search") then
+    local q = url:match("q=([^&]+)") or "test"
+    if q:find("force_hn_fallback") then
+      -- Unparseable page → web_search should fall through to HN Algolia
+      return make_handle('<html><body><p>no results found</p></body></html>')
+    end
+    local body = '<html><body><ol id="b_results">'
+      .. '<li class="b_algo"><h2><a href="https://example.org/a">Bing Result 1 for ' .. q .. '</a></h2><p class="b_lineclamp3">snippet one &amp; more</p></li>'
+      .. '<li class="b_algo"><h2><a href="https://example.org/b">Bing Result 2</a></h2><p>snippet two</p></li>'
+      .. '<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?u=internal">Internal Link</a></h2><p>should be filtered out</p></li>'
+      .. '</ol></body></html>'
+    return make_handle(body)
+  end
+  -- Simulate a fetchable HTML page (fixture for web_fetch HTML→text)
+  if url:match("^https://fetch%.example/") then
+    local body = '<html><head><title>Test Page</title><style>body{color:red}</style></head>'
+      .. '<body><script>var x = 1;</script><h1>Heading &amp; Title</h1>'
+      .. '<p>First paragraph with <b>bold</b> &lt;tag&gt; entity.</p>'
+      .. '<p>Second paragraph.</p><br/><p>After break</p></body></html>'
+    return make_handle(body)
+  end
+  -- Simulate a 301 redirect page (fixture for web_fetch redirect note)
+  if url:match("^https://redirect%.example/") then
+    local body = '<html><head><title>301 Moved Permanently</title></head><body><a href="https://final.example/landed">here</a></body>'
+    return make_handle(body)
+  end
   error("internet.mock: cannot handle " .. url)
 end
 

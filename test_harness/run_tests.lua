@@ -261,13 +261,27 @@ test_tool("execute_lua removed", "execute_lua", '{"code":"return 1"}',
 test_tool("unknown tool", "unknown_tool", '{}',
   function(r) return r:find("Unknown tool") ~= nil end)
 
--- web_search tests (HN Algolia fallback, no tavily key configured)
-test_tool("web_search hn", "web_search", '{"query":"gtnh"}',
-  function(r) return r:find("Result 1 for gtnh") ~= nil and r:find("example.com/1") ~= nil end)
+-- web_search tests (backend: Bing scrape by default, no tavily key configured)
+test_tool("web_search bing", "web_search", '{"query":"gtnh"}',
+  function(r) return r:find("Bing Result 1 for gtnh") ~= nil and r:find("example.org/a") ~= nil and r:find("snippet one & more") ~= nil end)
+test_tool("web_search bing filters internal links", "web_search", '{"query":"gtnh"}',
+  function(r) return r:find("bing.com/ck") == nil end)
 test_tool("web_search limit", "web_search", '{"query":"lua","limit":1}',
   function(r) return r:find("Result 1 for lua") ~= nil and not r:find("Result 2") end)
+test_tool("web_search bing→hn fallback", "web_search", '{"query":"force_hn_fallback x"}',
+  function(r) return r:find("Hacker News fallback") ~= nil and r:find("example.com/1") ~= nil end)
 test_tool("web_search empty query", "web_search", '{"query":""}',
   function(r) return r:find("query is required") ~= nil end)
+
+-- web_fetch tests (mock pages: fetch.example / redirect.example)
+test_tool("web_fetch html→text", "web_fetch", '{"url":"https://fetch.example/page"}',
+  function(r) return r:find("Heading & Title") ~= nil and r:find("First paragraph") ~= nil and r:find("After break") ~= nil and r:find("var x") == nil end)
+test_tool("web_fetch redirect note", "web_fetch", '{"url":"https://redirect.example/"}',
+  function(r) return r:find("redirected") ~= nil and r:find("final.example/landed") ~= nil end)
+test_tool("web_fetch rejects non-http", "web_fetch", '{"url":"ftp://x"}',
+  function(r) return r:find("^Error") ~= nil end)
+test_tool("web_fetch unknown host", "web_fetch", '{"url":"https://nope.mock.test/"}',
+  function(r) return r:find("fetch error") ~= nil end)
 
 -- v0.3.124: component_doc / component_invoke 工具已删（用 lua -e 调组件）
 
@@ -683,7 +697,7 @@ test("system prompt no execute_lua", sp:find("execute_lua") == nil)
 -- text_ops/component_list/component_doc/component_invoke）。
 local EXPECTED_TOOLS = {
   "read_file", "write_file", "edit_file", "append_file", "search_files",
-  "web_search", "shell_execute", "subagent_call", "subagent_discover", "ask_user",
+  "web_search", "web_fetch", "shell_execute", "subagent_call", "subagent_discover", "ask_user",
   "compact_history",
 }
 local tools_have = {}
@@ -3046,6 +3060,32 @@ do
       '{"path":"/tmp/is_err_rt.txt","content":"ok"}', deps)
     test("is_err: write_file 成功 → is_err=false",
       e8 == false and tostring(t8):find("Written to") ~= nil, tostring(t8))
+  end
+end
+
+print("")
+
+-- search 纯函数辅助（agent.tools.search 的 _internal，_TEST_MODE 暴露）
+do
+  local search_mod = require("agent.tools.search")
+  local H = search_mod._internal
+  test("search: _internal 测试钩子（_TEST_MODE）", type(H) == "table", tostring(type(H)))
+  if type(H) == "table" then
+    test("search: urlencode 空格", H.urlencode("a b c") == "a%20b%20c", H.urlencode("a b c"))
+    test("search: urlencode 中文逐字节", H.urlencode("\229\177\130") == "%E5%B1%82", H.urlencode("\229\177\130"))
+    test("search: decode_entities 命名", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;") == "&<>\" ", H.decode_entities("&amp;&lt;&gt;&quot;&nbsp;"))
+    test("search: decode_entities 数字", H.decode_entities("&#39;&#65;") == "'A", H.decode_entities("&#39;&#65;"))
+    test("search: decode_entities 未知保留", H.decode_entities("&nope;") == "&nope;", H.decode_entities("&nope;"))
+    test("search: utf8_char 3 字节", H.utf8_char(0x4E2D) == "\228\184\173", H.utf8_char(0x4E2D))
+    local t = H.html_to_text("<html><body><script>evil()</script><style>.x{}</style><h1>T &amp; T</h1><p>a<b>b</b></p><br/><p>c</p></body></html>")
+    test("search: html_to_text 去 script/style/标签",
+      t == "T & T\na b\n\nc" and t:find("evil()") == nil and t:find(".x{}") == nil, string.format("%q", t))
+    local items = H.parse_bing('<li class="b_algo"><h2><a href="https://x.org/a">T1</a></h2><p>s1</p></li><li class="b_algo"><h2><a href="https://bing.com/ck">T2</a></h2><p>s2</p></li>', 5)
+    test("search: parse_bing 提取+过滤站内链",
+      #items == 1 and items[1].title == "T1" and items[1].url == "https://x.org/a" and items[1].snippet == "s1",
+      "n=" .. tostring(#items))
+    test("search: parse_bing limit 生效",
+      #H.parse_bing('<li class="b_algo"><h2><a href="https://x.org/a">T1</a></h2><p>s</p></li><li class="b_algo"><h2><a href="https://x.org/b">T2</a></h2><p>s</p></li>', 1) == 1, "limit")
   end
 end
 
