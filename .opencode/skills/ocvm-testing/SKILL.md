@@ -1,138 +1,116 @@
 ---
 name: ocvm-testing
-description: ocvm 模拟器测试（<ocvm-host> 远程 Ubuntu）。Triggers on "ocvm", "ocvm 测试", "modular 测试", "模拟器测试", "真机测试"。涵盖 tools/ocvm_test.py 驱动的所有测试（基础对话/文件读写/组件链/插件自举/modular 多文件 require/relocate/联网对话），含目录上传映射语法与挂载盘布局。
+description: ocvm 模拟器测试（本机 ~/oc-test/ocvm，<ocvm-host>）。Triggers on "ocvm", "ocvm 测试", "modular 测试", "模拟器测试", "VM 测试", "remote_pit", "remote_battery"。涵盖 VM 启动/部署/远控 E2E 全流程、test_harness 远程套件（39 用例+10 场景电池）、legacy SSH 驱动 tools/ocvm_test.py 的 EXTRA_FILES 语法与 modular 测试。
 ---
 
-# ocvm 模拟器测试（<ocvm-host>）
+# ocvm 模拟器测试（本机）
 
-> ocvm 是 OpenComputers 的 C++ 模拟器，运行在远程 Ubuntu 服务器（<ocvm-host>，
-> <user>/<password> **密码认证仍有效**——ssh-connect skill 里"已禁密码"的记录过时）。
-> 全部测试通过 `tools/ocvm_test.py` 驱动。ocvm 总内存 4MB（真机 2MB），数据目录 tmp_t 重启即清。
+> ocvm 是 OpenComputers 的 C++ 模拟器。**本机（<ocvm-host>，用户 <user>）就是测试服务器**
+> ——旧文档里的"<ocvm-host> 远程 + 密码 <password> + `cd "<local-dir>"`"全部过时作废。
+> VM 在 `~/oc-test/ocvm` 原地运行（**二进制不可 relocate**，拷到新目录第二次 boot 卡死，
+> 见 `patches/README.md`）。总内存 4MB（真机 4MB），数据盘目录 `tmp_t/<uuid>/`。
 
-## 环境准备
-
-```bash
-# 三个环境变量必须显式 export（ocvm_test.py 要求非空）
-export OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<password>
-```
-
-## 标准测试跑法（单文件 + agent.lua）
+## 环境要点
 
 ```bash
-cd "<local-dir>"
-export OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<password>
-python tools/ocvm_test.py test_harness/<test>.lua
+cd ~/oc-test/ocvm
+# tmp_t/client.cfg 必须保持（改后 grep 复核——曾被冲回）:
+#   allowGC=true            # 上游默认 false → 长跑瞬态 OOM（write_90k FAIL 根因）
+#   maxTcpConnections=16    # 上游默认 4，远控 long-poll 会触顶
+#   内存 4194304 / system.timeout 120
 ```
 
-驱动流程：重启 VM（tmux 会话 ocvm_t）→ 上传 agent.lua + 测试脚本到所有挂载盘
-→ find_agent_mount（touch 实证可写盘）→ run_script（dofile agent.lua + 钩子）→
-wait_result 轮询 `test_harness/results/<test>_result.txt`。
+- 杀 VM 用 `pkill -x ocvm`（`-f` 会匹配自己的 shell 命令行自杀——已三度复发）
+- tmux 会话惯例 `ocvm_t`：`tmux kill-session -t ocvm_t; tmux new-session -d -s ocvm_t './ocvm tmp_t'`
+- **磁盘**：`tmp_t/client.cfg` 存在时盘目录固定 UUID（当前 574e8f95-…，挂载 `/mnt/574`）；
+  盘目录不存在时每次 boot 新建。挂载短名=目录名前 3 hex，boot 后 `ls /mnt` 确认再部署。
+  宿主侧直接读写：`~/oc-test/ocvm/tmp_t/<uuid>/`（VM 内路径即该树）。
 
-常用测试：
-- `basic_test.lua` 基础对话
-- `file_io_test.lua` 文件读写
-- `component_chain_test.lua` 组件链（list→doc→invoke）
-- `shell_timeout_test.lua` shell_execute 超时（9 项）
-- `reasoning_e2e_test.lua` reasoning_content 传回（3/3）
-- `json_ctrl_e2e_test.lua` JSON 控制字符（修复前 400）
-- `modular_ocvm_test.lua` 模块化 e2e（22 项，见下）
+## 标准 E2E 跑法（远控通道，当前主力）
 
-## modular 测试（多文件 require 链 + 插件自举，22 项）
-
-modular 测试**不是**单文件 agent.lua——它验证开发态 `src/agent/` 目录结构在真实
-OpenOS 中可 require。需要 `<mount>/agent/` 布局（agent/agent.lua = 入口）：
+不再用 TUI 交互驱动——agent 自带 `remote.lua` 守护，全部经控制服务器验证：
 
 ```bash
-EXTRA_FILES="src/agent=agent,src/agent/init.lua=agent/agent.lua" \
-  OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<password> \
-  python tools/ocvm_test.py test_harness/modular_ocvm_test.lua
+cd <repo-root>/aiProjects/mieAgent
+# 1. 服务器（真机目标带 --allow-emoji；ocvm 目标去掉，否则 4 字节字符无保护）
+python3 tools/remote_server.py serve --bind 127.0.0.1 --port 8765 --hold 12 --token <tok>
+# 2. boot VM → 部署 agent.lua（scripts/build_single.lua 构建）+ agent_config.txt
+#    config 必须含 remote_url=http://127.0.0.1:8765 + remote_token + mem_exec_min_free=200000
+#    （4MB 机空闲 ~317KB < 默认 500KB 护栏，不降会全拒 exec）
+# 3. 交互式首跑（tmux send-keys）: lua /mnt/<盘>/agent.lua + 3 次 Enter 跳 setup
+#    → 守护自启（config 有 url+token 即自启；或 TUI 内 /remote on）
+# 4. 验证:
+python3 test_harness/remote_pit_test.py        # 39 用例（本地 127.0.0.1 默认）
+python3 test_harness/remote_battery_test.py --base http://127.0.0.1:8765 --token <tok>  # 10 场景
+python3 tools/remote_server.py client --base http://127.0.0.1:8765 --token <tok> --ping
 ```
 
-- `src/agent=agent` → 整个 src/agent/ 树（42 个 .lua）上传为 `<mount>/agent/`
-- `src/agent/init.lua=agent/agent.lua` → 入口 init.lua 以 agent.lua 部署名上传
-- 上传 45 文件到 2 挂载；断言 require 链 9/9 + json roundtrip + init.lua 加载
-  + agent_test 钩子 + TOOLS 19 项集合 + 插件自举闭环（写 zz_hello.lua→重扫 20
-  →调用 HELLO_PLUGIN_OK→写坏模块跳过）
+基线（r6b+ 构建，GC on）：39 用例 **41 PASS/0 FAIL/9 OBSERVE**、电池 **10/10**。
+OBSERVE 9 是信息型（lua -e 无支持/输出泄漏/二进制读等已知行为），FAIL 才是回归。
+完整 op 手册、真机差异、10 条坑 → 见 `oc-remote` skill。
 
-## EXTRA_FILES 映射语法（ocvm_test.py upload）
+## legacy SSH 驱动（tools/ocvm_test.py，仍能跑但少用）
 
-逗号分隔文件/目录，支持 `path=newname` 映射：
+驱动走 paramiko SSH，环境变量必须非空（本机可指 localhost）：
+
+```bash
+export OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<本机密码或留参>
+python3 tools/ocvm_test.py test_harness/<test>.lua
+```
+
+流程：重启 VM（tmux ocvm_t）→ 上传 agent.lua + 测试脚本到所有挂载盘 →
+find_agent_mount（touch 实证可写盘）→ run_script（dofile agent.lua + 钩子）→
+wait_result 轮询 VM 内 `test_harness/results/<test>_result.txt`（host 侧看
+`tmp_t/<uuid>/test_harness/results/`）。
+
+### EXTRA_FILES 映射语法
+
+逗号分隔，`path=newname` 映射：
 
 | 用法 | 效果 |
 |------|------|
 | `EXTRA_FILES=oc-docs.tar` | 单文件上传到挂载根 |
 | `EXTRA_FILES=src/agent=agent` | 目录递归上传，内容落 `<mount>/agent/` |
-| `EXTRA_FILES=src/agent/init.lua=agent/agent.lua` | 文件映射，落 `<mount>/agent/agent.lua` |
+| `EXTRA_FILES=src/agent/init.lua=agent/agent.lua` | 文件映射，入口以 agent.lua 部署名 |
 
-实现要点（踩过的坑）：
-- main() 解析 `path=newname` 时**先拆 = 再 exists()** 校验（整串 exists 必 False）
-- upload() 用**整串**判定 `=`（Windows basename 会被 `\` 截断——`init.lua=agent\agent.lua`
-  的 basename 是 agent.lua 不含 =，会漏判）
-- 文件映射目标含子路径时**同时查 `/` 和 `\`**（mapped_name 来自 Windows 串，反斜杠
-  分支曾把文件传回挂载根覆盖单文件 agent.lua）
-- 目录映射默认名 = 源码目录 basename；映射名显式指定
+实现要点（踩过的坑，改 ocvm_test.py 前必读）：main() 解析 `path=newname` 时
+**先拆 = 再 exists()** 校验（整串 exists 必 False）；upload() 用**整串**判定 `=`
+（Windows basename 会被 `\` 截断漏判）；文件映射目标含子路径时**同时查 `/` 和 `\`**
+（反斜杠分支曾把文件传回挂载根覆盖单文件 agent.lua）。
 
-## 联网对话测试（REPL 完整主循环）
+### modular 测试（多文件 require 链 + 插件自举）
 
-自动压缩在 process_exchange 开头（字节阈值触发）——**一次性测试脚本走不到**，
-必须跑 REPL 完整主循环：
+验证开发态 `src/agent/` 目录结构在真实 OpenOS 中可 require：
 
 ```bash
-python tools/ocvm_dialog.py    # 交互式多轮对话（屏幕检测轮次完成）
+EXTRA_FILES="src/agent=agent,src/agent/init.lua=agent/agent.lua" \
+  OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<...> \
+  python3 tools/ocvm_test.py test_harness/modular_ocvm_test.lua
 ```
 
-- 上传 agent.lua + _setup_config.lua（OpenOS 内写 config 到所有可写挂载+tmp）
-- config 内容**不能带 return 前缀**（serialization.unserialize = load("return "..data)，
-  带前缀变 return return {...} 语法错误 → 走 First Run Setup）
-- config 路径 = writable_base/agent_config.txt，writable_base 探测 /home 只读后落
-  /tmp（tmpfs）
-- history 文件在 /tmp（tmpfs），host 侧 find 不到 → 轮次检测用**屏幕检测**
-  （Ready 状态栏 + "> " 提示符 + [compact] 标记），不是文件轮询
-- 触发压缩示例：`mem_prefold_bytes=20000, mem_compact_threshold=200000` 等测试 config
+断言 TOOLS **11 项**（v0.3.124 从 19 精简：file 3/read+search+write 系、component 3 删、
+data 3 删、其余 5）+ require 链 + json roundtrip + 插件自举闭环。
 
-## relocate 测试
+## 其他工具
 
-```bash
-python tools/ocvm_relocate_test.py   # 迁移流程（REPL 注入 /relocate → 选 1）
-python tools/ocvm_relocate_e2e.py    # 端到端（重启→迁移→重启 agent→验证 data_dir）
-```
-注意：ocvm_relocate_e2e.py 的 PASS 判断曾有 bug（匹配 "/mnt/" 即 PASS），
-真实验证要对比迁移前后 /relocate 显示的数据目录。
+- `tools/ocvm_dialog.py` 交互式多轮对话（屏幕检测轮次：Ready 状态栏 + "> " 提示符 +
+  [compact] 标记——history 在 VM 内 tmpfs，host 轮询不到）
+- `tools/ocvm_relocate_test.py` / `ocvm_relocate_e2e.py` 迁移流程
+  （e2e 的 PASS 判断曾匹配 "/mnt/" 即过——真实验证要对比迁移前后 /relocate 显示的数据目录）
+- `tools/ocvm_dual_test.py` 双实例 modem 互联（explorer 文件代理）：每实例 modem 连
+  `HostAddress:SystemPort`（默认 127.0.0.1:56000），同 system port 即同网（星型 hub）；
+  挂载盘 host 路径 `tmp_t/<uuid>/`
+- `tools/ocvm_install_test.py` install.lua 自举
+- `tools/ssh_ubuntu.py` 默认 IP 仍是 **<ocvm-host>（过时**，真机 <ocvm-host>）——
+  用 `UBUNTU_HOST=<ocvm-host> python3 tools/ssh_ubuntu.py ...` 覆盖
 
-## 双实例互联测试（explorer 文件代理端到端，PASS 2026-08-12）
+## 排查备忘
 
-ocvm 多实例 modem 互联（源码实证 drivers/modem_drv.cpp + server_pool.cpp）:
-- 每实例 modem 连 `HostAddress:SystemPort`（默认 127.0.0.1:56000），
-  同 system port 即同网（星型：首个实例 ServerPool bind/listen 作 hub，
-  其余 Connection connect 上来）
-- client.cfg 内存加载不落盘——新实例自动继承根模板（无 client.cfg 文件）
-- 挂载盘 host 路径 = `~/oc-test/ocvm/<ENV_PATH>/<uuid>/`（每实例多个 uuid 目录）
-
-跑法（验证 v0.3.92 explorer 文件代理修复——双值返回 bug / modem 包长 / 路径提示）:
-
-```bash
-export OCVM_HOST=<ocvm-host> OCVM_USER=<user> OCVM_PASS=<password>
-cd "<local-dir>"
-python tools/ocvm_dual_test.py
-```
-
-流程: 重启两实例 tmp_e2e_m（master/hub）+ tmp_e2e_s（sub/client）→ 上传
-agent.lua + explorer_e2e_master.lua/sub.lua → sub 预写 agent_config.txt
-（subagent=true）→ sub 跑 explorer_e2e_sub.lua（监听）→ master 跑
-explorer_e2e_master.lua（discover → explorer call）→ 轮询 master 结果断言
-回复含真实文件内容（PASS: file requests served: N, ok: N）。
-
-关键坑（PASS 前修的三处）:
-1. **config 必须写到 agent.lua 实际读的位置**: `find_writable_base()` 实测
-   ocvm 选 `/tmp`（fs.mounts() 第一个可写挂载），不是 /home 也不是 /mnt/<m>！
-   sub 脚本把所有候选位置都写一遍（/home + /tmp + 每个 /mnt/<m>）
-2. **sub 不进 subagent 模式** = load_config() nil → 卡 First Run Setup——
-   必须预写含 `subagent=true` 的 config（自动进监听，无需 --subagent 参数）
-3. **地址解析**用完整 UUID pattern（`[a-fA-F0-9%-]+` 会从错误文本 "found" 抠出 "f"）
-
-## 排查备忘- 挂载短名每次重启变（如 /mnt/b2f）——脚本自动探测，无需硬编码
-- `ls -d tmp_t/*/` 偶发 boot 时序失败 → upload 已加 find fallback
-- 结果文件在 `test_harness/results/<name>_result.txt`（VM 内写入，host 轮询）
-- 测试脚本首个参数固定传挂载路径（如 /mnt/xxxx）
-- VM 内存 4MB，测试用 config 需显式传 api_key/model/api_url 绕过本地 config
-- 真机（非 ocvm）测试另有工具链，ocvm 用于快速回归
+- config 位置每 boot 漂移（writable base 探测）：读活 config 用
+  `lua` op `require("agent.config").config_path`，别在宿主侧找
+- 测试 config 不能带 `return` 前缀（`serialization.unserialize = load("return "..data)`
+  带前缀变 `return return {...}` 语法错 → 弹 First Run Setup）
+- 首跑 setup 3 问（默认 deepseek-v4-flash-free / opencode zen），空回车走默认
+- VM 冻结（TUI 无回显 + CPU 高）= 死循环/守护活跃 /exit → `pkill -x ocvm` + 重启
+- 真机（非 ocvm）测试/远控 → `oc-remote` skill；ocvm 定位=真机 Lua 层回归沙箱
+  （OpenOS 1.8.9 同款；VM 宿主层 C++(ocvm) vs Java(GTNH) 结论不可互推）
