@@ -109,6 +109,9 @@ def log(msg):
 def make_handler(state):
     class Handler(BaseHTTPRequestHandler):
         server_version = "OCRemoteServer/1.0"
+        # SakuraFrp auto_https 反代后长轮询: HTTP/1.1 避免每次 poll
+        # 重建 TLS（技能实战教训; Content-Length 已全路径发送）
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt, *args):  # 静音默认访问日志
             pass
