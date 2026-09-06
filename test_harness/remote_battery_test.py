@@ -2,9 +2,14 @@
 """r6 新命令电池——39 用例套件未覆盖的场景（一次通过率审计）。
 10 场景: fetch 分页×3 / 3 并发 / CJK exec 输出 / 内存风暴 / config 热重载
 / Ctrl+C 中断 / 60s 超时边界 / 服务器重启恢复（最后）。"""
-import json, sys, time, urllib.request, urllib.error, urllib.parse, subprocess
+import argparse, json, sys, time, urllib.request, urllib.error, urllib.parse, subprocess
 
-BASE = "http://127.0.0.1:8765"; TOK = "ocvmtoken123"
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--base", default="http://127.0.0.1:8765",
+                 help="控制服务器基址（公网: https://mc.u628580.nyat.app:37057）")
+_ap.add_argument("--token", required=True)
+_args = _ap.parse_args()
+BASE = _args.base; TOK = _args.token
 WAIT = 45
 
 def http_json(url, body=None, timeout=20):
