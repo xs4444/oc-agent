@@ -1748,6 +1748,10 @@ local injected_chat
 -- History path state: defaults to the config module's resolved path,
 -- overridable via set_paths (used by tests).
 local history_path = config_mod.history_path
+-- Sessions dir state: 模块级局部（曾是全局自由变量——启动时无人初始化，
+-- 真机 /resume 实证 get_sessions_dir()=nil → fs.list(nil) 报错被 pcall
+-- 吞掉 → 归档全部不可见 → "No resumable sessions" 空列表）。
+local sessions_dir = config_mod.sessions_dir
 
 -- 历史/trim 预算（OC 内存约束）与压缩触发（模型窗口约束）:
 --   - trim: 200KB / 60 条 —— 2MB 内存下历史+编码峰值 ~600KB，安全
@@ -2027,6 +2031,30 @@ end
 -- 限制: 磁盘满时静默跳过（compact 主流程不受影响，内存优先）；归档只
 -- 增不减，超限由 /relocate 换盘或手动清理承担（用户明确"尽可能利用
 -- 硬盘"）。
+-- archive.jsonl 冷存储封顶（2026-09-07 真机: 732KB 无上限增长是慢性元凶
+-- ——/home 写满 → find_writable_base 漂移到 /tmp tmpfs → 重启历史丢失）。
+-- 超 MAX_ARCHIVE_BYTES 时只保留后半（行对齐截断: JSONL 每行一条消息，
+-- 跳过半数后丢弃首残行即从完整行开始）。峰值内存 ≈ 文件一半，
+-- 4MB 机器安全（~500KB）。
+local MAX_ARCHIVE_BYTES = 1000000
+local function cap_archive()
+  local p = history_path .. ".archive.jsonl"
+  local f = io.open(p, "r")
+  if not f then return end
+  local size = f:seek("end") or 0
+  f:close()
+  if size <= MAX_ARCHIVE_BYTES then return end
+  local f2 = io.open(p, "r")
+  if not f2 then return end
+  f2:seek("set", math.floor(size / 2))
+  f2:read("*l")  -- 丢弃 seek 点所在的行（通常是不完整残行）
+  local tail = f2:read("*a")
+  f2:close()
+  local f3 = io.open(p, "w")
+  if not f3 then return end
+  f3:write(tail)
+  f3:close()
+end
 local function archive_folded(messages)
   if not messages or #messages == 0 then return end
   local f = io.open(history_path .. ".archive.jsonl", "a")
@@ -2036,6 +2064,7 @@ local function archive_folded(messages)
     if not ok_w then break end
   end
   f:close()
+  cap_archive()
 end
 -- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——
 -- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
@@ -2345,7 +2374,7 @@ local function set_chat(fn)
   injected_chat = fn
 end
 
-return {
+local M = {
   load_history = load_history,
   append_history = append_history,
   rebuild_history = rebuild_history,
@@ -2369,6 +2398,15 @@ return {
   -- 单一 token 估算实现（init.lua 引用，避免重复定义）
   estimate_tokens = estimate_tokens,
 }
+-- 测试钩子: _TEST_MODE 下暴露内部函数（run_tests.lua 断言用）
+if _TEST_MODE then
+  M._internal = {
+    cap_archive = cap_archive,
+    archive_folded = archive_folded,
+    MAX_ARCHIVE_BYTES = MAX_ARCHIVE_BYTES,
+  }
+end
+return M
 end
 
 -- agent.agent.tools (embedded module)
@@ -8274,8 +8312,18 @@ local function handle_command(cmd, config, messages)
     -- 从选定会话继续追加，而非只读回放）。归档恢复时迁移为同名 .jsonl
     -- （续写判断: 对侧 jsonl 条数 >= 归档则直接续写，避免覆盖上次恢复
     -- 后新增的消息；.txt 保留——cleanup_sessions 约定不动归档）。
-    local sdir = session_mod.get_sessions_dir()
+    local sdir = session_mod.get_sessions_dir() or config_mod.sessions_dir
     local entries = {}
+    -- 归档文件名 agent_history_<游戏时间戳>.txt → 人类可读日期（游戏钟）
+    local function archive_label(name)
+      local stamp = tonumber(name:match("^agent_history_(%d+%.?%d*)$"))
+      if stamp then
+        local ok_d, d = pcall(os.date, "%Y-%m-%d %H:%M", stamp)
+        if ok_d and d then return d end
+      end
+      return name
+    end
+    local main_count = 0
     local function preview_of(content)
       local p = tostring(content or ""):gsub("%s+", " ")
       if p == "" then return "" end
@@ -8285,7 +8333,7 @@ local function handle_command(cmd, config, messages)
     -- 单遍流式统计 + 首条 user 消息预览（损坏行跳过，与 load_history 同策略）
     local function scan_jsonl(name, path, kind)
       local f = io.open(path, "r")
-      if not f then return end
+      if not f then return 0 end
       local count, preview = 0, ""
       for line in f:lines() do
         local ok_j, msg = pcall(json.decode, line)
@@ -8300,6 +8348,7 @@ local function handle_command(cmd, config, messages)
       if count > 0 then
         entries[#entries + 1] = {name = name, kind = kind or "session", path = path, count = count, preview = preview}
       end
+      return count
     end
     -- 归档 .txt → {name, count, preview}（unserialize 失败 = 损坏，跳过）
     local function scan_archive(name, path)
@@ -8319,9 +8368,9 @@ local function handle_command(cmd, config, messages)
           break
         end
       end
-      entries[#entries + 1] = {name = name, kind = "archive", path = path, count = #list, preview = preview}
+      entries[#entries + 1] = {name = name, kind = "archive", path = path, count = #list, preview = preview, label = archive_label(name)}
     end
-    scan_jsonl("default", HISTORY_PATH, "main")
+    main_count = scan_jsonl("default", HISTORY_PATH, "main") or 0
     do
       local fs = require("filesystem")
       local ok_l, iter = pcall(fs.list, sdir)
@@ -8345,7 +8394,8 @@ local function handle_command(cmd, config, messages)
       end
     end
     if #entries == 0 then
-      print("No resumable sessions (named sessions & /new archives; /session <name> to create)")
+      print("No resumable sessions (named sessions & /new archives; /session <name> to create)"
+        .. (main_count == 0 and " —— 主会话为空（/new 归档后未再对话，或历史在 " .. sdir .. " 之外）" or ""))
     else
       local function resolve(sel)
         local n = tonumber(sel)
@@ -8353,7 +8403,7 @@ local function handle_command(cmd, config, messages)
           return entries[n]
         end
         for _, e in ipairs(entries) do
-          if e.name == sel then return e end
+          if e.name == sel or e.label == sel then return e end
         end
         local base = sel:gsub("%.jsonl$", ""):gsub("%.txt$", "")
         for _, e in ipairs(entries) do
@@ -8398,6 +8448,10 @@ local function handle_command(cmd, config, messages)
           local msgs = trim_history(list)
           session_mod.set_paths(jsonl_path)
           rebuild_history(msgs)
+          if #msgs < #list then
+            print("  (按内存预算裁剪: 加载 " .. #msgs .. "/" .. #list
+              .. " 条——最早的 " .. (#list - #msgs) .. " 条仍在归档 " .. e.path .. " 中)")
+          end
           print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, archive migrated to JSONL; .txt kept)")
           return msgs
         else
@@ -8416,7 +8470,8 @@ local function handle_command(cmd, config, messages)
           local tag = e.kind == "archive" and " [archive]" or (e.kind == "main" and " [main]" or "")
           local cur = e.path == session_mod.current_path() and " *current*" or ""
           local pv = e.preview ~= "" and "  | " .. e.preview or ""
-          print(string.format("  %d. %-20s (%d msgs)%s%s%s", i, e.name, e.count, tag, cur, pv))
+          local disp = e.kind == "archive" and (e.label or e.name) or e.name
+          print(string.format("  %d. %-20s (%d msgs)%s%s%s", i, disp, e.count, tag, cur, pv))
         end
         io.write("Resume # (1-" .. #entries .. ", Enter=cancel): ")
         local line

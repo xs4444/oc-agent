@@ -5,13 +5,13 @@
     "debug.lua": 16478,
     "execute.lua": 3404,
     "http.lua": 13630,
-    "init.lua": 119830,
+    "init.lua": 120774,
     "interrupt.lua": 4297,
     "json.lua": 10581,
     "patch.lua": 6458,
     "remote.lua": 38151,
     "selftest.lua": 19512,
-    "session.lua": 31521,
+    "session.lua": 33057,
     "subagent.lua": 11846,
     "tools.lua": 5913,
     "tools/compact.lua": 3277,
@@ -24,5 +24,5 @@
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-08T0047"
+  "version": "2026-09-08T0310"
 }

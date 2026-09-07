@@ -22,6 +22,10 @@ local injected_chat
 -- History path state: defaults to the config module's resolved path,
 -- overridable via set_paths (used by tests).
 local history_path = config_mod.history_path
+-- Sessions dir state: 模块级局部（曾是全局自由变量——启动时无人初始化，
+-- 真机 /resume 实证 get_sessions_dir()=nil → fs.list(nil) 报错被 pcall
+-- 吞掉 → 归档全部不可见 → "No resumable sessions" 空列表）。
+local sessions_dir = config_mod.sessions_dir
 
 -- 历史/trim 预算（OC 内存约束）与压缩触发（模型窗口约束）:
 --   - trim: 200KB / 60 条 —— 2MB 内存下历史+编码峰值 ~600KB，安全
@@ -301,6 +305,30 @@ end
 -- 限制: 磁盘满时静默跳过（compact 主流程不受影响，内存优先）；归档只
 -- 增不减，超限由 /relocate 换盘或手动清理承担（用户明确"尽可能利用
 -- 硬盘"）。
+-- archive.jsonl 冷存储封顶（2026-09-07 真机: 732KB 无上限增长是慢性元凶
+-- ——/home 写满 → find_writable_base 漂移到 /tmp tmpfs → 重启历史丢失）。
+-- 超 MAX_ARCHIVE_BYTES 时只保留后半（行对齐截断: JSONL 每行一条消息，
+-- 跳过半数后丢弃首残行即从完整行开始）。峰值内存 ≈ 文件一半，
+-- 4MB 机器安全（~500KB）。
+local MAX_ARCHIVE_BYTES = 1000000
+local function cap_archive()
+  local p = history_path .. ".archive.jsonl"
+  local f = io.open(p, "r")
+  if not f then return end
+  local size = f:seek("end") or 0
+  f:close()
+  if size <= MAX_ARCHIVE_BYTES then return end
+  local f2 = io.open(p, "r")
+  if not f2 then return end
+  f2:seek("set", math.floor(size / 2))
+  f2:read("*l")  -- 丢弃 seek 点所在的行（通常是不完整残行）
+  local tail = f2:read("*a")
+  f2:close()
+  local f3 = io.open(p, "w")
+  if not f3 then return end
+  f3:write(tail)
+  f3:close()
+end
 local function archive_folded(messages)
   if not messages or #messages == 0 then return end
   local f = io.open(history_path .. ".archive.jsonl", "a")
@@ -310,6 +338,7 @@ local function archive_folded(messages)
     if not ok_w then break end
   end
   f:close()
+  cap_archive()
 end
 -- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——
 -- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
@@ -619,7 +648,7 @@ local function set_chat(fn)
   injected_chat = fn
 end
 
-return {
+local M = {
   load_history = load_history,
   append_history = append_history,
   rebuild_history = rebuild_history,
@@ -643,3 +672,12 @@ return {
   -- 单一 token 估算实现（init.lua 引用，避免重复定义）
   estimate_tokens = estimate_tokens,
 }
+-- 测试钩子: _TEST_MODE 下暴露内部函数（run_tests.lua 断言用）
+if _TEST_MODE then
+  M._internal = {
+    cap_archive = cap_archive,
+    archive_folded = archive_folded,
+    MAX_ARCHIVE_BYTES = MAX_ARCHIVE_BYTES,
+  }
+end
+return M
