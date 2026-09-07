@@ -8316,7 +8316,9 @@ local function handle_command(cmd, config, messages)
     local entries = {}
     -- 归档文件名 agent_history_<游戏时间戳>.txt → 人类可读日期（游戏钟）
     local function archive_label(name)
-      local stamp = tonumber(name:match("^agent_history_(%d+%.?%d*)$"))
+      -- 归档名 agent_history_<游戏时间戳>.txt（.jsonl=迁移后）→ 人类可读日期（游戏钟）
+      local stamp = tonumber(name:match("^agent_history_(%d+%.?%d*)%.txt$"))
+        or tonumber(name:match("^agent_history_(%d+%.?%d*)%.jsonl$"))
       if stamp then
         local ok_d, d = pcall(os.date, "%Y-%m-%d %H:%M", stamp)
         if ok_d and d then return d end
