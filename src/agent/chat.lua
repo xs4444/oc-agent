@@ -158,7 +158,7 @@ local function chat(messages, config, opts)
   --   response_body_limit: 单次请求响应体累积上限（结构性内存护栏——
   --     OOM 无法预测，硬上限保证任何单次峰值都在安全线内，见 agent.http）
   http_mod.set_budget(tonumber(config.retry_budget) or 300)
-  http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
+  http_mod.set_response_timeout(tonumber(config.response_timeout) or 900)
   http_mod.set_response_body_limit(tonumber(config.response_body_limit) or 131072)
 
   -- 请求选项 opts（摘要专用瘦身，opencode 裸摘要请求同款 + reasonix

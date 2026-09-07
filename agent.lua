@@ -338,8 +338,13 @@ local retry_budget = _TEST_MODE and 60 or 300
 -- 单次请求响应读超时（秒）: 真机荒野大师 internet 迭代器可能在连接
 -- 建立后流不结束（JVM 实现可能无 OS 超时）——响应迭代若无超时则无限
 -- 等，而重试预算检查（os.clock()）在 once 返回后才执行，预算形同虚设。
--- 默认 120s；config.response_timeout 可调（chat() 每次请求前同步）
-local MAX_RESPONSE_WAIT = 120
+-- 默认 900s（15 分钟）——真机 27B vLLM 冷 prefill 实测可超 2 分钟
+-- （2026-09 用户确认：冷 prefill 长会真实发生，允许上限 15 分钟）。
+-- 与 300s 重试预算配合：单次读超时后预算必然耗尽→不重试，等效"单次
+-- 最长 15 分钟"；秒级瞬态失败（连接拒绝/快速 5xx）仍可在预算内重试。
+-- 中断随时可杀（chunk 循环子线程化，v0.3.126r1）。
+-- config.response_timeout 可覆盖（chat() 每次请求前同步）
+local MAX_RESPONSE_WAIT = 900
 -- 单次请求响应体累积上限（字节）: 结构性内存护栏——OOM 无法预测（单次
 -- 工具调用/响应峰值不可知），正确解法是给所有已知分配源设硬上限，任何
 -- 单次峰值都落在安全线内。http_post_once 的 chunks 累积此前无上限，
@@ -2764,7 +2769,7 @@ local function chat(messages, config, opts)
   --   response_body_limit: 单次请求响应体累积上限（结构性内存护栏——
   --     OOM 无法预测，硬上限保证任何单次峰值都在安全线内，见 agent.http）
   http_mod.set_budget(tonumber(config.retry_budget) or 300)
-  http_mod.set_response_timeout(tonumber(config.response_timeout) or 120)
+  http_mod.set_response_timeout(tonumber(config.response_timeout) or 900)
   http_mod.set_response_body_limit(tonumber(config.response_body_limit) or 131072)
 
   -- 请求选项 opts（摘要专用瘦身，opencode 裸摘要请求同款 + reasonix
