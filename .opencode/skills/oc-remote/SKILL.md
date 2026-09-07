@@ -69,8 +69,15 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
   （内容含 `]==]` 时升级定界符）；**>100KB 线上限制的文件分块**：第 1 块 "w" 模式
   + 后续 "a" 追加（init.lua 119KB=3 块实证；Python 按 str 字符切分，多字节字符使
   字符数<字节数，拼接完整即可）——部署后一律读回 n/sum 校验
-- LLM=用户自建 vLLM 端点（`llm.u628580.nyat.app:20881`，Qwen3.8-27B-INT4，
-  ctx 128K）——与远控通道不同端口互不影响
+- LLM=用户自建 vLLM 端点（`llm.u628580.nyat.app:20881`，模型名
+  **`Qwen3.8-27B`**（config 实证），ctx 128K）——与远控通道不同端口互不影响。
+  **冷 prefill 可超 2 分钟**（用户 2026-09-07 确认"最长可以允许十五分钟"）：
+  config 已设 `response_timeout=900`（代码默认同 900，commit 1e870fb）；
+  与 300s 重试预算配合=单次最长 15 分钟、超时不重试；TUI "+Ns" 期间继续滚动，
+  Ctrl+C 随时可杀
+- **ocvm 测试 VM 的 LLM 端点已过期**（2026-09-07 用户未续费）：mimo-v2.5 @
+  `opencode.ai/zen/go`（574 盘 config）——ocvm 上要跑 LLM 回归需先换端点
+  （可用同一 vLLM 公网地址），纯远控回归不受影响
 - 护栏空闲内存拒绝消息是中文：`空闲内存 X < NB（shell 执行护栏）`
 - 错误判定=结构化 is_err（v0.3.125r3+：工具层直接返回布尔，`^Error` 前缀仅回退）——
   合法输出含 "Error:" 不误判
@@ -205,7 +212,8 @@ lua update.lua v0.3.125          -- 升级（走 tag；回滚=v0.3.124）
 通道协议 v0.3.126r1（r2b/r3/r4/r5/r6/r6b/r6d/r7/r7b/web/无chunk防护 全含：看门狗/
 deadline 注入/结构化 is_err/fetch 分页 64KB 分块 + 256KB 封顶/report 重试/413/
 400 多行拒收/429 队列满/lost 判定/ensure_ascii=False/HTTP/1.1/写失败检查 r7/
-json %c 显式类 r7b/web_search Bing+web_fetch/LLM 无 chunk 挂起防护 8b1bfb9）。
+json %c 显式类 r7b/web_search Bing+web_fetch/LLM 无 chunk 挂起防护 8b1bfb9/
+响应读超时 900s 1e870fb）。
 agent.lua 单文件构建（scripts/build_single.lua，21 preload）；发版走 Clash 7897
 代理 push + tag。
 
