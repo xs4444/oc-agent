@@ -226,6 +226,30 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
       不匹配**（532 回归里 2 个 web_fetch 用例因此假 FAIL，实际输出正确）；字面量
       匹配用 plain 模式 `r:find(s, 1, true)` 或转义 `%-`。同型隐患：期望"不匹配"的
       断言（==nil）在 pattern 坏了时假通过——写测试时留意。
+  24. **agent 模块内的"全局"自由变量=隐形 nil**（v0.3.126r3 实证）：
+      session.lua 的 `sessions_dir` 曾是全局自由变量——多文件部署下启动时
+      无人初始化 → `get_sessions_dir()=nil` → /resume `fs.list(nil)` 报错被
+      pcall 吞掉 → "No resumable sessions" 空列表（真机 2026-09-07：3 个归档
+      都在 /home/sessions/ 却列不出）。模块级状态一律 `local x = config 默认值`
+      显式初始化；pcall 吞错路径（fs.list/require）排查"功能静默失效"先想 nil
+      参数。**连带**：`.archive.jsonl` 折叠冷存储无界增长（真机 732KB）→ 超
+      1MB 行对齐截断至后半（cap_archive），防 /home 写满 → find_writable_base
+      漂到 /tmp tmpfs → 重启历史丢失。用户"swap 盘"=安装盘=根盘（/home 所在
+      4MB 盘）；/mnt/<hex> 见根盘内容先做双向写身份探针（曾遇 /mnt/32d 是
+      根盘双挂载而非独立盘）。
+  25. **GTNH fork 的 `f:write(...)` 返回文件句柄本身（table）而非字节数**：
+      上传校验 `local n=f:write(chunk) return n` 拿到 table（"table: 0x..."）。
+      写后校验一律**读回全文件 `#f:read("a")` 核对累计大小**+最终 size:字节和
+      （模 1000003 与本地比）。另：分块内容必须按 **UTF-8 字符边界**切——
+      按字节切 + latin-1 中转会把多字节拆成 U+00XX → JSON 重编码膨胀 2 倍
+      （33057B 变 43319B，size 校验当场暴露）。
+  26. **run_tests.lua 主 chunk 局部变量贴近 Lua 5.3 的 200 上限**：在其后
+      新增内联 IIFE 会改变主 chunk 寄存器分配布局 → /resume IIFE 的 CLOSURE
+      寄存器被冲掉 → "attempt to call a nil value"（报错行指向上游无关语句，
+      trace 行钩子实证执行路径 2850→2918→2762 回跳）；块数/位置不同结果不同
+      （两份同块反而不崩）。**规则：新增测试段落一律独立文件 + dofile 接入**
+      （tui_mouse_render_test / session_resume_test 模式，_IN_RUN_TESTS 控
+      os.exit，return pass, fail 宿主累加）。
 
 ## 真机部署/恢复配方
 
