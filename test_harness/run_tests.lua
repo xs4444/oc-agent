@@ -2848,6 +2848,30 @@ end
   os.remove(rdir .. "/agent_history_100.jsonl")
   os.execute("rmdir " .. rdir .. " 2>nul")
 end)()
+-- session 回归（sessions_dir 默认值 + archive.jsonl 封顶）: 独立文件
+-- session_resume_test.lua 以 dofile 接入（同鼠标渲染测试模式——主
+-- chunk 局部变量贴近 200 上限，内联 IIFE 触发 Lua 5.3 编译器寄存器
+-- 分配敏感布局: /resume IIFE 的 CLOSURE 寄存器被冲掉 → "attempt to
+-- call a nil value"）。
+do
+  _IN_RUN_TESTS = true
+  local ok_sr, p_sr, f_sr = pcall(dofile, "session_resume_test.lua")
+  _IN_RUN_TESTS = nil
+  if ok_sr and type(p_sr) == "number" then
+    pass = pass + p_sr
+    fail = fail + f_sr
+  else
+    test("session_resume_test file runs", false, tostring(ok_sr) .. " " .. tostring(p_sr))
+  end
+end
+
+-- ═══════════════════════════════════════════
+-- session: ① sessions_dir 模块默认值回归（曾是全局自由变量——启动时无人
+--   初始化 → get_sessions_dir()=nil → /resume fs.list(nil) 报错被 pcall
+--   吞掉 → "No resumable sessions" 空列表，真机 2026-09-07 实证）
+-- ② archive.jsonl 冷存储封顶（防 /home 写满 → writable base 漂到 /tmp
+--   tmpfs → 重启历史丢失；行对齐截断保首行完整 JSON）
+-- ═══════════════════════════════════════════
 
 -- ═══════════════════════════════════════════
 -- debug 报告: 无全局/模块 computer 时不崩

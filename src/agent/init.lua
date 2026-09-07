@@ -554,8 +554,18 @@ local function handle_command(cmd, config, messages)
     -- 从选定会话继续追加，而非只读回放）。归档恢复时迁移为同名 .jsonl
     -- （续写判断: 对侧 jsonl 条数 >= 归档则直接续写，避免覆盖上次恢复
     -- 后新增的消息；.txt 保留——cleanup_sessions 约定不动归档）。
-    local sdir = session_mod.get_sessions_dir()
+    local sdir = session_mod.get_sessions_dir() or config_mod.sessions_dir
     local entries = {}
+    -- 归档文件名 agent_history_<游戏时间戳>.txt → 人类可读日期（游戏钟）
+    local function archive_label(name)
+      local stamp = tonumber(name:match("^agent_history_(%d+%.?%d*)$"))
+      if stamp then
+        local ok_d, d = pcall(os.date, "%Y-%m-%d %H:%M", stamp)
+        if ok_d and d then return d end
+      end
+      return name
+    end
+    local main_count = 0
     local function preview_of(content)
       local p = tostring(content or ""):gsub("%s+", " ")
       if p == "" then return "" end
@@ -565,7 +575,7 @@ local function handle_command(cmd, config, messages)
     -- 单遍流式统计 + 首条 user 消息预览（损坏行跳过，与 load_history 同策略）
     local function scan_jsonl(name, path, kind)
       local f = io.open(path, "r")
-      if not f then return end
+      if not f then return 0 end
       local count, preview = 0, ""
       for line in f:lines() do
         local ok_j, msg = pcall(json.decode, line)
@@ -580,6 +590,7 @@ local function handle_command(cmd, config, messages)
       if count > 0 then
         entries[#entries + 1] = {name = name, kind = kind or "session", path = path, count = count, preview = preview}
       end
+      return count
     end
     -- 归档 .txt → {name, count, preview}（unserialize 失败 = 损坏，跳过）
     local function scan_archive(name, path)
@@ -599,9 +610,9 @@ local function handle_command(cmd, config, messages)
           break
         end
       end
-      entries[#entries + 1] = {name = name, kind = "archive", path = path, count = #list, preview = preview}
+      entries[#entries + 1] = {name = name, kind = "archive", path = path, count = #list, preview = preview, label = archive_label(name)}
     end
-    scan_jsonl("default", HISTORY_PATH, "main")
+    main_count = scan_jsonl("default", HISTORY_PATH, "main") or 0
     do
       local fs = require("filesystem")
       local ok_l, iter = pcall(fs.list, sdir)
@@ -625,7 +636,8 @@ local function handle_command(cmd, config, messages)
       end
     end
     if #entries == 0 then
-      print("No resumable sessions (named sessions & /new archives; /session <name> to create)")
+      print("No resumable sessions (named sessions & /new archives; /session <name> to create)"
+        .. (main_count == 0 and " —— 主会话为空（/new 归档后未再对话，或历史在 " .. sdir .. " 之外）" or ""))
     else
       local function resolve(sel)
         local n = tonumber(sel)
@@ -633,7 +645,7 @@ local function handle_command(cmd, config, messages)
           return entries[n]
         end
         for _, e in ipairs(entries) do
-          if e.name == sel then return e end
+          if e.name == sel or e.label == sel then return e end
         end
         local base = sel:gsub("%.jsonl$", ""):gsub("%.txt$", "")
         for _, e in ipairs(entries) do
@@ -678,6 +690,10 @@ local function handle_command(cmd, config, messages)
           local msgs = trim_history(list)
           session_mod.set_paths(jsonl_path)
           rebuild_history(msgs)
+          if #msgs < #list then
+            print("  (按内存预算裁剪: 加载 " .. #msgs .. "/" .. #list
+              .. " 条——最早的 " .. (#list - #msgs) .. " 条仍在归档 " .. e.path .. " 中)")
+          end
           print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, archive migrated to JSONL; .txt kept)")
           return msgs
         else
@@ -696,7 +712,8 @@ local function handle_command(cmd, config, messages)
           local tag = e.kind == "archive" and " [archive]" or (e.kind == "main" and " [main]" or "")
           local cur = e.path == session_mod.current_path() and " *current*" or ""
           local pv = e.preview ~= "" and "  | " .. e.preview or ""
-          print(string.format("  %d. %-20s (%d msgs)%s%s%s", i, e.name, e.count, tag, cur, pv))
+          local disp = e.kind == "archive" and (e.label or e.name) or e.name
+          print(string.format("  %d. %-20s (%d msgs)%s%s%s", i, disp, e.count, tag, cur, pv))
         end
         io.write("Resume # (1-" .. #entries .. ", Enter=cancel): ")
         local line
