@@ -524,7 +524,7 @@ do
   local e_code, e_resp, e_err = http_post("https://mock/hang2", {}, "{}",
     function() end)
   internet.request = real_request
-  http_mod.set_response_timeout(120)
+  http_mod.set_response_timeout(900)
   http_mod.set_budget(60)
   test("network-error budget exhaustion mentions retry count",
     type(e_err) == "string" and e_err:find("重试", 1, true) ~= nil
@@ -594,9 +594,9 @@ do
     "err=" .. tostring(d_res and d_res.error)
       .. string.format(" %.2fs", d_elapsed))
 
-  -- 恢复默认（_TEST_MODE: budget 60 / response timeout 120 / body limit 128KB）
+  -- 恢复默认（_TEST_MODE: budget 60 / response timeout 900 / body limit 128KB）
   http_mod.set_budget(60)
-  http_mod.set_response_timeout(120)
+  http_mod.set_response_timeout(900)
   http_mod.set_response_body_limit(131072)
 end
 
