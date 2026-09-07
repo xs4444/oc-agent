@@ -579,6 +579,15 @@ function mock_internet.request(url, data, headers, method)
     local body = '<html><head><title>301 Moved Permanently</title></head><body><a href="https://final.example/landed">here</a></body>'
     return make_handle(body)
   end
+  -- Simulate jsDelivr raw-file mirror (fixture for web_fetch GFW rewrite)
+  if url:match("^https://cdn%.jsdelivr%.net/gh/") then
+    return make_handle("JSDELIVR-FIXTURE-FILE-CONTENT")
+  end
+  -- Simulate GitHub gists API (fixture for web_fetch GFW rewrite)
+  if url:match("^https://api%.github%.com/gists/") then
+    local body = '{"files":{"note.txt":{"content":"GIST-FIXTURE-CONTENT"}}}'
+    return make_handle(body)
+  end
   error("internet.mock: cannot handle " .. url)
 end
 
