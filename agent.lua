@@ -2694,6 +2694,7 @@ local function build_system_prompt()
     .. "- search_files: Search file contents for a pattern (recursive; 'path:line: content' output; result cap 50). Use for broad code search; for quick one-off greps, `grep` via shell_execute works too\n"
     .. "- web_search: Search the web for information (titles, URLs, snippets). Backends: Tavily if configured, else Bing (general + Chinese, keyless), Hacker News as last resort.\n"
     .. "- web_fetch: Fetch a URL and return readable text (HTML stripped). No redirect following — if it reports 'redirected to: ...', call web_fetch again with that URL. Capped at 32KB by default (max_bytes up to 65536).\n"
+    .. "- GitHub from this machine: this world's egress filters github 443 (github.com/gist.github.com/raw.githubusercontent.com connect time out ~25% of the time, each failure wastes ~21s). web_fetch AUTO-REWRITES raw files, gists, issues and PRs to reachable endpoints (cdn.jsdelivr.net / api.github.com — result starts with a 'GFW rewrite:' note). For other GitHub HTML pages prefer the API form when possible (api.github.com/repos/...); if a page is truly unreachable, ask the user to fetch it with the local gh_fetch tool (it lands at /home/cache/<name> — then read_file it).\n"
     .. "- subagent_call: Delegate heavy work to another computer on your modem network running agent.lua --subagent. Pass its modem address + task (+ role). It uses its own memory/disk.\n"
     .. "Subagent session reuse: pass the same `session` id to a subagent to continue its previous conversation (context preserved on its disk); omit `session` for a fresh session. Reuse the session of a subagent when a new task continues prior work; use a fresh session for unrelated work. A subagent may reply 'busy' if it is still processing a previous task in that session — retry later.\n\n"
     .. "- shell_execute: Run an OpenOS shell command (ls/find/grep/df/components all available; run Lua via a script file — `lua /tmp/x.lua`, the lua wrapper has NO -e flag). SCRIPTS: `print()` writes to the machine terminal (leaks to the in-game screen), NOT to the captured output — use `io.stdout:write(...)` for output you want captured, or write a result file and `cat` it. SYNTAX TRAPS: `head` only accepts `--lines=N` (`head -40` prints usage to the screen and leaves the captured output empty); `grep` uses LUA patterns, not POSIX (no `\\|` alternation, no -E; -i -r -n -l -c -w -x -v -o --max-count=N are supported) — for alternation run grep once per pattern\n"
@@ -7011,12 +7012,38 @@ local tools = {
   }},
   {type="function", ["function"]={
     name="web_fetch",
-    description="Fetch a URL and return its content as readable text (HTML tags stripped, entities decoded). OpenOS internet does NOT follow redirects — if the result says 'redirected', fetch the target URL directly. Default cap 32KB; max_bytes up to 65536.",
+    description="Fetch a URL and return its content as readable text (HTML tags stripped, entities decoded). OpenOS internet does NOT follow redirects — if the result says 'redirected', fetch the target URL directly. Default cap 32KB; max_bytes up to 65536. GitHub raw/gist/issues/pull URLs are auto-rewritten to reachable equivalents (cdn.jsdelivr.net / api.github.com) when this machine's egress filters github 443 (GFW) — the result then starts with a 'GFW rewrite:' note.",
     parameters={type="object", properties={url={type="string", description="http(s) URL to fetch"}, max_bytes={type="number", description="Max bytes returned (1024-65536, default 32768)"}}, required={"url"}}
   }},
 }
 
 -- ── 纯函数辅助（可单测，_TEST_MODE 下经 _internal 暴露）────────────
+
+-- GitHub GFW 改写（真机实测 2026-09-07: github.com/gist/raw 的 443 被 SNI 级
+-- 黑洞[直连 ~25% 通、每次失败白等 ~21s]，而 api.github.com 与 cdn.jsdelivr.net
+-- 100% 通）。把有确定等价物的 URL 形态改写到可达端点：
+--   raw.githubusercontent.com/U/R/BR/PATH → cdn.jsdelivr.net/gh/U/R@BR/PATH
+--   github.com/U/R/raw/BR/PATH            → cdn.jsdelivr.net/gh/U/R@BR/PATH
+--   gist.github.com/[U/]ID[/...]           → api.github.com/gists/ID（JSON 含 files 内容）
+--   github.com/U/R/issues/N | pull/N      → api.github.com/repos/U/R/issues(N|pull_requests/N)
+-- 其余 github.com HTML 页面无确定等价物 → 返回 nil（直连，~25% 通）。
+local function rewrite_github(url)
+  local u, r, br, p = url:match("^https://raw%.githubusercontent%.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
+  if u then return "https://cdn.jsdelivr.net/gh/" .. u .. "/" .. r .. "@" .. br .. "/" .. p end
+  u, r, br, p = url:match("^https://github%.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$")
+  if u then return "https://cdn.jsdelivr.net/gh/" .. u .. "/" .. r .. "@" .. br .. "/" .. p end
+  -- 带用户名模式必须先试：匿名模式的 ([0-9a-fA-F]+) 会吃掉十六进制前缀的
+  -- 用户名（alice → "a"），且无尾锚
+  local g = url:match("^https://gist%.github%.com/[^/]+/([0-9a-fA-F]+)")
+  if g then return "https://api.github.com/gists/" .. g end
+  g = url:match("^https://gist%.github%.com/([0-9a-fA-F]+)")
+  if g then return "https://api.github.com/gists/" .. g end
+  u, r, n = url:match("^https://github%.com/([^/]+)/([^/]+)/issues/([0-9]+)")
+  if u then return "https://api.github.com/repos/" .. u .. "/" .. r .. "/issues/" .. n end
+  u, r, n = url:match("^https://github%.com/([^/]+)/([^/]+)/pull/([0-9]+)")
+  if u then return "https://api.github.com/repos/" .. u .. "/" .. r .. "/pull_requests/" .. n end
+  return nil
+end
 
 local ENTITIES = {
   amp="&", lt="<", gt=">", quot='"', apos="'", nbsp=" ",
@@ -7228,6 +7255,10 @@ local function exec(name, args, deps)
       local max_bytes = math.floor(tonumber(args.max_bytes) or 32768)
       if max_bytes < 1024 then max_bytes = 1024 end
       if max_bytes > 65536 then max_bytes = 65536 end
+      -- GitHub GFW 改写（见 rewrite_github）——命中则改道可达端点
+      local rw = rewrite_github(url)
+      local note = rw and ("GFW rewrite: " .. rw .. "\n") or ""
+      if rw then url = rw end
       local internet = require("internet")
       local okr, handle = pcall(function() return internet.request(url) end)
       if not okr then return "fetch error: " .. tostring(handle) end
@@ -7259,13 +7290,13 @@ local function exec(name, args, deps)
       end
 
       local text = html_to_text(body)
-      if text == "" then return "(empty page)" end
+      if text == "" then return note .. "(empty page)" end
       local truncated = #body > max_bytes
       text = text:sub(1, max_bytes)
       if truncated then
         text = text .. "\n…[truncated at " .. max_bytes .. " bytes of " .. #body .. "]"
       end
-      return text
+      return note .. text
     end)
     return ok and result or ("Error: " .. tostring(result))
   end
@@ -7278,7 +7309,7 @@ if _TEST_MODE then
   M._internal = {
     urlencode = urlencode, decode_entities = decode_entities,
     html_to_text = html_to_text, strip_tags = strip_tags, parse_bing = parse_bing,
-    utf8_char = utf8_char,
+    utf8_char = utf8_char, rewrite_github = rewrite_github,
   }
 end
 return M

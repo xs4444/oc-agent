@@ -225,7 +225,7 @@ print("")
 print(string.format("JSON tests: %d pass, %d fail", pass, fail))
 
 -- Check if total tests match
-local total_tests = 26
+local total_tests = 31
 if pass + fail ~= total_tests then
   print(string.format("WARNING: ran %d tests, expected %d", pass + fail, total_tests))
 else
@@ -282,6 +282,18 @@ test_tool("web_fetch rejects non-http", "web_fetch", '{"url":"ftp://x"}',
   function(r) return r:find("^Error") ~= nil end)
 test_tool("web_fetch unknown host", "web_fetch", '{"url":"https://nope.mock.test/"}',
   function(r) return r:find("fetch error") ~= nil end)
+-- v0.3.126: GitHub GFW 改写——raw 文件改道 jsDelivr、gist 改道 api（mock 端点）
+test_tool("web_fetch github raw→jsDelivr rewrite", "web_fetch",
+  '{"url":"https://raw.githubusercontent.com/foo/bar/master/baz.lua"}',
+  function(r) return r:find("GFW rewrite: https://cdn%.jsdelivr%.net/gh/foo/bar@master/baz%.lua") ~= nil
+    and r:find("JSDELIVR-FIXTURE-FILE-CONTENT", 1, true) ~= nil end)
+test_tool("web_fetch github gist→api rewrite", "web_fetch",
+  '{"url":"https://gist.github.com/someuser/abc123def456/raw/note.txt"}',
+  function(r) return r:find("GFW rewrite: https://api%.github%.com/gists/abc123def456") ~= nil
+    and r:find("GIST-FIXTURE-CONTENT", 1, true) ~= nil end)
+test_tool("web_fetch non-github url unrewritten", "web_fetch",
+  '{"url":"https://fetch.example/page"}',
+  function(r) return r:find("GFW rewrite") == nil end)
 
 -- v0.3.124: component_doc / component_invoke 工具已删（用 lua -e 调组件）
 
@@ -1419,7 +1431,7 @@ local keep_long = agent_test.compact_history(keep_long_msgs, {model = "m", api_k
 agent_test.set_chat(agent_test.chat)
 test("KEEP truncates long embed", keep_long
   and keep_long[1].content:find("truncated") ~= nil
-  and keep_long[1].content:find("tail-marker") == nil,
+  and keep_long[1].content:find("tail-marker", 1, true) == nil,
   tostring(keep_long and keep_long[1].content or nil):sub(1, 300))
 
 -- 任务4: REF 双标记（opencode-acp keep-markers）——[[REF:N|desc]] 展开为
@@ -3100,6 +3112,30 @@ do
       "n=" .. tostring(#items))
     test("search: parse_bing limit 生效",
       #H.parse_bing('<li class="b_algo"><h2><a href="https://x.org/a">T1</a></h2><p>s</p></li><li class="b_algo"><h2><a href="https://x.org/b">T2</a></h2><p>s</p></li>', 1) == 1, "limit")
+    -- v0.3.126: GitHub GFW 改写纯函数
+    test("search: rewrite_github raw→jsDelivr",
+      H.rewrite_github("https://raw.githubusercontent.com/foo/bar/master/baz.lua")
+        == "https://cdn.jsdelivr.net/gh/foo/bar@master/baz.lua",
+      tostring(H.rewrite_github("https://raw.githubusercontent.com/foo/bar/master/baz.lua")))
+    test("search: rewrite_github github raw 路径→jsDelivr",
+      H.rewrite_github("https://github.com/foo/bar/raw/dev/deep/path.txt")
+        == "https://cdn.jsdelivr.net/gh/foo/bar@dev/deep/path.txt",
+      tostring(H.rewrite_github("https://github.com/foo/bar/raw/dev/deep/path.txt")))
+    test("search: rewrite_github gist 匿名→api",
+      H.rewrite_github("https://gist.github.com/abc123def456") == "https://api.github.com/gists/abc123def456")
+    test("search: rewrite_github gist 用户名→api",
+      H.rewrite_github("https://gist.github.com/alice/abc123def456/raw/note.txt")
+        == "https://api.github.com/gists/abc123def456")
+    test("search: rewrite_github issues→api",
+      H.rewrite_github("https://github.com/foo/bar/issues/42")
+        == "https://api.github.com/repos/foo/bar/issues/42")
+    test("search: rewrite_github pull→api",
+      H.rewrite_github("https://github.com/foo/bar/pull/42")
+        == "https://api.github.com/repos/foo/bar/pull_requests/42")
+    test("search: rewrite_github 非确定性形态不改写",
+      H.rewrite_github("https://github.com/foo/bar") == nil
+      and H.rewrite_github("https://api.github.com/repos/foo/bar") == nil
+      and H.rewrite_github("https://example.com/a") == nil)
   end
 end
 
