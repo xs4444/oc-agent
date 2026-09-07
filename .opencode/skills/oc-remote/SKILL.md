@@ -57,6 +57,27 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
 - 内存查询用 `computer.totalMemory()/freeMemory()`（`component.list("memory")()=0`
   两宿主皆空——memory 不在注册表）
 - 出口网络通（frp 隧道外）；中文/emoji 全链路无损
+- **出口可达性矩阵**（2026-09-07 lua op internet.request 电池实证）：
+  | 端点 | 结果 |
+  |---|---|
+  | `https://github.com`(443) | **~25% 通**（SNI 级黑洞：DNS 正常、SYN 丢包；失败="Connection timed out: connect" ~21s 白等） |
+  | `gist.github.com` / `raw.githubusercontent.com` | 0/8 |
+  | `api.github.com` | **100% 通**（1.2s） |
+  | `cdn.jsdelivr.net`（含 /gh/ 镜像） | ~100% 通（3.4-9.7s，**间歇 "Connection/Read timed out"**=GFW 抖动，分钟级重试可过） |
+  | `http://github.com`(80) | 通（650ms） |
+  | Cloudflare 系（worldtimeapi/httpbin/time.is） | 服务器出口封（重置/TLS 失败） |
+  | 国内（time1.cloud.tencent.com） | TCP 超时 |
+  定性=**443 SNI 级过滤**（api.github.com 与 github.com 同 IP 段 140.82.112.0/22 却通→非 IP 封锁）；
+  DoH/QUIC 无效（过滤在 SNI 层）。update.lua 走 jsDelivr+api tags 不受影响
+- **GitHub 抓取=A 自动改写 + B 取件柜**（v0.3.126r2, commit 4ac3efa）：
+  - A: `web_fetch` 内建 `rewrite_github`——raw/gist/issues/pull URL 自动改道
+    cdn.jsdelivr.net / api.github.com（结果加 "GFW rewrite: <url>" 前缀）；
+    其余 HTML 页面无确定等价物→不改写直连（~25% 通）
+  - B: `python3 tools/gh_fetch.py <url> [--name X]`——本机抓取（直连→gh-proxy.com
+    镜像→Clash 7897）≤99KB→远控 op=write 推 `/home/cache/<name>`→agent read_file 本地
+  - 第三方加速镜像（gh-proxy.com/ghfast.top/ghproxy.net 等 10 家 2026-09-07 预筛）：
+    3 家活但**短寿命公共服务 70% 已死**+真机无法安全验证（见坑 22）→不作主力，
+    只留作 gh_fetch 的中间 fallback
 - **磁盘图**（df 实证）：`/`=OpenOS 根盘 4MB（**/home 在此**，余 ~1.8MB）；
   三驱动 `/mnt/857` 4MB 1%、`/mnt/bb7` 4MB 14%（**agent 多文件部署树
   /mnt/bb7/agent/**，入口 agent.lua ~119KB）、`/mnt/9ab` 2MB 41%；
@@ -193,6 +214,18 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
      （"unexpected symbol near 'local'"，与注释词法歧义相关）；`[==[` 多次上传
      字节级一致。**规则：远控上传一律 `[==[` 及以上**，部署后读回 n/sum/head16
      校验缺一不可。
+  22. **native internet 连接等待不受 lua 看门狗管（真机电池烧进程实证）**：
+      internet.request 的**连接建立**等待发生在 native 层（Java socket connect，
+      ~2min/个失败端点），期间 Lua 不让出→坑 13 的宿主 CPU 看门狗杀 agent 进程
+      （c320/c322 两轮镜像电池均：首个 ~21s 等待存活，第二个端点起无 report，
+      /status online=False 直至用户重启）。lua op 看门狗只护 Lua sleep 点，护不了
+      native 阻塞。**规则：真机网络电池先本机预筛（curl 直连/镜像/Clash 三通道），
+      上真机的端点 ≤3 个且逐个发（别一次 10 个）**。
+  23. **Lua pattern 的 `-` 是元字符**（`x-` = 0 个或多个 x）：测试断言里
+      `r:find("JSDELIVR-FIXTURE-CONTENT")` 会因 `R-`/`E-` 解析成重复量词而**误判
+      不匹配**（532 回归里 2 个 web_fetch 用例因此假 FAIL，实际输出正确）；字面量
+      匹配用 plain 模式 `r:find(s, 1, true)` 或转义 `%-`。同型隐患：期望"不匹配"的
+      断言（==nil）在 pattern 坏了时假通过——写测试时留意。
 
 ## 真机部署/恢复配方
 
@@ -213,10 +246,10 @@ lua update.lua v0.3.125          -- 升级（走 tag；回滚=v0.3.124）
 deadline 注入/结构化 is_err/fetch 分页 64KB 分块 + 256KB 封顶/report 重试/413/
 400 多行拒收/429 队列满/lost 判定/ensure_ascii=False/HTTP/1.1/写失败检查 r7/
 json %c 显式类 r7b/web_search Bing+web_fetch/LLM 无 chunk 挂起防护 8b1bfb9/
-响应读超时 900s 1e870fb）。
+响应读超时 900s 1e870fb/GitHub GFW 自动改写+gh_fetch 取件柜 4ac3efa）。
 agent.lua 单文件构建（scripts/build_single.lua，21 preload）；发版走 Clash 7897
 代理 push + tag。
 
-**⚠️ 远端 tag 仍是 v0.3.125（不含 r7/r7b/web 工具/8b1bfb9 修复）**——真机跑的是
-手动部署的多文件树（/mnt/bb7/agent/，与 master 逐字节同步）；再跑 `update.lua`
-会用 tag 载荷覆盖并**回滚**。新 tag v0.3.126 待用户发话。
+**⚠️ 远端 tag 仍是 v0.3.125（不含 r7/r7b/web 工具/8b1bfb9 修复/900s/A+B 4ac3efa）**——
+真机跑的是手动部署的多文件树（/mnt/bb7/agent/，与 master 逐字节同步）；再跑
+`update.lua` 会用 tag 载荷覆盖并**回滚**。新 tag v0.3.126 待用户发话。
