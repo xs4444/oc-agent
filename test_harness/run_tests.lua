@@ -1887,6 +1887,60 @@ if ok_tui and type(tui_mod) == "table" then
   pcall(tui_mod.cleanup)
 end
 
+-- v0.3.126r7 loadHistory: /resume 恢复历史会话后整体重建渲染缓冲
+-- （pi renderInitialMessages 模式）——清空 + 逐条按 role 重渲染 + populateHistory。
+-- 独立 do 块 + 自 require（隔离作用域, 避免 main chunk 局部变量超 200 上限）。
+do
+  local ok_lh_tui, lh_tui = pcall(require, "agent.tui")
+  test("loadHistory: tui module available",
+    ok_lh_tui and type(lh_tui) == "table", tostring(ok_lh_tui))
+  if ok_lh_tui and type(lh_tui) == "table" then
+    lh_tui.init()
+    local msgs = {
+      {role = "system", content = "[上下文] system prompt 不应入屏"},
+      {role = "user", content = "恢复的历史问题A"},
+      {role = "assistant", content = "恢复的回答A",
+        tool_calls = {{id = "call_0", ["function"] = {name = "read_file",
+          arguments = '{"path":"/x.lua"}'}}}},
+      {role = "tool", tool_call_id = "call_0", content = "文件内容RESULT"},
+      {role = "user", content = "恢复的历史问题B"},
+      {role = "assistant", content = "恢复的回答B"},
+    }
+    test("loadHistory call safe", pcall(lh_tui.loadHistory, msgs))
+    local joined = ""
+    for _, e in ipairs(lh_tui.history()) do joined = joined .. e.text .. "\n" end
+    test("loadHistory renders user+assistant",
+      joined:find("恢复的历史问题A", 1, true) ~= nil
+      and joined:find("恢复的回答A", 1, true) ~= nil
+      and joined:find("恢复的历史问题B", 1, true) ~= nil
+      and joined:find("恢复的回答B", 1, true) ~= nil,
+      joined:sub(1, 120))
+    test("loadHistory renders tool call + result",
+      joined:find(">> read_file", 1, true) ~= nil
+      and joined:find("文件内容RESULT", 1, true) ~= nil,
+      joined:sub(1, 160))
+    test("loadHistory skips system",
+      joined:find("[上下文] system", 1, true) == nil)
+    local pA = joined:find("恢复的历史问题A", 1, true)
+    local pAa = joined:find("恢复的回答A", 1, true)
+    local pB = joined:find("恢复的历史问题B", 1, true)
+    test("loadHistory preserves order",
+      pA and pAa and pB and pA < pAa and pAa < pB)
+    -- populateHistory（pi 语义）: user 消息进命令历史（↑ 可翻）, system 不进
+    local cmd = lh_tui.debug_cmd_history()
+    test("loadHistory populateHistory user prompts",
+      #cmd == 2 and cmd[1] == "恢复的历史问题A" and cmd[2] == "恢复的历史问题B",
+      "#cmd=" .. tostring(#cmd))
+    -- 空表 → 清空渲染缓冲; nil 安全
+    lh_tui.init()
+    local before = #lh_tui.history()
+    pcall(lh_tui.loadHistory, {})
+    test("loadHistory empty clears buffer", #lh_tui.history() <= before)
+    test("loadHistory nil safe", pcall(lh_tui.loadHistory, nil))
+    pcall(lh_tui.cleanup)
+  end
+end
+
 print("")
 print("═══════════════════════════════════════")
 print("Content Selection (v0.3.100) Tests")

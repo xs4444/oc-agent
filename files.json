@@ -5,7 +5,7 @@
     "debug.lua": 16478,
     "execute.lua": 3404,
     "http.lua": 13630,
-    "init.lua": 122411,
+    "init.lua": 123265,
     "interrupt.lua": 4297,
     "json.lua": 10581,
     "patch.lua": 6458,
@@ -20,9 +20,9 @@
     "tools/search.lua": 14934,
     "tools/shell.lua": 7347,
     "tools/subagent.lua": 9228,
-    "tui.lua": 101605,
+    "tui.lua": 105453,
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-08T1900"
+  "version": "2026-09-08T2050"
 }

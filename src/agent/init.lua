@@ -502,6 +502,7 @@ local function handle_command(cmd, config, messages)
     end
     messages = {}
     rebuild_history(messages)
+    if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
     print("New session started")
   elseif command == "/compact" then
     if #messages == 0 then
@@ -512,6 +513,7 @@ local function handle_command(cmd, config, messages)
       if compacted then
         messages = compacted
         rebuild_history(messages)
+        if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
         print("Compacted: " .. #messages .. " messages kept (summary + recent)")
       else
         print("Compaction failed (network or model error); conversation unchanged")
@@ -520,6 +522,7 @@ local function handle_command(cmd, config, messages)
   elseif command == "/reset" then
     messages = {}
     rebuild_history(messages)
+    if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
     print("History cleared")
   elseif command == "/restart" then
     -- 原地重启机器（OpenOS: computer.shutdown(true) = runlevel 6，区别于
@@ -552,6 +555,7 @@ local function handle_command(cmd, config, messages)
       if target == "default" then
         session_mod.set_paths(HISTORY_PATH)
         messages = session_mod.load_history()
+        if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
         print("Session: default (" .. #messages .. " msgs)")
       else
         local safe = target:gsub("[^%w_%-]", "_"):sub(1, 64)
@@ -562,6 +566,7 @@ local function handle_command(cmd, config, messages)
         else
           session_mod.set_paths(SESSIONS_DIR .. "/" .. safe .. ".jsonl")
           messages = session_mod.load_history()
+          if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
           print("Session: " .. safe .. " (" .. #messages .. " msgs)")
         end
       end
@@ -759,7 +764,12 @@ local function handle_command(cmd, config, messages)
           print("No such session: " .. sel .. " (/resume to list)")
         else
           local new_msgs = do_resume(e)
-          if new_msgs then messages = new_msgs end
+          if new_msgs then
+            messages = new_msgs
+            -- 恢复历史后整体重建 TUI 渲染缓冲（否则恢复的消息只进
+            -- messages 表, 不进屏——用户看不到恢复的会话历史）
+            if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(new_msgs) end
+          end
         end
       end
     end
@@ -2393,6 +2403,9 @@ local function main(config, ...)
       -- 内容区搜索（v0.3.109 P1-3, tmux window_copy_search 移植）
       UI_HOOKS.search = function(pat) ui.search(pat) end
       UI_HOOKS.searchNext = function(dir) ui.searchNext(dir) end
+      -- v0.3.126r7: /resume 恢复历史会话后整体重建渲染缓冲（pi
+      -- renderInitialMessages 模式）——替换 messages 后重渲染 TUI
+      UI_HOOKS.loadHistory = function(msgs) ui.loadHistory(msgs) end
     end
   end
 

@@ -767,6 +767,91 @@ local function json_encode(v)
   return ok and out or tostring(v)
 end
 
+-- 整体重建渲染缓冲（/resume 恢复历史会话用, v0.3.126r7）。
+-- 参考 pi coding-agent 的 resume 模式（interactive-mode.ts:
+--   renderInitialMessages → renderSessionEntries(entries) → renderSessionItems
+--   → addMessageToChat(message, {populateHistory})）: initial load 与 resume
+--   都从 session 状态**全量重渲染** chat 容器（非追加）。
+-- 问题（用户报告: "resume 后会话历史没恢复到 tui 中"）: 主循环逐条
+-- printRole 渲染, state.history 只增不重建——/resume 整体替换 messages 后
+-- 渲染缓冲仍是旧的, 恢复的历史没进屏。
+-- 本函数 = OC 的 renderInitialMessages 等价物:
+--   · 清空 state.history + 行缓存/脏行/选中/搜索/滚动态
+--   · 逐条按 role 重渲染（与主循环 printRole/printToolCall/printToolResult
+--     同款前缀+色）: user "> "(蓝) / assistant 正文(白)+tool_calls ">>name"
+--     (黄)+args(灰) / tool "<<result"(灰); system/未知 role 跳过
+--   · populateHistory（pi 语义）: user 消息填入命令历史 state.cmdHistory,
+--     ↑ 可翻历史 prompt（去重保序, 上限 50 与主循环 term_history 一致）
+--   · 滚到底 + 单次 redrawContent（appendHistory 已含 MAX_HISTORY=1000
+--     前裁——超长恢复会话显示缓冲有界, 全量数据仍在 session 文件）
+-- messages = 恢复后的会话消息表 {role, content, tool_calls?}。
+function tui.loadHistory(messages)
+  if type(messages) ~= "table" then return end
+  state.history = {}
+  state.lineCache = {}
+  state.dirtyRows = {}
+  state.search = nil
+  state.csel = nil
+  state.csel_active = nil
+  state.scrollOffset = 0
+  local _, _, w = getContentBounds()
+  local cmdUser = {}
+  local function contentStr(c)
+    if c == nil then return "" end
+    if type(c) == "string" then return c end
+    return json_encode(c)
+  end
+  local function pushLine(text, color)
+    for _, line in ipairs(wrapText(text, w)) do
+      appendHistory({text = line, color = color})
+    end
+  end
+  for _, m in ipairs(messages) do
+    if type(m) ~= "table" then break end
+    local role, content = m.role, m.content
+    if role == "user" then
+      local text = contentStr(content)
+      pushLine("> " .. text, tui.colors.user)
+      if text ~= "" then cmdUser[#cmdUser + 1] = text end
+    elseif role == "assistant" then
+      local text = contentStr(content)
+      if text ~= "" then pushLine(text, tui.colors.assistant) end
+      if type(m.tool_calls) == "table" then
+        for _, tc in ipairs(m.tool_calls) do
+          if type(tc) ~= "table" then break end
+          local fn = tc["function"] or {}
+          pushLine(">> " .. tostring(fn.name or "?"), tui.colors.toolName)
+          if fn.arguments ~= nil then
+            local s = type(fn.arguments) == "string"
+              and fn.arguments or json_encode(fn.arguments)
+            if ulen(s) > 100 then s = usub(s, 1, 97) .. "..." end
+            pushLine("   " .. s, tui.colors.dim)
+          end
+        end
+      end
+    elseif role == "tool" then
+      local s = contentStr(content)
+      if ulen(s) > 200 then s = usub(s, 1, 197) .. "..." end
+      pushLine("<< " .. s, tui.colors.dim)
+    end
+    -- system / 未知 role: 上下文不入屏
+  end
+  -- populateHistory（pi renderSessionEntries 同款）: user 消息进命令历史
+  if #cmdUser > 0 then
+    local hist = {}
+    for _, t in ipairs(cmdUser) do hist[#hist + 1] = t end
+    if #hist > 50 then
+      local trimmed = {}
+      for i = #hist - 49, #hist do trimmed[#trimmed + 1] = hist[i] end
+      hist = trimmed
+    end
+    state.cmdHistory = hist
+    state.cmdHistoryIndex = 0
+  end
+  state.scrollOffset = 0
+  pcall(tui.redrawContent)
+end
+
 -- ════════════════════════════════════════
 -- 增量重绘（v0.3.109 P0-2）
 -- ════════════════════════════════════════
@@ -2249,6 +2334,10 @@ function tui.debug_input_buffer()
 end
 function tui.debug_scroll_offset()
   return state.scrollOffset or 0
+end
+-- v0.3.126r7: loadHistory populateHistory 断言用（↑ 可翻历史 prompt）
+function tui.debug_cmd_history()
+  return state.cmdHistory or {}
 end
 
 return tui
