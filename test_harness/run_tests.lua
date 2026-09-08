@@ -2741,6 +2741,9 @@ do  -- 包裹成块: 主 chunk 局部变量贴 200 上限时 VM 寄存器错乱�
   test("/search without TUI prints hint", not exit8)
   local exit9 = agent_test.handle_command("/snext", cmd_cfg, cmd_msgs)
   test("/snext without TUI prints hint", not exit9)
+  -- /restart: 测试环境无 computer.shutdown（oc_mock 未提供）→ 优雅降级不崩
+  local exit10 = agent_test.handle_command("/restart", cmd_cfg, cmd_msgs)
+  test("/restart degrades gracefully without computer.shutdown", not exit10)
   -- 清理
   os.remove(sdir .. "/alpha.jsonl")
   os.remove(sdir .. "/beta.jsonl")

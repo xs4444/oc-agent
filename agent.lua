@@ -8268,6 +8268,18 @@ local function handle_command(cmd, config, messages)
     messages = {}
     rebuild_history(messages)
     print("History cleared")
+  elseif command == "/restart" then
+    -- 原地重启机器（OpenOS: computer.shutdown(true) = runlevel 6，区别于
+    -- 无参 shutdown() 关机）。重启后根盘 /init.lua 自动拉起 agent
+    -- （v0.3.126 已装），无需人工进 shell。消息逐条即时落盘，重启不丢。
+    local ok_c, c = pcall(require, "computer")
+    if not ok_c or type(c) ~= "table" or type(c.shutdown) ~= "function" then
+      print("Restart unavailable (no computer component in this environment)")
+    else
+      print("Rebooting computer (agent auto-restarts via /init.lua)...")
+      os.sleep(0.2)  -- 让输出刷上屏
+      c.shutdown(true)
+    end
   elseif command == "/sessions" then
     local list = session_mod.list_sessions()
     if #list == 0 then
@@ -8998,6 +9010,7 @@ local function handle_command(cmd, config, messages)
     print("  /new            Archive current session, start fresh conversation")
     print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
     print("  /reset          Clear history without archiving")
+    print("  /restart        Reboot this computer (agent auto-restarts via /init.lua)")
     print("  /hist           Show current session name and message count")
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
@@ -10081,7 +10094,7 @@ local function main(config, ...)
         return table.concat(parts, "  ")
       end)
       -- Tab 补全: 命令 + 工具名
-      local comps = {"/help", "/ctx", "/ml", "/new", "/resume", "/reset", "/compact", "/hist",
+      local comps = {"/help", "/ctx", "/ml", "/new", "/resume", "/reset", "/restart", "/compact", "/hist",
         "/sessions", "/session", "/relocate", "/preset-256k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
