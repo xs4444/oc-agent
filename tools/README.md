@@ -3,8 +3,8 @@
 | 工具 | 用途 | 用法 |
 |------|------|------|
 | `ocvm_test.py` | ocvm 模拟器测试驱动（重启 VM → 上传 → 运行 → 拉结果）。`EXTRA_FILES` 环境变量上传额外文件；测试结果自动保存到 `test_harness/results/` | `python tools/ocvm_test.py <脚本.lua> [参数...]` |
-| `ssh_ubuntu.py` | 一键执行 Ubuntu 服务器 (<ocvm-host>) 命令（paramiko）。凭据可用 `UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS` 覆盖 | `python tools/ssh_ubuntu.py "cmd"` |
-| `ssh_win.py` | 一键执行 windowsCo (<win-host>) 命令（SSH 密钥）。`--ps` 用 PowerShell（中文路径安全） | `python tools/ssh_win.py "cmd" [--ps]` |
+| `ssh_ubuntu.py` | 一键执行 Ubuntu 内网测试服务器 命令（paramiko）。凭据经 `UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS` env 提供（脱敏，默认占位） | `python tools/ssh_ubuntu.py "cmd"` |
+| `ssh_win.py` | 一键执行 windowsCo 内网穿透服务器 命令（SSH 密钥，`SSH_WIN_HOST/PORT` env 提供）。`--ps` 用 PowerShell（中文路径安全） | `python tools/ssh_win.py "cmd" [--ps]` |
 | `gist.py` | GitHub gist 工具：列表 / 最新报告 / 指定 ID 拉取（`/debug` 报告用）。token 走 `GH_TOKEN` 环境变量 | `python tools/gist.py latest -o report.txt` |
 
 ## 典型组合

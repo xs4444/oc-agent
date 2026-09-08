@@ -1,15 +1,12 @@
-# docs — 设计文档与实现计划
+# docs — 文档
 
-superpowers 工作流（brainstorming → writing-plans → executing-plans）的产物 + 横向对比。
+横向对比文档。（设计文档/实现计划位于 `docs/superpowers/`，内部产物不公开，已 gitignore）
 
 ## 目录结构
 
 ```
 docs/
-├── COMPARISON.md        # 与 oc-ai / pi / pi-subagents 的横向对比（含子代理能力对比）
-└── superpowers/
-    ├── specs/     # 设计文档（brainstorming 产物，实现前经用户审阅）
-    └── plans/     # 实现计划（writing-plans 产物，任务级拆分）
+└── COMPARISON.md        # 与 oc-ai / pi / pi-subagents 的横向对比（含子代理能力对比）
 ```
 
 ## 文档索引
@@ -17,19 +14,16 @@ docs/
 | 文件 | 阶段 | 说明 |
 |------|------|------|
 | `COMPARISON.md` | 对比 | agent.lua vs oc-ai（OC SDK）vs pi（TS harness）vs pi-subagents（子代理参考）|
-| `specs/2026-07-28-oc-agent-design.md` | 设计 | OC Agent 完整设计：JSON/HTTP/工具/LLM/REPL 架构、硬件需求、风险 |
-| `superpowers/plans/2026-07-28-oc-agent.md` | 计划 | 7 个任务的实现计划（JSON 编解码 → HTTP → 工具 → LLM → 配置 → REPL → 集成）|
-| `superpowers/plans/2026-08-03-modular-split.md` | 计划 | 模块化拆分（4 阶段）：工具插件化 → 基础设施模块 → 核心装配 → 自举扩展验证 |
 
 ## 与现状的差异
 
 计划/设计文档编写于开发初期，后续迭代引入了文档之外的内容：
 
-- **新增工具**：`component_doc` / `component_invoke` / `web_search` / `json_query` / `calc` / `text_ops` / `edit_file` / `append_file` / `subagent_call` / `ask_user`（原计划 6 工具 → 现 15 工具）
+- **工具集**：精简为 11 工具（`read_file`+行切片 / `write_file` / `edit_file` / `append_file` / `list_files` / `glob_files` / `grep_files` / `json_query` / `web_search` / `shell_execute` / `subagent_call`）；移除 `calc`/`text_ops`/`component_*`/`execute_lua`
 - **移除 execute_lua**：任意代码执行被数据处理工具集替代（安全 + 防 OOM）
 - **子代理**：modem 组网跨机器委派 + session 会话复用（参考 opencode 会话模型与 pi-subagents 角色设计）
 - **文件工具族**：read 行切片（offset/limit/tail）+ edit_file + append_file（内存恒定流式追加）
-- **默认模型**：从 OpenRouter/gpt-4o-mini 改为 OpenCode Zen 免费模型
+- **端点/模型**：默认不提供（避免硬编码某免费端点过时），首次 setup 或 `/model` `/url` 显式配置任意 OpenAI 兼容端点
 - **健壮性**：迭代器错误捕获、参数容错、yield 保护、内存三重裁剪、HTTP 自动重试（均源于模拟器/真实环境实测发现）
 - **持久化**：append-only JSONL 会话日志（替代整表重写）+ anchored summary 增量压缩 + 会话归档
 - **安装方式**：从"loot 磁盘"改为 GitHub 自动安装（update.lua 一键更新 → 查 jsDelivr data API 最新 tag → 不可变 tag URL 下载；install.lua 多文件安装 + 增量更新 + PATH 启动器）
@@ -51,6 +45,6 @@ docs/
 - **TUI**：参考 DonChong2000/oc-ai 实现全屏终端 UI（header/内容区/状态栏/输入行四区布局、角色着色、Tab 补全、输入历史、滚动、T1 GPU 单色兼容）；print 代理集成（现有日志自动进内容区）；状态栏显示 ctx%/cache%/model；ask_user 走 TUI 输入行；无 gpu/keyboard 自动回退传统 REPL
 - **模型驱动压缩（opencode-acp 策略）**：压缩由模型调用 `compact_history` 工具主动执行（上下文占用注入运行时尾部块作为决策依据），进程内仅保留 80% 窗口硬保护；KEEP 标记让关键工具结果/错误原文内嵌进摘要（越界引用非阻塞警告）；保留策略双轨（≥4 条 + ≥1500 token，封顶 8 条）；窗口比例 0.6 + 条数 48 触发判定供 /ctx 建议
 - **工具层护栏**：shell_execute 入口确定性拦截 Unix-only 命令（uname/head/tail/grep/wc/curl/wget，含管道内）+ 裸 lua REPL（OpenOS 无这些命令，错误信息内含等价做法）——替代 system prompt 大段指令，不依赖模型遵守
-- **前缀缓存计费优化**：system prompt 静态化（进程内 memoize，字节稳定）+ uptime/freeMemory/组件列表移入请求尾部 runtime 块 → 前缀缓存命中（讯飞 kimi k2.6 实测 2432/2669 = 91%）；`/ctx`/`[ctx]` 显示缓存命中率（兼容 DeepSeek 与 OpenAI 新格式 usage 字段）；trim_history/force_trim 保留首条消息锚定缓存前缀；http 重试改为 opencode 风格指数退避（总预算 1 小时，测试环境 60s）
+- **前缀缓存计费优化**：system prompt 静态化（进程内 memoize，字节稳定）+ uptime/freeMemory/组件列表移入请求尾部 runtime 块 → 前缀缓存命中（kimi k2.6 实测 2432/2669 = 91%）；`/ctx`/`[ctx]` 显示缓存命中率（兼容 DeepSeek 与 OpenAI 新格式 usage 字段）；trim_history/force_trim 保留首条消息锚定缓存前缀；http 重试改为 opencode 风格指数退避（总预算 1 小时，测试环境 60s）
 
 核心架构（两级循环 + 工具契约 + 动态系统提示）与设计文档一致。

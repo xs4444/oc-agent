@@ -7,8 +7,6 @@
 | 路径 | 说明 |
 |------|------|
 | `agent.lua` | **唯一需要部署到游戏内的文件**（单文件，含全部功能） |
-| `docs/superpowers/specs/2026-07-28-oc-agent-design.md` | 设计文档（superpowers 流程产物） |
-| `docs/superpowers/plans/2026-07-28-oc-agent.md` | 实现计划 |
 
 ## 功能一览
 
@@ -20,8 +18,8 @@
 - **联网搜索**：默认 HN Algolia（无 key），`/tavily <key>` 升级为通用搜索（含中文）
 - **shell_execute 增强**：`io.popen` 捕获 stdout+stderr（不再只返回 true/false）+ 线程超时保护（默认 60s，死循环/挂起命令自动 kill）
 - **append-only 会话日志**：每条消息 JSON 单行追加（O(新增) 内存，替代整表重写 O(n²)）；启动重放 + 裁剪；旧格式自动迁移
-- **自动重试**：网络错误 / 429 / 5xx 自动重试（opencode 风格指数退避 2s×2ⁿ，单次等待封顶 5 分钟，**总预算 1 小时**；测试环境 60s），4xx 不重试——适配讯飞星辰等频繁限流的免费端点
-- **前缀缓存计费优化**：system prompt **静态化**（进程内 memoize，字节稳定）+ 动态运行时数据（uptime/freeMemory/组件列表）移入**请求尾部**独立消息 → DeepSeek/讯飞前缀缓存命中（实测 kimi k2.6 命中率 91%）；`/ctx` 与 `[ctx]` 行显示缓存命中率（兼容 DeepSeek `prompt_cache_hit_tokens` 与 OpenAI 新格式 `prompt_tokens_details.cached_tokens`）；`trim_history`/`force_trim` 保留首条消息（缓存锚点），裁剪不破坏前缀
+- **自动重试**：网络错误 / 429 / 5xx 自动重试（opencode 风格指数退避 2s×2ⁿ，单次等待封顶 5 分钟，**总预算 1 小时**；测试环境 60s），4xx 不重试——适配频繁限流的免费端点
+- **前缀缓存计费优化**：system prompt **静态化**（进程内 memoize，字节稳定）+ 动态运行时数据（uptime/freeMemory/组件列表）移入**请求尾部**独立消息 → DeepSeek 前缀缓存命中（实测 kimi k2.6 命中率 91%）；`/ctx` 与 `[ctx]` 行显示缓存命中率（兼容 DeepSeek `prompt_cache_hit_tokens` 与 OpenAI 新格式 `prompt_tokens_details.cached_tokens`）；`trim_history`/`force_trim` 保留首条消息（缓存锚点），裁剪不破坏前缀
 - **对话压缩**：历史超限时自动用 LLM 生成摘要替换旧消息（保留最近 4 条），失败回退裁剪；`/compact` 手动触发
 - **会话归档**：`/new` 将当前会话归档到 `/home/sessions/` 并开新会话（配置保留）
 - **诊断上报**：`/debug` 收集版本+脱敏配置+最近历史 → 本地文件 + 可选上传 GitHub Gist（`/gist-token <token>` 配置，scope: gist）
@@ -31,7 +29,7 @@
  - **400 防护**：请求前 token 预算（估算超窗口 80% 自动压缩；压缩失败 LLM 已超限时强制裁剪保留最近）；HTTP 400 仅当估算确实超限（>85%）才裁剪重试，其他原因（reasoning/格式/限流）保留现场报错
  - **reasoning_content 传回**：DeepSeek/Kimi thinking mode 的思考内容随历史完整传回（网关要求，缺失返回 400）；JSON 编码器对全部控制字符转义为 `\u00XX`（裸控制字符 = 非法 JSON → 400）
  - **多行输入**：`/ml` 逐行收集到独立行 `EOF` 合并为一条消息发送（粘贴多行代码不再被逐行误发成多条命令；OC 无 bracketed paste，opencode TUI 多行粘贴的等价物）
- - **默认模型**：`deepseek-v4-flash-free`（OpenCode Zen 免费，无需 key）
+  - **端点/模型**：默认不提供（避免硬编码某免费端点过时），首次 setup 或 `/model` `/url` 显式配置任意 OpenAI 兼容端点
 
 ## 部署（GitHub 自动安装，无需粘贴）
 
@@ -140,9 +138,8 @@ agent 之前做的**无线远程调试/控制工具**：主控 OC 通过 modem �
 │   ├── json.lua           # JSON 编解码（全控制字符转义）
 │   ├── tools.lua          # 工具注册表（BUILTIN + 插件扫描）
 │   └── tools/             # 工具模块（file/search/shell/subagent/question/compact）
-├── docs/                  # 设计文档与实现计划 → docs/README.md
-│   ├── COMPARISON.md      # 与 oc-ai / pi / pi-subagents 三方对比
-│   └── superpowers/
+├── docs/                  # 文档 → docs/README.md
+│   └── COMPARISON.md      # 与 oc-ai / pi / pi-subagents 三方对比
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
 │   ├── run_tests.lua      # 本地回归测试（552 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/loadHistory 大会话重渲染/工具轮次上限/length 截断防呆）

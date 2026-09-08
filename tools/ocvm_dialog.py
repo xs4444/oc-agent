@@ -39,9 +39,10 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ocvm_test import OcvmDriver  # noqa: E402
 
+# 脱敏: 默认值占位，须经 env 提供（OCVM_HOST/OCVM_USER/OCVM_PASS）
 HOST = os.environ.get("OCVM_HOST", "<ocvm-host>")
 USER = os.environ.get("OCVM_USER", "<user>")
-PASS = os.environ.get("OCVM_PASS", "<password>")
+PASS = os.environ.get("OCVM_PASS", "")
 VM_DIR = "~/oc-test/ocvm"
 TMP_DIR = "tmp_t"
 HISTORY = "agent_history.txt"

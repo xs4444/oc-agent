@@ -3117,9 +3117,9 @@ do
       and c2.api_url == "http://api/x" and c2.remote_token == "t",
       json.encode(c2))
     local c3 = m(nil, "", "", "")
-    test("config merge: 无旧值走默认",
-      c3.model == "deepseek-v4-flash-free"
-      and c3.api_url == "https://opencode.ai/zen/v1/chat/completions"
+    test("config merge: 无旧值留空(无默认模型/端点)",
+      c3.model == ""
+      and c3.api_url == ""
       and c3.api_key == "",
       json.encode(c3))
     local c4 = m({api_key = "old-key", data_dir = "/mnt/x"}, "", "", "")

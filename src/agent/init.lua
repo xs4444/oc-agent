@@ -273,7 +273,7 @@ end
 
 -- 缓存命中统计: 兼容两种 provider 上报格式
 --   DeepSeek/zen:        usage.prompt_cache_hit_tokens / prompt_cache_miss_tokens
---   讯飞星辰(kimi)/OpenAI 新格式: usage.prompt_tokens_details.cached_tokens
+--   kimi/OpenAI 新格式: usage.prompt_tokens_details.cached_tokens
 -- 返回 hit, miss（无缓存字段或 hit=0 时返回 nil）。
 -- 全防御: provider usage 结构怪异（字段类型不对/嵌套非表）时返回 nil 而非抛错
 -- ——statusData 回调依赖它，异常曾导致 TUI 状态栏绘制中断（只剩 status）。

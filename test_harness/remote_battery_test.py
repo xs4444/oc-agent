@@ -2,11 +2,14 @@
 """r6 新命令电池——39 用例套件未覆盖的场景（一次通过率审计）。
 10 场景: fetch 分页×3 / 3 并发 / CJK exec 输出 / 内存风暴 / config 热重载
 / Ctrl+C 中断 / 60s 超时边界 / 服务器重启恢复（最后）。"""
-import argparse, json, sys, time, urllib.request, urllib.error, urllib.parse, subprocess
+import argparse, json, os, sys, time, urllib.request, urllib.error, urllib.parse, subprocess
+
+# 脱敏: 仓库根 = test_harness/ 的上级目录（不再硬编码用户路径）
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--base", default="http://127.0.0.1:8765",
-                 help="控制服务器基址（公网: https://<server-endpoint>）")
+                 help="控制服务器基址（本地隧道 http://127.0.0.1:8765 或公网地址，须 --token）")
 _ap.add_argument("--token", required=True)
 _args = _ap.parse_args()
 BASE = _args.base; TOK = _args.token
@@ -209,8 +212,8 @@ except Exception as e:
 # 重启服务器
 srv = subprocess.Popen(
     ["python3", "tools/remote_server.py", "serve", "--bind", "127.0.0.1",
-     "--port", "8765", "--hold", "12", "--token", "ocvmtoken123"],
-    cwd="<repo-root>/aiProjects/mieAgent",
+     "--port", "8765", "--hold", "12", "--token", "ocvmtesttoken"],
+    cwd=REPO_ROOT,
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 t0 = time.time()
 online = False

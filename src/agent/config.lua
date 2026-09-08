@@ -228,26 +228,24 @@ local function merge_setup(prev, api_key, model, api_url)
     config.api_key = api_key
   end
   if type(config.api_key) ~= "string" then config.api_key = "" end
+  -- v0.3.x: 默认不提供模型/端点（避免硬编码某免费端点过时）。空答案且无旧值
+  -- 则留空——用户须经 /model /url 或首次 setup 显式提供 OpenAI 兼容端点。
   if type(model) == "string" and model ~= "" then config.model = model end
-  if type(config.model) ~= "string" or config.model == "" then
-    config.model = "deepseek-v4-flash-free"
-  end
+  if type(config.model) ~= "string" then config.model = "" end
   if type(api_url) == "string" and api_url ~= "" then
     config.api_url = api_url
   end
-  if type(config.api_url) ~= "string" or config.api_url == "" then
-    config.api_url = "https://opencode.ai/zen/v1/chat/completions"
-  end
+  if type(config.api_url) ~= "string" then config.api_url = "" end
   return config
 end
 
 local function first_run()
   print("OC Agent - First Run Setup")
-  io.write("API Key (empty for free OpenCode Zen model, or any OpenAI-compatible key): ")
+  io.write("API Key (any OpenAI-compatible key, or empty): ")
   local api_key = io.read():gsub("\n", "")
-  io.write("Model [deepseek-v4-flash-free]: ")
+  io.write("Model (OpenAI-compatible model name): ")
   local model = io.read():gsub("\n", "")
-  io.write("API URL [https://opencode.ai/zen/v1/chat/completions]: ")
+  io.write("API URL (OpenAI-compatible /chat/completions endpoint): ")
   local api_url = io.read():gsub("\n", "")
   -- v0.3.125r6: 继承现存配置（此前无条件 3 字段覆盖——实证坑 r5）
   local prev = find_existing_config()

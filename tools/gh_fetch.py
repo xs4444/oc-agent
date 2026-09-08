@@ -10,14 +10,16 @@
 """
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
 import urllib.request
 
 TOK_FILE = ".oc-remote-token"
-BASE_DEFAULT = "https://<server-endpoint>"
-PROXY = "http://127.0.0.1:7897"
+# 脱敏: 远控服务器基址/代理不再硬编码（env 覆盖，占位符为默认）
+BASE_DEFAULT = os.environ.get("OC_REMOTE_BASE", "https://<your-server>:<port>")
+PROXY = os.environ.get("OC_REMOTE_PROXY", "http://127.0.0.1:7897")
 MIRROR = "https://gh-proxy.com/"
 MAX = 99000
 UA = {"User-Agent": "Mozilla/5.0 (gh_fetch/1.0)"}

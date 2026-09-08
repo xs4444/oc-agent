@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ssh_win.py — 一键执行 windowsCo (<win-host>) 命令
+"""ssh_win.py — 一键执行 windowsCo 内网穿透服务器 命令
 
 用法:
     python tools/ssh_win.py "dir /b D:"                    # cmd 默认 shell
     python tools/ssh_win.py --ps "Get-ChildItem E:/proGrams"  # PowerShell
 
 凭据: 仅密钥认证（~/.ssh/id_ed25519），无密码
+地址: SSH_WIN_HOST/SSH_WIN_PORT/SSH_WIN_USER env 提供（脱敏，默认占位）
 输出: 过滤 ssh 版本警告行；编码自动探测（utf-8 → gbk）
 """
 import argparse
@@ -15,7 +16,9 @@ import subprocess
 import sys
 
 KEY = os.path.expanduser("~/.ssh/id_ed25519")
-HOST, PORT, USER = "<win-host>", 56056, "<user>"
+HOST = os.environ.get("SSH_WIN_HOST", "<win-host>")
+PORT = int(os.environ.get("SSH_WIN_PORT", "0"))
+USER = os.environ.get("SSH_WIN_USER", "<user>")
 
 WARN_MARKERS = (
     "WARNING: connection is not using",

@@ -8,6 +8,8 @@ __pycache__/
 # repos/pi-subagents repos/opencomputers repos/oc-ai repos/deepseek-reasonix
 repos/
 lua_portable/
+# superpowers 设计文档/实现计划（内部产物，不公开）
+docs/superpowers/
 
 # 临时输出与杂项
 err.txt

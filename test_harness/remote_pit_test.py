@@ -5,7 +5,7 @@
       ② 控制服务器在跑（serve 模式）
 用法:
     python3 test_harness/remote_pit_test.py \
-        --base http://127.0.0.1:8765 --token ocvmtoken123 [--only NAME... ]
+        --base http://127.0.0.1:8765 --token <token> [--only NAME... ]
 
 每个用例: 发命令 → 等结果（≤45s）→ 比对期望 → 记 PASS/FAIL/OBSERVE。
 OBSERVE = 行为不确定/需要人眼确认的用例，打印实际输出供记录。

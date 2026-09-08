@@ -27,6 +27,8 @@ import urllib.request
 
 API = "https://api.github.com"
 HEAD = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+# 脱敏: GitHub 用户名不再硬编码（env GIST_USER 提供，占位符为默认）
+GIST_USER = os.environ.get("GIST_USER", "<github-username>")
 
 
 def get_token():
@@ -56,13 +58,13 @@ def main():
         print("ERROR: no token (set GIST_TOKEN or ~/.gist_token)", file=sys.stderr)
         sys.exit(1)
     if "--list" in flags:
-        data = json.loads(req(API + "/users/xs4444/gists?per_page=5", token))
+        data = json.loads(req(API + "/users/" + GIST_USER + "/gists?per_page=5", token))
         for g in data:
             print(g["id"], g["created_at"], "-", g.get("description") or "")
         return
     gid = args[0] if args else None
     if "--latest" in flags or gid is None:
-        data = json.loads(req(API + "/users/xs4444/gists?per_page=1", token))
+        data = json.loads(req(API + "/users/" + GIST_USER + "/gists?per_page=1", token))
         if not data:
             print("no gists")
             return

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""ssh_ubuntu.py — 一键执行 Ubuntu 服务器 (<ocvm-host>) 命令
+"""ssh_ubuntu.py — 一键执行 Ubuntu 内网测试服务器 命令
 
 用法:
     python tools/ssh_ubuntu.py "ls -la ~/oc-test"
     python tools/ssh_ubuntu.py "cat /path/file.txt" --wait 3
 
-凭据: 环境变量 UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS 可覆盖默认
-      （默认 <ocvm-host> / <user> / <password>，内网测试服务器）
+凭据: 环境变量 UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS（脱敏，默认占位须 env 提供）
 输出: 原始 stdout，UTF-8 兼容
 """
 import argparse
@@ -20,9 +19,10 @@ except ImportError:
     print("需要 paramiko: pip install paramiko", file=sys.stderr)
     sys.exit(1)
 
-HOST = os.environ.get("UBUNTU_HOST", "<ocvm-host>")
+# 脱敏: 默认值占位，须经 env 提供（UBUNTU_HOST/UBUNTU_USER/UBUNTU_PASS）
+HOST = os.environ.get("UBUNTU_HOST", "<ubuntu-host>")
 USER = os.environ.get("UBUNTU_USER", "<user>")
-PASS = os.environ.get("UBUNTU_PASS", "<password>")
+PASS = os.environ.get("UBUNTU_PASS", "")
 
 
 def run(cmd, timeout=30, wait=2.0):
