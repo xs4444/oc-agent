@@ -89,6 +89,18 @@ lua agent.lua -- --subagent          # 监听 modem 端口 9090
 # 子代理收到后用自己的内存/磁盘/算力处理（完整 agent 循环），结果回传。
 ```
 
+## 无线远程调试（remote_debug.lua，agent 自制）
+
+agent 之前做的**无线远程调试/控制工具**：主控 OC 通过 modem 远程操控游戏内 bot（执行命令、读写文件、查信息）。非 agent.lua 一部分，部署在目标 bot 的 `3e9` 盘（`/mnt/3e9/`），**纯文本协议刻意避开 JSON 解析 bug**，端口 8001。
+
+- **`remote_debug.lua`**（v5.1，运行在目标 bot）：modem 8001 接收 `op|param1|param2`
+  - `ping`→pong；`info`→设备信息（id/uptime/内存/组件列表）
+  - `exec|cmd`→执行 shell 命令（重定向 `/home` 避开 `/tmp` 目录文件数上限）
+  - `read|path` / `write|path|escaped` / `delete|path`→文件操作
+  - `write` 用 serialization + `|` 转义（`\|`→\001、`\\`→\）；回复上限 7680 字节
+- **`listen.lua`**：简化版 PING/PONG 监听（调试用，同端口 8001）
+- **关键修复**：`modem_message` 事件参数顺序（`sig[3]`=远程地址、`sig[4]`=端口、`sig[6]`=数据）——旧版误用 `b==port` 判断（`b` 实为远程地址非端口）导致永远不回复
+
 ## 目录结构
 
 每个子目录含独立 `README.md` 说明用途与用法。
