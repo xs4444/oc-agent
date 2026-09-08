@@ -11,7 +11,7 @@
     "patch.lua": 6458,
     "remote.lua": 38151,
     "selftest.lua": 19512,
-    "session.lua": 36261,
+    "session.lua": 36461,
     "subagent.lua": 11846,
     "tools.lua": 5913,
     "tools/compact.lua": 3277,
@@ -24,5 +24,5 @@
     "wcwidth.lua": 3353,
     "docs.lua": 16742
   },
-  "version": "2026-09-08T1837"
+  "version": "2026-09-08T1900"
 }

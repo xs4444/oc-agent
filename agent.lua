@@ -2085,10 +2085,12 @@ local function default_free_space()
   if not ok_a or not addr then return math.huge end
   local ok_p, disk = pcall(fs.proxy, addr)
   if not ok_p or type(disk) ~= "table" then return math.huge end
-  if type(disk.spaceTotal) ~= "function" or type(disk.spaceUsed) ~= "function" then return math.huge end
+  -- GTNH fork 的磁盘代理方法 type 是 table（带 __call 元方法，调用返回
+  -- number）而非 function——不能用 type 判可调用（真机 2026-09-08 实证:
+  -- disk.spaceTotal type=table 但 pcall 调用正常），直接 pcall 调用并验 number。
   local ok_t, total = pcall(disk.spaceTotal)
   local ok_u, used = pcall(disk.spaceUsed)
-  if not ok_t or not ok_u or not total or not used then return math.huge end
+  if not ok_t or not ok_u or type(total) ~= "number" or type(used) ~= "number" then return math.huge end
   return total - used
 end
 local free_space_fn = default_free_space
