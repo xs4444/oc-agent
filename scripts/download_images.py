@@ -6,8 +6,9 @@ import glob
 import urllib.request
 
 BASE = 'https://ocdoc.cil.li/_media/'
-WIKI_DIR = r'<local-dir>\ocdoc_wiki'
-OUT_DIR = r'<local-dir>\ocdoc_md\media'
+# 脱敏: 本地目录经 env 提供（原为某 Windows 用户路径）
+WIKI_DIR = os.environ.get('WIKI_DIR', r'ocdoc_wiki')
+OUT_DIR = os.environ.get('OUT_DIR', r'ocdoc_md\media')
 
 paths = set()
 for f in glob.glob(os.path.join(WIKI_DIR, '*.txt')):
