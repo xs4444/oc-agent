@@ -21,7 +21,7 @@ make deps && make lua=lua5.3
 
 ## 测试环境位置（重要）
 
-- **ocvm 测试环境在 `~/oc-test/ocvm`（本机，<ocvm-host>），原地运行，不要搬迁。**
+- **ocvm 测试环境在 `~/oc-test/ocvm`（本机，地址经 env `OCVM_HOST` 提供），原地运行，不要搬迁。**
 - 该目录的 working tree 包含与上面相同的未提交修复（Makefile / client.cfg /
   drivers/internet_http.cpp），补丁即从那里导出，两边内容一致。
 - 已知问题（2026-09-03 记录）：ocvm 二进制**不可 relocate**——把
