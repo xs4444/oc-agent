@@ -12,11 +12,10 @@
 
 ## 功能一览
 
-- **15 个 LLM 工具**：`read_file`（支持 offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `list_directory` / `json_query` / `calc` / `text_ops` / `component_list` / `component_doc` / `component_invoke` / `web_search` / `shell_execute` / `subagent_call` + **`ask_user`（对话中向用户提问，选项编号或自定义输入）**
+- **12 个 LLM 工具**：`read_file`（offset/limit 行切片 + tail）/ `write_file` / `edit_file`（精确替换，唯一性检查）/ `append_file`（流式追加，内存恒定）/ `search_files`（全文搜索，Lua pattern/literal + glob 过滤，替代原 list_directory）/ `web_search` / `web_fetch`（抓 URL 全文，GFW 自动改写 GitHub 地址）/ `shell_execute`（io.popen + 线程超时保护）/ `subagent_call` / `subagent_discover`（modem 广播发现网内子代理）/ `compact_history`（LLM 摘要压缩对话）/ **`ask_user`（对话中向用户提问，选项编号或自定义输入）**
+- **TUI（oc-code 风格终端界面）**：gpu+screen+keyboard 齐全时自动启用（否则回退 REPL）。内容区渲染 + 输入框 + 状态栏 + 命令历史（↑/↓ 召回）+ 全文搜索（`/search`）+ 选中复制 + 会话历史恢复（`/resume` 重渲染大会话，每 ~8 条 `os.sleep` 让出防 OpenOS 看门狗 "too long without yielding"）
 - **子代理**：`subagent_call(address, task, role?, session?, context?, timeout?)` 通过游戏内网卡（modem 组件）把任务委派给其他 OC 计算机上运行的 `agent.lua -- --subagent`——每台子代理拥有独立内存和磁盘，主代理可并行调度；跨机器经 ocvm 双实例实测通过（SUBAGENT_PONG 往返）
 - **子代理会话复用**：`session` 参数延续子代理对话（同 id 恢复磁盘上的会话历史，省略则全新会话）；busy 状态机防止同会话并发（对齐 opencode 的 Active/Reusable 会话模型）
-- **组件探索闭环**：list → doc → invoke，LLM 可自主发现并操控任意 OC 硬件
-- **数据处理工具集**：`json_query`（JSON 点路径提取）/ `calc`（安全数学求值，不执行代码）/ `text_ops`（字符串操作）替代了原 `execute_lua`，无任意代码执行风险
 - **文件工具族**：`read_file` 行切片（大文件只读目标区段，带行号；负 offset = tail）+ `edit_file`（精确替换，>20KB 拒绝）+ `append_file`（流式追加，内存与文件大小无关）——先查后改，适配 OC 1MB 内存
 - **联网搜索**：默认 HN Algolia（无 key），`/tavily <key>` 升级为通用搜索（含中文）
 - **shell_execute 增强**：`io.popen` 捕获 stdout+stderr（不再只返回 true/false）+ 线程超时保护（默认 60s，死循环/挂起命令自动 kill）
@@ -71,8 +70,19 @@ lua update.lua
 /tools                -- 列出全部工具及说明
 /debug                -- 生成诊断报告（本地 + 可选上传 Gist）
 /gist-token <token>   -- 保存 GitHub token（scope: gist）供 /debug 上传
+/resume               -- 恢复 /home/sessions/ 的会话（选择后 loadHistory 重渲染历史到 TUI）
+/session <name>       -- 切换到命名会话（/home/sessions/<name>.jsonl）
+/sessions             -- 列出 /home/sessions/ 的全部会话
+/restart              -- 重启 agent（重跑 agent.lua，保留会话）
+/selftest             -- 内置自检（核心模块健康检查）
+/remote               -- 远程 daemon 状态（tools/remote_server.py 通道）
 /help                 -- 全部命令说明
 /exit                 -- 退出
+-- TUI 导航（oc-code 风格，仅 TUI 模式）
+/top /bottom /up /down /pgup /pgdn  -- 滚动内容区
+/search <query>       -- TUI 内容区全文搜索
+/browse               -- 浏览模式
+/paste                -- 把选中内容粘到输入框
 ```
 
 ## 子代理部署（多台 OC 组网）
@@ -83,7 +93,7 @@ lua update.lua
 lua agent.lua -- --subagent          # 监听 modem 端口 9090
 # 或在 config 里加 subagent=true，然后直接 lua agent.lua
 
-# 主代理机器：运行时 LLM 通过 component_list(filter="modem") 发现子代理地址，
+# 主代理机器：运行时 LLM 通过 subagent_discover 广播发现网内子代理地址（modem 端口 9090），
 # 然后 subagent_call(address, task, role?, session?, context?, timeout?) 委派任务。
 # session 参数延续子代理的对话记录（同 id = 复用上下文，省略 = 新会话）。
 # 子代理收到后用自己的内存/磁盘/算力处理（完整 agent 循环），结果回传。
@@ -110,23 +120,32 @@ agent 之前做的**无线远程调试/控制工具**：主控 OC 通过 modem �
 ├── install.lua            # 安装器（多文件安装 + 增量更新 + PATH 集成）
 ├── update.lua             # 一键更新（查最新 tag → 增量更新，永不需更新自身）
 ├── docs.lua               # 离线文档安装器（交互引导选盘/卸载 + 纯 Lua ustar 解包）
-├── files.json             # 安装清单（18 个分发文件 + 字节数 + 版本号）
+├── files.json             # 安装清单（23 个分发文件 + 字节数 + 版本号）
 ├── docs_pack/             # 离线文档包（oc-docs.tar 910KB + docs.json 元数据，make_docs_pack.py 生成）
 ├── README.md
-├── src/agent/             # 模块化源码（9 核心 + 8 工具模块）
-│   ├── init.lua           # 入口（REPL/子代理/命令 /ctx /ml/ask_user 注入/400 防护）
+├── src/agent/             # 模块化源码（15 核心 + 6 工具模块）
+│   ├── init.lua           # 入口（REPL/TUI/子代理/命令 /resume /session /restart /ctx /ml/ask_user 注入/400 防护）
 │   ├── chat.lua           # LLM 客户端 + 系统提示（工具清单/上下文管理引导）
 │   ├── config.lua         # 配置（context_window/ctx_auto 默认值）
+│   ├── tui.lua            # oc-code 风格 TUI（内容渲染/输入/状态栏/搜索/loadHistory 大会话重渲染+os.sleep 让出）
+│   ├── session.lua        # 会话历史 + 压缩（/home/sessions/ 命名会话 + 归档 + /resume）
+│   ├── remote.lua         # 远程控制守护（v0.3.125, tools/remote_server.py 通道长轮询 exec/lua/read/write）
+│   ├── execute.lua        # 工具执行调度（Phase 1 插件拆分）
+│   ├── http.lua           # HTTP 客户端（Phase 2 拆分, Internet Card + 重试/退避）
+│   ├── interrupt.lua      # Ctrl+C 中断支持（v0.3.86, chat 阻塞期间处理 modem 消息）
+│   ├── patch.lua          # OpenOS 运行时补丁层（v0.3.99）
+│   ├── selftest.lua       # 实机自检（/selftest 命令）
+│   ├── wcwidth.lua        # 宽字符判定（musl wcwidth, 与 OC FontUtils 一致）
 │   ├── debug.lua          # 诊断报告收集 + Gist 上传
 │   ├── json.lua           # JSON 编解码（全控制字符转义）
 │   ├── tools.lua          # 工具注册表（BUILTIN + 插件扫描）
-│   └── tools/             # 工具模块（file/data/component/search/shell/subagent/question）
+│   └── tools/             # 工具模块（file/search/shell/subagent/question/compact）
 ├── docs/                  # 设计文档与实现计划 → docs/README.md
 │   ├── COMPARISON.md      # 与 oc-ai / pi / pi-subagents 三方对比
 │   └── superpowers/
 ├── test_harness/          # 测试脚本（本地 + 模拟器内）→ test_harness/README.md
 │   ├── oc_mock.lua        # OC API mock（本地 Lua 环境）
-│   ├── run_tests.lua      # 本地回归测试（234 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/工具轮次上限/length 截断防呆）
+│   ├── run_tests.lua      # 本地回归测试（552 项：JSON/工具/压缩/TOOLS 双向校验/ctx/400 防护/多行输入/缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/loadHistory 大会话重渲染/工具轮次上限/length 截断防呆）
 │   ├── danger_test.lua    # 高危场景测试（21 项：自改/坏插件/死循环/磁盘/配置/自删/递归）
 │   ├── shell_timeout_test.lua  # ocvm/OCEmu 真机 shell 超时验证
 │   ├── reasoning_e2e_test.lua  # reasoning_content 传回真机 e2e（工具链无 400）
@@ -136,13 +155,16 @@ agent 之前做的**无线远程调试/控制工具**：主控 OC 通过 modem �
 │   ├── raw/               # DokuWiki 原始文本（215 页）
 │   ├── markdown/          # Markdown 转换版（40+ 页，含 GTNH 指南）
 │   └── reference/         # agent 开发精选 API 参考（35 文件）
-├── tools/                 # Windows 辅助脚本 → tools/README.md
+├── tools/                 # 辅助脚本 → tools/README.md
+│   ├── remote_server.py   # 远程控制 daemon 服务端（真机 lua op 通道：--lua/--exec/--read/--write + --status）
+│   ├── real_machine_probe.py  # 真机探测脚本（config/sessions/磁盘布局）
 │   ├── ocvm_test.py       # ocvm 测试驱动（EXTRA_FILES 上传 + 结果自动保存）
 │   ├── ssh_ubuntu.py      # Ubuntu 测试服务器一键执行
 │   ├── ssh_win.py         # windowsCo 一键执行（密钥认证，--ps 中文路径）
-│   └── gist.py            # /debug 报告拉取（list/latest/fetch）
+│   ├── gist.py            # /debug 报告拉取（list/latest/fetch）
+│   └── ...                # 另含 fetch_gist/gh_fetch/capture_*/ocvm_*/type_to_oc 等 16 脚本
 ├── scripts/               # 构建与发版脚本 → scripts/README.md
-│   ├── build_all.py       # 构建+清单+234 项回归一键
+│   ├── build_all.py       # 构建+清单+552 项回归一键
 │   ├── release_check.py   # 发版安全检查（版本 bump/清单/字节/语法）
 │   ├── make_docs_pack.py  # 离线文档包生成（CRLF→LF + ustar）
 │   └── build_single.lua / make_manifest.lua
@@ -173,7 +195,7 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 ```
 
 测试要点：
-- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**234 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/工具轮次上限/length 截断防呆）+ `danger_test.lua`（21 项高危场景）
+- 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**552 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/loadHistory 大会话重渲染/工具轮次上限/length 截断防呆）+ `danger_test.lua`（21 项高危场景）
 - 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
 - LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
