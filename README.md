@@ -195,13 +195,13 @@ cd ~/oc-test/OCEmu && DISPLAY=:77 lua5.2 boot.lua
 - 本地：`python scripts/build_all.py`（构建+清单+回归一键）或 `lua_portable/bin/lua.exe test_harness/run_tests.lua`（**552 项回归**：JSON 编解码含控制字符转义/工具执行/压缩/TOOLS 双向校验/ctx 仪表盘/400 防护/多行输入收集/前缀缓存静态性/KEEP+REF 标记/模型驱动压缩/护栏/TUI/loadHistory 大会话重渲染/工具轮次上限/length 截断防呆）+ `danger_test.lua`（21 项高危场景）
 - 模拟器：`python tools/ocvm_test.py test_harness/<脚本>.lua` 一键驱动（自动重启 ocvm → 上传 → 探测挂载 → 运行 → 拉取结果，结果自动存 `test_harness/results/`）
 - 子代理双实例：`run_subagent_dual.py` 模式（主/子两台 ocvm 组网，modem 互通）
-- LLM 端到端：`deepseek-v4-flash` @ opencode-go（备用，需 auth.json 的 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
+- LLM 端到端：任意 OpenAI 兼容端点（需 key）；`reasoning_e2e_test.lua` / `json_ctrl_e2e_test.lua` 验证工具链无 400
 - 发版链路：`build_all.py` → `release_check.py`（全 PASS 才能打 tag）→ `git push --tags`；jsDelivr 索引无需监控，实机 `lua update.lua` 即拉新 tag
 - 远程诊断：游戏内 `/debug` 上传诊断报告到 Gist（`tools/gist.py latest` 拉取）
 
 ## 已知限制
 
-- **上下文受 OC 内存限制**：2 个 T3.5（2MB）下历史预算 50KB（≈12-25K token）。窗口大小在 config 的 `context_window` 配置（默认 128000，按模型实际窗口调整）；`/ctx` 实时查看使用率，超 80% 自动压缩
+- **上下文受 OC 内存限制**：推荐游戏内 **T3 服务（4×T3.5 内存）** 环境；2MB 档历史预算 50KB（≈12-25K token）。窗口大小在 config 的 `context_window` 配置（默认 128000，按模型实际窗口调整）；`/ctx` 实时查看使用率，超 80% 自动压缩
 - **`collectgarbage` 不可用**：无法手动触发 GC，依赖 Lua 自动增量回收（已实测无泄漏）
 - **搜索覆盖**：HN Algolia 仅英文技术内容；Tavily 需注册 key
 - **公共服务器限制**：OC 网络黑名单/白名单、HTTP 开关可能影响外联
