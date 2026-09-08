@@ -213,7 +213,10 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
      内容开头多出 1 个 `[`（0x5B，+1 字节 MISMATCH），另一脚本 parse 失败
      （"unexpected symbol near 'local'"，与注释词法歧义相关）；`[==[` 多次上传
      字节级一致。**规则：远控上传一律 `[==[` 及以上**，部署后读回 n/sum/head16
-     校验缺一不可。
+     校验缺一不可。**另（v0.3.126r5 实证）：Lua 长串会剥掉开头定界符后紧跟的
+      第一个换行**——分块内容以 `\n` 开头时该字节静默丢失（481218B 文件少 1B，
+      尾部一致但中间错位、sum 差恰=10 才定位到块首）；**分块处内容以 \n 开头时
+      把前导 \n 并入上一块**再写。
   22. **native internet 连接等待不受 lua 看门狗管（真机电池烧进程实证）**：
       internet.request 的**连接建立**等待发生在 native 层（Java socket connect，
       ~2min/个失败端点），期间 Lua 不让出→坑 13 的宿主 CPU 看门狗杀 agent 进程
