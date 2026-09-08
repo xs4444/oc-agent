@@ -1,6 +1,6 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 29 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗/
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 30 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗/
 LLM 无 chunk 挂起/OC internet 4xx 异常语义）。
 ---
 
@@ -268,6 +268,13 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
        （死循环）。恢复：软盘启动（另盘 OS 的 shell 挂载根盘 /mnt/<hex> 改
        /init.lua）；若崩在 shell 循环内则游戏内聚焦屏幕按任意键可进 shell。
        **规则：改 /init.lua 先 loadfile 编译校验 + 真机留 .bak/.bak2 备份**。
+    30. **GTNH fork 磁盘代理方法 `type` 是 table 而非 function**（v0.3.126r9
+        真机实证）：`fs.proxy(computer.getBootAddress())` 返回的代理上，
+        `disk.spaceTotal`/`disk.spaceUsed` 的 `type(...)` 是 **table**（带 `__call`
+        元方法，`pcall` 调用正常返回 number），不是 function → 用
+        `type(disk.spaceTotal)=="function"` 判可调用会误判 false → 读不到盘
+        剩余空间。查容量一律 `pcall(disk.spaceTotal)` 后验 `type(r)=="number"`，
+        别用 type 判 function。
 
 ## 真机部署/恢复配方
 
