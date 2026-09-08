@@ -5266,6 +5266,22 @@ function tui.loadHistory(messages)
       appendHistory({text = line, color = color})
     end
   end
+  -- OpenOS 看门狗: 主线程跑太久不让出 → "too long without yielding"（真机
+  -- 2026-09-08 实证: /resume 恢复 388 条会话, wrapText+appendHistory 循环
+  -- 无让出 → agent 崩 "too long without yielding"）。每 ~8 条让出一次重置
+  -- 看门狗计时。让出用 os.sleep（~20ms 最小 tick）——GTNH OpenOS 1.8.9 真机
+  -- 实证 require("computer").sleep == nil（1.8+ 移除, 改 os.sleep）, 用
+  -- computer.sleep 的 pcall 会静默失败=没让出。pcall 兜底: 无 os.sleep
+  -- （测试/降级）跳过让出, 循环仍完成。
+  local ok_os_sleep = type(os.sleep) == "function"
+  local yielded = 0
+  local function maybe_yield()
+    yielded = yielded + 1
+    if yielded >= 8 and ok_os_sleep then
+      pcall(os.sleep, 0.01)
+      yielded = 0
+    end
+  end
   for _, m in ipairs(messages) do
     if type(m) ~= "table" then break end
     local role, content = m.role, m.content
@@ -5295,6 +5311,7 @@ function tui.loadHistory(messages)
       pushLine("<< " .. s, tui.colors.dim)
     end
     -- system / 未知 role: 上下文不入屏
+    maybe_yield()  -- 周期性让出, 防大会话重渲染触发看门狗
   end
   -- populateHistory（pi renderSessionEntries 同款）: user 消息进命令历史
   if #cmdUser > 0 then
