@@ -472,7 +472,15 @@ function mock_filesystem.list(path)
 end
 function mock_filesystem.isDirectory(path) return false end
 function mock_filesystem.makeDirectory(path) return true end
-function mock_filesystem.size(path) return 0 end
+function mock_filesystem.size(path)
+  -- 返回真实文件大小（与真机 fs.size 一致；原恒 0 会让"删最旧直到够"
+  -- 的空间核算失真——agent.session.ensure_archive_space 依赖真实 size）
+  local f = io.open(path, "r")
+  if not f then return 0 end
+  local sz = f:seek("end") or 0
+  f:close()
+  return sz
+end
 function mock_filesystem.mounts()
   -- local test env: current directory is writable; expose it as a mount.
   -- Real OC: iterator yields (proxy, mount_path) per iteration.

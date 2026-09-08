@@ -475,16 +475,27 @@ local function handle_command(cmd, config, messages)
         stamp = string.format("%.0f", comp.uptime() or 0)
       end
       local archive_path = SESSIONS_DIR .. "/agent_history_" .. stamp .. ".txt"
-      local ok_save, save_err = pcall(function()
-        local f = io.open(archive_path, "w")
-        if not f then error("cannot open " .. archive_path) end
-        f:write(require("serialization").serialize(messages))
-        f:close()
-      end)
-      if ok_save then
-        print("Session archived to " .. archive_path .. " (/resume to restore)")
+      -- 先 serialize 量出归档精确字节数，写前检查安装盘空间（会满则删最旧归档
+      -- 直到够）——用户要求: 历史会话进安装盘，存前检查，满则删最旧直到够。
+      local ok_ser, data = pcall(function() return require("serialization").serialize(messages) end)
+      if ok_ser and type(data) == "string" then
+        local deleted, freed = session_mod.ensure_archive_space(#data)
+        local ok_save, save_err = pcall(function()
+          local f = io.open(archive_path, "w")
+          if not f then error("cannot open " .. archive_path) end
+          f:write(data)
+          f:close()
+        end)
+        if ok_save then
+          print("Session archived to " .. archive_path .. " (/resume to restore)")
+          if deleted > 0 then
+            print(string.format("  made room: deleted %d oldest archive(s), freed %dKB", deleted, math.floor(freed / 1024)))
+          end
+        else
+          print("Session archive failed: " .. tostring(save_err))
+        end
       else
-        print("Session archive failed: " .. tostring(save_err))
+        print("Session archive failed: serialize error: " .. tostring(data))
       end
     else
       print("No messages to archive")

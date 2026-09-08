@@ -2066,6 +2066,68 @@ local function archive_folded(messages)
   f:close()
   cap_archive()
 end
+
+-- 磁盘空间检查（用户要求: 历史会话进安装盘，存新归档前检查盘会不会满，会满
+-- 就删最旧归档直到够）: /new 写归档前调用。archive_size = 新归档字节数（/new
+-- 先 serialize 再传入精确值）。需腾出 = archive_size + 安全余量
+-- （ARCHIVE_SPACE_MARGIN，防盘写满 100%，config.archive_space_margin 可覆盖）。
+-- 不足时按时间戳从旧到新删 sessions 目录的 agent_history_*.txt 归档（.jsonl
+-- 会话文件由 cleanup_sessions 管理，不动），直到够。free_space_fn 缺省读
+-- 安装盘，测试可经 _internal.set_free_space_fn 注入 mock；无 computer 组件
+-- （测试环境）返回 math.huge = 空间未知 → 不删（安全默认）。
+-- 返回 (删除归档数, 释放字节)。
+local ARCHIVE_SPACE_MARGIN = 256000  -- 256KB 安全余量
+local function default_free_space()
+  local ok_fs, fs = pcall(require, "filesystem")
+  local ok_c, c = pcall(require, "computer")
+  if not (ok_fs and ok_c and type(c.getBootAddress) == "function") then return math.huge end
+  local ok_a, addr = pcall(c.getBootAddress)
+  if not ok_a or not addr then return math.huge end
+  local ok_p, disk = pcall(fs.proxy, addr)
+  if not ok_p or type(disk) ~= "table" then return math.huge end
+  if type(disk.spaceTotal) ~= "function" or type(disk.spaceUsed) ~= "function" then return math.huge end
+  local ok_t, total = pcall(disk.spaceTotal)
+  local ok_u, used = pcall(disk.spaceUsed)
+  if not ok_t or not ok_u or not total or not used then return math.huge end
+  return total - used
+end
+local free_space_fn = default_free_space
+local function ensure_archive_space(archive_size)
+  local margin = config_mod.archive_space_margin or ARCHIVE_SPACE_MARGIN
+  local free = free_space_fn()
+  if free == math.huge then return 0, 0 end  -- 空间未知 → 不删（安全默认）
+  local needed = (archive_size or 0) + margin
+  if free >= needed then return 0, 0 end
+  local fs = require("filesystem")
+  local archives = {}
+  local ok_l, iter = pcall(fs.list, sessions_dir)
+  if ok_l and type(iter) == "function" then
+    for name in iter do
+      local m = name:match("^agent_history_(%d+%.?%d*)%.txt$")
+      if m then
+        local path = sessions_dir .. "/" .. name
+        local sz = 0
+        local ok_s, s = pcall(fs.size, path)
+        if ok_s and s then sz = s end
+        archives[#archives + 1] = { name = name, size = sz, ts = tonumber(m) or 0 }
+      end
+    end
+  end
+  table.sort(archives, function(a, b) return a.ts < b.ts end)
+  local deleted, freed = 0, 0
+  for _, a in ipairs(archives) do
+    if free >= needed then break end
+    local path = sessions_dir .. "/" .. a.name
+    local ok_rm, res = pcall(os.remove, path)
+    if ok_rm and res == true then
+      free = free + a.size
+      freed = freed + a.size
+      deleted = deleted + 1
+    end
+  end
+  return deleted, freed
+end
+
 -- Compact（传统 opencode 自动压缩语义）: 折叠段消息**物理删除**——
 -- （含 KEEP/REF 静态展开的原文，见下方 expand_keep_markers 调用点）已
 -- 承载旧消息内容；折叠段不进请求体、对缓存无贡献，留在内存表纯占内存
@@ -2388,6 +2450,7 @@ local M = {
   set_sessions_dir = set_sessions_dir,
   get_sessions_dir = get_sessions_dir,
   cleanup_sessions = cleanup_sessions,
+  ensure_archive_space = ensure_archive_space,
   set_chat = set_chat,
   current_path = current_path,
   list_sessions = list_sessions,
@@ -2404,6 +2467,10 @@ if _TEST_MODE then
     cap_archive = cap_archive,
     archive_folded = archive_folded,
     MAX_ARCHIVE_BYTES = MAX_ARCHIVE_BYTES,
+    ensure_archive_space = ensure_archive_space,
+    -- 注入 mock 空间读取（fn 返回自由字节数；nil 恢复缺省读盘逻辑）
+    set_free_space_fn = function(fn) free_space_fn = fn or default_free_space end,
+    ARCHIVE_SPACE_MARGIN = ARCHIVE_SPACE_MARGIN,
   }
 end
 return M
@@ -8233,16 +8300,27 @@ local function handle_command(cmd, config, messages)
         stamp = string.format("%.0f", comp.uptime() or 0)
       end
       local archive_path = SESSIONS_DIR .. "/agent_history_" .. stamp .. ".txt"
-      local ok_save, save_err = pcall(function()
-        local f = io.open(archive_path, "w")
-        if not f then error("cannot open " .. archive_path) end
-        f:write(require("serialization").serialize(messages))
-        f:close()
-      end)
-      if ok_save then
-        print("Session archived to " .. archive_path .. " (/resume to restore)")
+      -- 先 serialize 量出归档精确字节数，写前检查安装盘空间（会满则删最旧归档
+      -- 直到够）——用户要求: 历史会话进安装盘，存前检查，满则删最旧直到够。
+      local ok_ser, data = pcall(function() return require("serialization").serialize(messages) end)
+      if ok_ser and type(data) == "string" then
+        local deleted, freed = session_mod.ensure_archive_space(#data)
+        local ok_save, save_err = pcall(function()
+          local f = io.open(archive_path, "w")
+          if not f then error("cannot open " .. archive_path) end
+          f:write(data)
+          f:close()
+        end)
+        if ok_save then
+          print("Session archived to " .. archive_path .. " (/resume to restore)")
+          if deleted > 0 then
+            print(string.format("  made room: deleted %d oldest archive(s), freed %dKB", deleted, math.floor(freed / 1024)))
+          end
+        else
+          print("Session archive failed: " .. tostring(save_err))
+        end
       else
-        print("Session archive failed: " .. tostring(save_err))
+        print("Session archive failed: serialize error: " .. tostring(data))
       end
     else
       print("No messages to archive")

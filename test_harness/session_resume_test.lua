@@ -119,6 +119,67 @@ do
   end
 end
 
+-- ③ ensure_archive_space: 存新归档前检查盘空间，满则删最旧直到够
+-- （用户要求: 历史会话进安装盘，存前检查，会满就删最旧直到够）
+do
+  local hook = sess_mod._internal
+  if type(hook) ~= "table" or type(hook.ensure_archive_space) ~= "function"
+     or type(hook.set_free_space_fn) ~= "function" then
+    test("ensure_archive_space: _internal 钩子暴露", false,
+      "ensure_archive_space/set_free_space_fn missing")
+  else
+    local function exists(p)
+      local f = io.open(p, "r")
+      if f then f:close() return true end
+      return false
+    end
+    local cfg_mod = require("agent.config")
+    local saved_margin = cfg_mod.archive_space_margin
+    local saved_sdir = sess_mod.get_sessions_dir()
+    local tdir = "test_ensure_space_tmp"
+    os.execute('rm -rf "' .. tdir .. '"')
+    os.execute('mkdir -p "' .. tdir .. '"')
+    local function mk(name, nbytes)
+      local f = io.open(tdir .. "/" .. name, "w")
+      f:write(string.rep("a", nbytes))
+      f:close()
+    end
+    mk("agent_history_100.txt", 1000)  -- 最旧
+    mk("agent_history_200.txt", 1000)
+    mk("agent_history_300.txt", 1000)  -- 最新
+    sess_mod.set_sessions_dir(tdir)
+    cfg_mod.archive_space_margin = 1000  -- 小 margin 便于用小文件测试
+    -- free=0, archive_size=500, margin=1000 → needed=1500
+    -- 删 100(1000)→free=1000<1500; 删 200(1000)→free=2000>=1500 停
+    hook.set_free_space_fn(function() return 0 end)
+    local deleted, freed = hook.ensure_archive_space(500)
+    test("ensure_archive_space: 满则删最旧直到够（删 2 留 1）",
+      deleted == 2 and freed == 2000,
+      "deleted=" .. tostring(deleted) .. " freed=" .. tostring(freed))
+    test("ensure_archive_space: 最旧两个已删",
+      not exists(tdir .. "/agent_history_100.txt")
+      and not exists(tdir .. "/agent_history_200.txt"),
+      "100/200 should be gone")
+    test("ensure_archive_space: 最新保留",
+      exists(tdir .. "/agent_history_300.txt"), "300 should remain")
+    -- 空间充足 → 不删
+    hook.set_free_space_fn(function() return 1000000 end)
+    local d2, fr2 = hook.ensure_archive_space(500)
+    test("ensure_archive_space: 空间充足不删",
+      d2 == 0 and fr2 == 0, "deleted=" .. tostring(d2) .. " freed=" .. tostring(fr2))
+    -- 空间未知（math.huge = 无 computer 组件）→ 安全不删
+    hook.set_free_space_fn(function() return math.huge end)
+    local d3, fr3 = hook.ensure_archive_space(500)
+    test("ensure_archive_space: 空间未知(huge)安全不删",
+      d3 == 0 and fr3 == 0, "deleted=" .. tostring(d3))
+    -- 恢复 + 清理
+    hook.set_free_space_fn(nil)  -- 恢复默认读盘逻辑
+    sess_mod.set_sessions_dir(saved_sdir)
+    cfg_mod.archive_space_margin = saved_margin
+    os.execute('rm -rf "' .. tdir .. '"')
+  end
+end
+
 -- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
