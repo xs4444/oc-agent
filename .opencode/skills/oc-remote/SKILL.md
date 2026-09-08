@@ -1,6 +1,6 @@
 ---
 name: oc-remote
-description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 21 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗/
+description: 远控 OC 真机（GTNH 服务器玩家计算机）与 ocvm 测试 VM 的远程通道全量操作手册。Triggers on "远控", "远程控制", "真机", "remote", "oc-remote", "公网通道", "frp 隧道", "real_machine_probe", "remote_server"。涵盖控制服务器（systemd + SakuraFrp 隧道）、CLI 全部 op、探针/电池测试、真机环境特征与 29 坑清单（含磁盘图/世界 ticking/容量写满语义/宿主 CPU 看门狗/
 LLM 无 chunk 挂起/OC internet 4xx 异常语义）。
 ---
 
@@ -253,6 +253,21 @@ python3 tools/remote_server.py client --base $BASE --token "$TOK" \
       （两份同块反而不崩）。**规则：新增测试段落一律独立文件 + dofile 接入**
       （tui_mouse_render_test / session_resume_test 模式，_IN_RUN_TESTS 控
       os.exit，return pass, fail 宿主累加）。
+
+   27. **OpenOS `os.time()` 返回浮点 → `string.format("%d")` 崩**（v0.3.126r7
+       真机实证）：`%d` 要求整数，`os.time()` 给浮点（如 203610232.8）→
+       "bad argument #2 to 'format' (number has no integer representation)"。
+       日志/时间戳一律字符串拼接 `"[" .. os.time() .. "]"`，勿用 `%d`。
+   28. **OpenOS `shell` 模块无顶层 `run` 函数**（v0.3.126r7 真机实证）：
+       `require("shell").run` 是 nil（`run` 是 `getShell()` 返回的 shell 实例的
+       方法，非模块函数）→ "attempt to call a nil value (field 'run')"。
+       /init.lua 自动拉起程序用 `dofile(path)`，不依赖 shell API。
+   29. **/init.lua 顶层崩溃 = OpenOS 蓝屏且无 shell 可救**：崩在拉起 shell 之前
+       → computer.stopped + machine.lastError → GraphicsCard.scala:559 画蓝底
+       (0x0000FF) "Unrecoverable Error"，机器空闲无程序接收按键 → 重启仍崩
+       （死循环）。恢复：软盘启动（另盘 OS 的 shell 挂载根盘 /mnt/<hex> 改
+       /init.lua）；若崩在 shell 循环内则游戏内聚焦屏幕按任意键可进 shell。
+       **规则：改 /init.lua 先 loadfile 编译校验 + 真机留 .bak/.bak2 备份**。
 
 ## 真机部署/恢复配方
 
