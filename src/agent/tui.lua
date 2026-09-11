@@ -25,6 +25,12 @@ local ok_cp, computer = pcall(require, "computer")
 -- 缺模块时回落旧启发（#ch>=3），不阻塞启动/测试。
 local ok_w, wcwidth = pcall(require, "agent.wcwidth")
 if not ok_w or type(wcwidth) ~= "table" then wcwidth = nil end
+-- 协作式让出闸门（agent.patch P4, v0.3.127）: OpenOS 看门狗（machine.lua:
+-- 1519 deadline 默认 5s）在**不间断的纯 CPU 段**超时即 error
+-- "too long without yielding"。重渲染大会话 / 全量 decode 都属此类。
+-- pcall 保护: 测试环境缺 patch 时降级为无让出（行为与修复前一致）。
+local ok_pg, patch_mod = pcall(require, "agent.patch")
+if not ok_pg or type(patch_mod) ~= "table" then patch_mod = nil end
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
@@ -806,21 +812,13 @@ function tui.loadHistory(messages)
       appendHistory({text = line, color = color})
     end
   end
-  -- OpenOS 看门狗: 主线程跑太久不让出 → "too long without yielding"（真机
-  -- 2026-09-08 实证: /resume 恢复 388 条会话, wrapText+appendHistory 循环
-  -- 无让出 → agent 崩 "too long without yielding"）。每 ~8 条让出一次重置
-  -- 看门狗计时。让出用 os.sleep（~20ms 最小 tick）——GTNH OpenOS 1.8.9 真机
-  -- 实证 require("computer").sleep == nil（1.8+ 移除, 改 os.sleep）, 用
-  -- computer.sleep 的 pcall 会静默失败=没让出。pcall 兜底: 无 os.sleep
-  -- （测试/降级）跳过让出, 循环仍完成。
-  local ok_os_sleep = type(os.sleep) == "function"
-  local yielded = 0
+  -- OpenOS 看门狗让出（v0.3.127 改为时间基准）: 旧版"每 8 条让出一次"
+  -- 是**条数基准**——单条成本大（12KB 内容 + wrapText）时 8 条就可能超
+  -- 5s 阈值，且真机根因根本不在这一环（在全量 decode，见 init.lua
+  -- scan_jsonl）。改走 patch.yield_gate: 按真实墙钟累计 ~0.7s 让出一次，
+  -- 单条再大也不会攒过阈值。patch 缺失（测试降级）时是空操作。
   local function maybe_yield()
-    yielded = yielded + 1
-    if yielded >= 8 and ok_os_sleep then
-      pcall(os.sleep, 0.01)
-      yielded = 0
-    end
+    if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   for _, m in ipairs(messages) do
     if type(m) ~= "table" then break end

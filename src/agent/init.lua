@@ -104,6 +104,14 @@ local chat = chat_mod.chat
 -- 工具阻塞期间用户中断生效。install() 在 main() 里调用。
 local interrupt_mod = require("agent.interrupt")
 
+-- 协作式让出闸门（agent.patch P4）——/resume 的两处**逐行读取**循环用它
+-- 重置 OpenOS 看门狗（见 scan_jsonl 注释: 逐行读取本身才是那个 6.3s 的
+-- 不间断段）。必须是**模块级 local**：写成裸自由变量会静默变 nil，
+-- `if patch_mod and ...` 守卫直接把闸门跳过（本项目「隐形 nil」坑，
+-- 真机 v0.3.126r3 的 sessions_dir 同形）。pcall 保护: 缺模块时降级。
+local ok_pm, patch_mod = pcall(require, "agent.patch")
+if not ok_pm then patch_mod = nil end
+
 local subagent_mod = require("agent.subagent")
 local load_session_history, append_session_history, rebuild_session_history =
   subagent_mod.load_session_history, subagent_mod.append_session_history, subagent_mod.rebuild_session_history
@@ -602,19 +610,32 @@ local function handle_command(cmd, config, messages)
       if #p > 40 then return utf8_safe_cut(p, 40) .. "…" end
       return p
     end
-    -- 单遍流式统计 + 首条 user 消息预览（损坏行跳过，与 load_history 同策略）
+    -- 单遍流式统计 + 首条 user 消息预览。
+    -- ⚠️ 真根因不是解码，而是**逐行读取本身**（真机 2026-08-09 实测：
+    --   · 单行 12784B 的 json.decode = 0.001s —— decode 几乎免费
+    --   · 但 635 行 f:lines() 迭代 = 6.3s；同一份数据 read("*a") 只要 1.90s
+    --   · 逐行开销 ~10µs/byte，是解码的百倍量级）
+    -- picker 每次 /resume（含带参数）都要过一遍所有会话，一趟不间断的
+    -- 逐行读取 = 6.3s > OpenOS 看门狗（machine.lua:1519
+    -- deadline = realTime() + system.timeout() 默认 5s）→ 崩
+    -- "too long without yielding"。故**每行过让出闸门**（不能只在解码处让）。
+    -- 同时不再全量 decode：JSONL 一行 = 一条消息 → 行数即条数；预览只解
+    -- 前 PREVIEW_LINES 行（首条 user 一定在最前几条内）。
+    local PREVIEW_LINES = 20
     local function scan_jsonl(name, path, kind)
       local f = io.open(path, "r")
       if not f then return 0 end
-      local count, preview = 0, ""
+      local count, preview, scanned = 0, "", 0
       for line in f:lines() do
-        local ok_j, msg = pcall(json.decode, line)
-        if ok_j and type(msg) == "table" and msg.role then
-          count = count + 1
-          if preview == "" and msg.role == "user" then
+        count = count + 1
+        if preview == "" and scanned < PREVIEW_LINES then
+          scanned = scanned + 1
+          local ok_j, msg = pcall(json.decode, line)
+          if ok_j and type(msg) == "table" and msg.role == "user" then
             preview = preview_of(msg.content)
           end
         end
+        if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
       end
       f:close()
       if count > 0 then
@@ -690,10 +711,12 @@ local function handle_command(cmd, config, messages)
           local jsonl_path = e.path:sub(1, -5) .. ".jsonl"
           local f2 = io.open(jsonl_path, "r")
           if f2 then
+            -- 只数行、不解码；但**必须过让出闸门**——逐行读取本身才是
+            -- 6.3s 的那个不间断段（见 scan_jsonl 注释）
             local n2 = 0
-            for line in f2:lines() do
-              local ok_j, m = pcall(json.decode, line)
-              if ok_j and type(m) == "table" and m.role then n2 = n2 + 1 end
+            for _ in f2:lines() do
+              n2 = n2 + 1
+              if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
             end
             f2:close()
             if n2 >= e.count then

@@ -2921,6 +2921,21 @@ do
     test("session_resume_test file runs", false, tostring(ok_sr) .. " " .. tostring(p_sr))
   end
 end
+-- OpenOS 看门狗 / 协作让出回归（v0.3.127）: 独立文件 watchdog_yield_test.lua
+-- 以 dofile 接入（同上——主 chunk 局部变量贴近 200 上限）。用虚拟钟 +
+-- 模拟 machine.lua checkDeadline 复现真机 "too long without yielding"
+-- 崩溃类，断言 /resume 全流程（picker 不解码整份 + load_history 让出）安全。
+do
+  _IN_RUN_TESTS = true
+  local ok_wd, p_wd, f_wd = pcall(dofile, "watchdog_yield_test.lua")
+  _IN_RUN_TESTS = nil
+  if ok_wd and type(p_wd) == "number" then
+    pass = pass + p_wd
+    fail = fail + f_wd
+  else
+    test("watchdog_yield_test file runs", false, tostring(ok_wd) .. " " .. tostring(p_wd))
+  end
+end
 
 -- ═══════════════════════════════════════════
 -- session: ① sessions_dir 模块默认值回归（曾是全局自由变量——启动时无人

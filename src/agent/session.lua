@@ -16,6 +16,14 @@
 
 local json = require("agent.json")
 local config_mod = require("agent.config")
+-- 协作式让出闸门（OpenOS 看门狗）——见 agent.patch P4。
+-- 真机实测（2026-08-09 两次独立测量）: **瓶颈是逐行读取，不是解码**——
+--   · 单行 12784B 的 json.decode = 0.001s（解码几乎免费）
+--   · 635 行 f:lines() 迭代 = 6.3s（逐行 ~87.4KB/s）；同数据 read("*a") 1.90s
+-- ⇒ 550KB 会话单趟逐行读取 6.3s > 看门狗 system.timeout() 5s，必崩
+--   "too long without yielding"。故闸门要盖在**读取循环**上（每行一次），
+--   只盖解码处不够（encode 侧同理，整表 rebuild 也是一行一次）。
+local patch_mod = require("agent.patch")
 
 -- Injected by agent.lua's set_chat(chat) once Section 5 is defined.
 local injected_chat
@@ -520,6 +528,9 @@ local function append_history(msg)
 end
 
 -- Full rewrite of the session log (after compaction / new session / reset).
+-- 让出闸门: encode 与 decode 同量级（真机 ~106KB/s），整表重写 550KB 会话
+-- 单趟 >5s 看门狗 → 每条让出一次（patch_mod.yield_gate 自带时间预算，
+-- 快速路径只比较一个数，开销可忽略）。
 local function rebuild_history(messages)
   local f = io.open(history_path, "w")
   if not f then
@@ -528,6 +539,7 @@ local function rebuild_history(messages)
   end
   for _, m in ipairs(messages) do
     f:write(json.encode(m), "\n")
+    if patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   f:close()
 end
@@ -583,6 +595,10 @@ local function load_history()
       end
       messages[#messages + 1] = msg
     end
+    -- 让出闸门（见 patch P4）: 635 行/550KB 的 jsonl 整趟**逐行读取**真机
+    -- 实测 6.3s（逐行 ~87.4KB/s；解码才 0.001s/行）> 看门狗 5s——必须每行
+    -- 给一次让出机会。
+    if patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   ingest(line0)
   for line in f:lines() do

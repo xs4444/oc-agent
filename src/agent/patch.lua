@@ -53,6 +53,87 @@ M.now = function()
   return NOW()
 end
 
+-- ── P4: 协作式让出闸门（OpenOS 看门狗）────────────────────────
+-- 背景（真机 2026-08-09 实证）: machine.lua:1519 每轮 resume 设
+--   deadline = computer.realTime() + system.timeout()（默认 5s），
+-- 由 debug count hook（checkDeadline, machine.lua:45-53）在**不被打断的
+-- 纯 CPU 段**超时后 error "too long without yielding"。
+-- ⚠️ 该错误的 traceback 无诊断价值: machine.lua:836 用
+--   pcall(msgh, tostring(tooLongWithoutYielding))
+-- 在**栈已展开之后**调用 message handler → handler 里的 debug.traceback()
+-- 只能看到 handler 自己的栈（实测真机: init:56 → pcall → machine:836 →
+-- init:53 → bios:61，没有任何 agent 帧）→ 真正的崩溃点要在候选路径上逐段
+-- 计时找。
+-- 真机成本画像（两次独立测量，决定闸门该盖在哪里）:
+--   · 逐行读取  ~87.4 KB/s（635 行/550707B = 6.3s）← 会话文件路径的主成本
+--   · read("*a") ~290 KB/s（同数据 1.90s，单次调用，<5s 可接受）
+--   · json.decode 0.001s/12.7KB 行（几乎免费——曾误判它是瓶颈，改错过一轮）
+--   ⇒ 闸门要盖在**读取/迭代循环**上（每行一次），只盖解码处不够。
+-- 让出 = os.sleep/event.pull（sysyield）→ 主循环重设 deadline。
+-- 用 realTime（**与看门狗同一个钟**）而非 uptime: uptime 是世界时间，
+-- 世界停摆时不走，会让闸门误判"还没到点"→ 让出太晚仍崩。
+local YIELD_BUDGET = 0.7
+local YIELD_SLEEP = 0.05   -- 一个 tick; 不用 0（OC #3779 os.sleep(0) 曾不
+                           -- 保证让出——正数才确定重置看门狗）
+local REALNOW = nil
+local function resolve_realnow()
+  local ok_c, comp = pcall(require, "computer")
+  if ok_c and comp then
+    if comp.realTime then return function() return comp.realTime() end end
+    if comp.uptime then return function() return comp.uptime() end end
+  end
+  return os.clock
+end
+-- 看门狗同源钟（真实墙钟）。与 M.now() 的区别: now() 优先 uptime（世界
+-- 墙钟，供重试/超时预算用），realnow() 优先 realTime（供让出闸门用）。
+M.realnow = function()
+  if not REALNOW then REALNOW = resolve_realnow() end
+  return REALNOW()
+end
+
+local gate_last = nil
+local gate_off = false
+local NOW_FN = nil
+-- 时钟探测只做一次（热路径每行都调这个闸门，不能每次都 pcall 组件调用）
+local function ensure_clock()
+  if NOW_FN then return true end
+  local ok, fn = pcall(resolve_realnow)
+  if not ok or type(fn) ~= "function" then return false end
+  local ok2, v = pcall(fn)
+  if not ok2 or type(v) ~= "number" then return false end
+  NOW_FN = fn
+  return true
+end
+-- 让出闸门: 在"单次迭代成本可观"的循环体内每轮调一次（per 行/条）。
+-- 累计 ~YIELD_BUDGET 秒未让出则让出一次。别放进逐字符内循环——realTime
+-- 是组件调用，比迭代本身贵。无 os.sleep/无钟的环境（部分测试）自动降级
+-- 为空操作（闸门关，行为与修复前一致）。
+M.yield_gate = function()
+  if gate_off then return end
+  if not NOW_FN and not ensure_clock() then gate_off = true return end
+  local now = NOW_FN()
+  if gate_last == nil then gate_last = now return end
+  if (now - gate_last) < YIELD_BUDGET then return end
+  gate_last = now
+  if type(os.sleep) ~= "function" then gate_off = true return end
+  -- pcall: os.sleep 被 interrupt 补丁包装过（Ctrl+C 时抛 interrupted，
+  -- 此处不吞掉用户中断的语义由外层命令循环处理——与既有 loadHistory
+  -- 的 pcall(os.sleep, ...) 一致）
+  pcall(os.sleep, YIELD_SLEEP)
+end
+
+-- 供测试断言: 闸门状态与预算（真机路径不得依赖它们的值）。
+M.YIELD_BUDGET = YIELD_BUDGET
+
+-- 测试缝隙: 注入虚拟钟。oc_mock 下真实钟不前进，毫秒级跑完的测试永远
+-- 攒不满预算 → 单测需要可控时间轴（watchdog_yield_test.lua 用虚拟钟 +
+-- 模拟看门狗 hook 复现真机崩溃类）。传 nil 恢复真实钟。
+M._set_clock = function(fn)
+  NOW_FN = fn
+  gate_last = nil
+  gate_off = false
+end
+
 -- ── P3: 多事件名匹配 pull ─────────────────────────────────────
 -- OpenOS event.pull(timeout, "a", "b") 语义是"事件名 match a 且
 -- 参数1==b"（位置匹配）——想要"匹配多个事件名"必须无过滤 pull + 自判

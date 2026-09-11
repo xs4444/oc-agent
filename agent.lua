@@ -1740,6 +1740,14 @@ package.preload["agent.session"] = function()
 
 local json = require("agent.json")
 local config_mod = require("agent.config")
+-- 协作式让出闸门（OpenOS 看门狗）——见 agent.patch P4。
+-- 真机实测（2026-08-09 两次独立测量）: **瓶颈是逐行读取，不是解码**——
+--   · 单行 12784B 的 json.decode = 0.001s（解码几乎免费）
+--   · 635 行 f:lines() 迭代 = 6.3s（逐行 ~87.4KB/s）；同数据 read("*a") 1.90s
+-- ⇒ 550KB 会话单趟逐行读取 6.3s > 看门狗 system.timeout() 5s，必崩
+--   "too long without yielding"。故闸门要盖在**读取循环**上（每行一次），
+--   只盖解码处不够（encode 侧同理，整表 rebuild 也是一行一次）。
+local patch_mod = require("agent.patch")
 
 -- Injected by agent.lua's set_chat(chat) once Section 5 is defined.
 local injected_chat
@@ -2244,6 +2252,9 @@ local function append_history(msg)
 end
 
 -- Full rewrite of the session log (after compaction / new session / reset).
+-- 让出闸门: encode 与 decode 同量级（真机 ~106KB/s），整表重写 550KB 会话
+-- 单趟 >5s 看门狗 → 每条让出一次（patch_mod.yield_gate 自带时间预算，
+-- 快速路径只比较一个数，开销可忽略）。
 local function rebuild_history(messages)
   local f = io.open(history_path, "w")
   if not f then
@@ -2252,6 +2263,7 @@ local function rebuild_history(messages)
   end
   for _, m in ipairs(messages) do
     f:write(json.encode(m), "\n")
+    if patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   f:close()
 end
@@ -2307,6 +2319,10 @@ local function load_history()
       end
       messages[#messages + 1] = msg
     end
+    -- 让出闸门（见 patch P4）: 635 行/550KB 的 jsonl 整趟**逐行读取**真机
+    -- 实测 6.3s（逐行 ~87.4KB/s；解码才 0.001s/行）> 看门狗 5s——必须每行
+    -- 给一次让出机会。
+    if patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   ingest(line0)
   for line in f:lines() do
@@ -3440,6 +3456,87 @@ M.now = function()
   return NOW()
 end
 
+-- ── P4: 协作式让出闸门（OpenOS 看门狗）────────────────────────
+-- 背景（真机 2026-08-09 实证）: machine.lua:1519 每轮 resume 设
+--   deadline = computer.realTime() + system.timeout()（默认 5s），
+-- 由 debug count hook（checkDeadline, machine.lua:45-53）在**不被打断的
+-- 纯 CPU 段**超时后 error "too long without yielding"。
+-- ⚠️ 该错误的 traceback 无诊断价值: machine.lua:836 用
+--   pcall(msgh, tostring(tooLongWithoutYielding))
+-- 在**栈已展开之后**调用 message handler → handler 里的 debug.traceback()
+-- 只能看到 handler 自己的栈（实测真机: init:56 → pcall → machine:836 →
+-- init:53 → bios:61，没有任何 agent 帧）→ 真正的崩溃点要在候选路径上逐段
+-- 计时找。
+-- 真机成本画像（两次独立测量，决定闸门该盖在哪里）:
+--   · 逐行读取  ~87.4 KB/s（635 行/550707B = 6.3s）← 会话文件路径的主成本
+--   · read("*a") ~290 KB/s（同数据 1.90s，单次调用，<5s 可接受）
+--   · json.decode 0.001s/12.7KB 行（几乎免费——曾误判它是瓶颈，改错过一轮）
+--   ⇒ 闸门要盖在**读取/迭代循环**上（每行一次），只盖解码处不够。
+-- 让出 = os.sleep/event.pull（sysyield）→ 主循环重设 deadline。
+-- 用 realTime（**与看门狗同一个钟**）而非 uptime: uptime 是世界时间，
+-- 世界停摆时不走，会让闸门误判"还没到点"→ 让出太晚仍崩。
+local YIELD_BUDGET = 0.7
+local YIELD_SLEEP = 0.05   -- 一个 tick; 不用 0（OC #3779 os.sleep(0) 曾不
+                           -- 保证让出——正数才确定重置看门狗）
+local REALNOW = nil
+local function resolve_realnow()
+  local ok_c, comp = pcall(require, "computer")
+  if ok_c and comp then
+    if comp.realTime then return function() return comp.realTime() end end
+    if comp.uptime then return function() return comp.uptime() end end
+  end
+  return os.clock
+end
+-- 看门狗同源钟（真实墙钟）。与 M.now() 的区别: now() 优先 uptime（世界
+-- 墙钟，供重试/超时预算用），realnow() 优先 realTime（供让出闸门用）。
+M.realnow = function()
+  if not REALNOW then REALNOW = resolve_realnow() end
+  return REALNOW()
+end
+
+local gate_last = nil
+local gate_off = false
+local NOW_FN = nil
+-- 时钟探测只做一次（热路径每行都调这个闸门，不能每次都 pcall 组件调用）
+local function ensure_clock()
+  if NOW_FN then return true end
+  local ok, fn = pcall(resolve_realnow)
+  if not ok or type(fn) ~= "function" then return false end
+  local ok2, v = pcall(fn)
+  if not ok2 or type(v) ~= "number" then return false end
+  NOW_FN = fn
+  return true
+end
+-- 让出闸门: 在"单次迭代成本可观"的循环体内每轮调一次（per 行/条）。
+-- 累计 ~YIELD_BUDGET 秒未让出则让出一次。别放进逐字符内循环——realTime
+-- 是组件调用，比迭代本身贵。无 os.sleep/无钟的环境（部分测试）自动降级
+-- 为空操作（闸门关，行为与修复前一致）。
+M.yield_gate = function()
+  if gate_off then return end
+  if not NOW_FN and not ensure_clock() then gate_off = true return end
+  local now = NOW_FN()
+  if gate_last == nil then gate_last = now return end
+  if (now - gate_last) < YIELD_BUDGET then return end
+  gate_last = now
+  if type(os.sleep) ~= "function" then gate_off = true return end
+  -- pcall: os.sleep 被 interrupt 补丁包装过（Ctrl+C 时抛 interrupted，
+  -- 此处不吞掉用户中断的语义由外层命令循环处理——与既有 loadHistory
+  -- 的 pcall(os.sleep, ...) 一致）
+  pcall(os.sleep, YIELD_SLEEP)
+end
+
+-- 供测试断言: 闸门状态与预算（真机路径不得依赖它们的值）。
+M.YIELD_BUDGET = YIELD_BUDGET
+
+-- 测试缝隙: 注入虚拟钟。oc_mock 下真实钟不前进，毫秒级跑完的测试永远
+-- 攒不满预算 → 单测需要可控时间轴（watchdog_yield_test.lua 用虚拟钟 +
+-- 模拟看门狗 hook 复现真机崩溃类）。传 nil 恢复真实钟。
+M._set_clock = function(fn)
+  NOW_FN = fn
+  gate_last = nil
+  gate_off = false
+end
+
 -- ── P3: 多事件名匹配 pull ─────────────────────────────────────
 -- OpenOS event.pull(timeout, "a", "b") 语义是"事件名 match a 且
 -- 参数1==b"（位置匹配）——想要"匹配多个事件名"必须无过滤 pull + 自判
@@ -4483,6 +4580,12 @@ local ok_cp, computer = pcall(require, "computer")
 -- 缺模块时回落旧启发（#ch>=3），不阻塞启动/测试。
 local ok_w, wcwidth = pcall(require, "agent.wcwidth")
 if not ok_w or type(wcwidth) ~= "table" then wcwidth = nil end
+-- 协作式让出闸门（agent.patch P4, v0.3.127）: OpenOS 看门狗（machine.lua:
+-- 1519 deadline 默认 5s）在**不间断的纯 CPU 段**超时即 error
+-- "too long without yielding"。重渲染大会话 / 全量 decode 都属此类。
+-- pcall 保护: 测试环境缺 patch 时降级为无让出（行为与修复前一致）。
+local ok_pg, patch_mod = pcall(require, "agent.patch")
+if not ok_pg or type(patch_mod) ~= "table" then patch_mod = nil end
 -- 缺库降级: 无 GPU/键盘组件时绘制静默失败，纯逻辑（history/滚动/补全）
 -- 仍可用（测试环境/机器人）。
 if not ok_c then component = {} end
@@ -5264,21 +5367,13 @@ function tui.loadHistory(messages)
       appendHistory({text = line, color = color})
     end
   end
-  -- OpenOS 看门狗: 主线程跑太久不让出 → "too long without yielding"（真机
-  -- 2026-09-08 实证: /resume 恢复 388 条会话, wrapText+appendHistory 循环
-  -- 无让出 → agent 崩 "too long without yielding"）。每 ~8 条让出一次重置
-  -- 看门狗计时。让出用 os.sleep（~20ms 最小 tick）——GTNH OpenOS 1.8.9 真机
-  -- 实证 require("computer").sleep == nil（1.8+ 移除, 改 os.sleep）, 用
-  -- computer.sleep 的 pcall 会静默失败=没让出。pcall 兜底: 无 os.sleep
-  -- （测试/降级）跳过让出, 循环仍完成。
-  local ok_os_sleep = type(os.sleep) == "function"
-  local yielded = 0
+  -- OpenOS 看门狗让出（v0.3.127 改为时间基准）: 旧版"每 8 条让出一次"
+  -- 是**条数基准**——单条成本大（12KB 内容 + wrapText）时 8 条就可能超
+  -- 5s 阈值，且真机根因根本不在这一环（在全量 decode，见 init.lua
+  -- scan_jsonl）。改走 patch.yield_gate: 按真实墙钟累计 ~0.7s 让出一次，
+  -- 单条再大也不会攒过阈值。patch 缺失（测试降级）时是空操作。
   local function maybe_yield()
-    yielded = yielded + 1
-    if yielded >= 8 and ok_os_sleep then
-      pcall(os.sleep, 0.01)
-      yielded = 0
-    end
+    if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
   end
   for _, m in ipairs(messages) do
     if type(m) ~= "table" then break end
@@ -8035,6 +8130,14 @@ local chat = chat_mod.chat
 -- 工具阻塞期间用户中断生效。install() 在 main() 里调用。
 local interrupt_mod = require("agent.interrupt")
 
+-- 协作式让出闸门（agent.patch P4）——/resume 的两处**逐行读取**循环用它
+-- 重置 OpenOS 看门狗（见 scan_jsonl 注释: 逐行读取本身才是那个 6.3s 的
+-- 不间断段）。必须是**模块级 local**：写成裸自由变量会静默变 nil，
+-- `if patch_mod and ...` 守卫直接把闸门跳过（本项目「隐形 nil」坑，
+-- 真机 v0.3.126r3 的 sessions_dir 同形）。pcall 保护: 缺模块时降级。
+local ok_pm, patch_mod = pcall(require, "agent.patch")
+if not ok_pm then patch_mod = nil end
+
 local subagent_mod = require("agent.subagent")
 local load_session_history, append_session_history, rebuild_session_history =
   subagent_mod.load_session_history, subagent_mod.append_session_history, subagent_mod.rebuild_session_history
@@ -8533,19 +8636,32 @@ local function handle_command(cmd, config, messages)
       if #p > 40 then return utf8_safe_cut(p, 40) .. "…" end
       return p
     end
-    -- 单遍流式统计 + 首条 user 消息预览（损坏行跳过，与 load_history 同策略）
+    -- 单遍流式统计 + 首条 user 消息预览。
+    -- ⚠️ 真根因不是解码，而是**逐行读取本身**（真机 2026-08-09 实测：
+    --   · 单行 12784B 的 json.decode = 0.001s —— decode 几乎免费
+    --   · 但 635 行 f:lines() 迭代 = 6.3s；同一份数据 read("*a") 只要 1.90s
+    --   · 逐行开销 ~10µs/byte，是解码的百倍量级）
+    -- picker 每次 /resume（含带参数）都要过一遍所有会话，一趟不间断的
+    -- 逐行读取 = 6.3s > OpenOS 看门狗（machine.lua:1519
+    -- deadline = realTime() + system.timeout() 默认 5s）→ 崩
+    -- "too long without yielding"。故**每行过让出闸门**（不能只在解码处让）。
+    -- 同时不再全量 decode：JSONL 一行 = 一条消息 → 行数即条数；预览只解
+    -- 前 PREVIEW_LINES 行（首条 user 一定在最前几条内）。
+    local PREVIEW_LINES = 20
     local function scan_jsonl(name, path, kind)
       local f = io.open(path, "r")
       if not f then return 0 end
-      local count, preview = 0, ""
+      local count, preview, scanned = 0, "", 0
       for line in f:lines() do
-        local ok_j, msg = pcall(json.decode, line)
-        if ok_j and type(msg) == "table" and msg.role then
-          count = count + 1
-          if preview == "" and msg.role == "user" then
+        count = count + 1
+        if preview == "" and scanned < PREVIEW_LINES then
+          scanned = scanned + 1
+          local ok_j, msg = pcall(json.decode, line)
+          if ok_j and type(msg) == "table" and msg.role == "user" then
             preview = preview_of(msg.content)
           end
         end
+        if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
       end
       f:close()
       if count > 0 then
@@ -8621,10 +8737,12 @@ local function handle_command(cmd, config, messages)
           local jsonl_path = e.path:sub(1, -5) .. ".jsonl"
           local f2 = io.open(jsonl_path, "r")
           if f2 then
+            -- 只数行、不解码；但**必须过让出闸门**——逐行读取本身才是
+            -- 6.3s 的那个不间断段（见 scan_jsonl 注释）
             local n2 = 0
-            for line in f2:lines() do
-              local ok_j, m = pcall(json.decode, line)
-              if ok_j and type(m) == "table" and m.role then n2 = n2 + 1 end
+            for _ in f2:lines() do
+              n2 = n2 + 1
+              if patch_mod and patch_mod.yield_gate then patch_mod.yield_gate() end
             end
             f2:close()
             if n2 >= e.count then
