@@ -8826,6 +8826,11 @@ local function handle_command(cmd, config, messages)
     else
       print("No messages to archive")
     end
+    -- 切回默认主会话再清空重建（/new 语义 = "开新会话"，主会话是它的家）。
+    -- **必须切回**: rebuild_history 是 `io.open(history_path,"w")`——留在
+    -- 命名会话上直接把该命名会话清空成 0 字节（内容虽已进归档，但会话名
+    -- 被毁，重启后还用它续写会得到空文件）。2026-09-12 测试实证。
+    session_mod.switch_to(HISTORY_PATH)
     messages = {}
     rebuild_history(messages)
     if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
@@ -8879,7 +8884,7 @@ local function handle_command(cmd, config, messages)
     else
       local target = parts[2]
       if target == "default" then
-        session_mod.set_paths(HISTORY_PATH)
+        session_mod.switch_to(HISTORY_PATH)  -- 落盘指针（重启恢复）
         messages = session_mod.load_history()
         if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
         print("Session: default (" .. #messages .. " msgs)")
@@ -8890,7 +8895,7 @@ local function handle_command(cmd, config, messages)
         if not ok_dir then
           print("Session dir unavailable: " .. tostring(dir_err))
         else
-          session_mod.set_paths(SESSIONS_DIR .. "/" .. safe .. ".jsonl")
+          session_mod.switch_to(SESSIONS_DIR .. "/" .. safe .. ".jsonl")
           messages = session_mod.load_history()
           if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
           print("Session: " .. safe .. " (" .. #messages .. " msgs)")
@@ -9038,7 +9043,7 @@ local function handle_command(cmd, config, messages)
             end
             f2:close()
             if n2 >= e.count then
-              session_mod.set_paths(jsonl_path)
+              session_mod.switch_to(jsonl_path)
               local msgs = load_history()
               print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, continued session)")
               return msgs
@@ -9059,7 +9064,7 @@ local function handle_command(cmd, config, messages)
           end
           local list = data.role and {data} or data
           local msgs = trim_history(list)
-          session_mod.set_paths(jsonl_path)
+          session_mod.switch_to(jsonl_path)
           rebuild_history(msgs)
           if #msgs < #list then
             print("  (按内存预算裁剪: 加载 " .. #msgs .. "/" .. #list
@@ -9068,7 +9073,7 @@ local function handle_command(cmd, config, messages)
           print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs, archive migrated to JSONL; .txt kept)")
           return msgs
         else
-          session_mod.set_paths(e.path)
+          session_mod.switch_to(e.path)
           local msgs = load_history()
           print("Resumed: " .. e.name .. " (" .. #msgs .. " msgs)")
           return msgs
@@ -9293,6 +9298,11 @@ local function handle_command(cmd, config, messages)
       failed[#failed + 1] = "data_dir 引导写入: " .. tostring(err_save)
     end
     -- 5) 本进程内立即切换 session 路径
+    -- 清活动会话指针（不是记新路径）: 旧盘路径在新盘上仍"存在"（迁移
+    -- 是复制不是移动），留着指针会让重启后的 restore_active 把会话拉回
+    -- 旧盘并在那里续写 → 新盘主会话被旁路。清掉 = 重启后落新盘默认
+    -- 会话，与 data_dir 引导语义一致。
+    session_mod.clear_active()
     session_mod.set_paths(target .. "/agent_history.txt")
     session_mod.set_sessions_dir(target .. "/sessions")
     print("[relocate] 已迁移 " .. moved .. " 个文件到 " .. target
@@ -9665,6 +9675,8 @@ local function handle_command(cmd, config, messages)
     print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
     print("  /reset          Clear history without archiving")
     print("  /restart        Reboot this computer (agent auto-restarts via /init.lua)")
+    print("  /resume         Reopen a previous session (survives /restart: the active")
+    print("                  session is remembered and restored on boot)")
     print("  /hist           Show current session name and message count")
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
@@ -9700,6 +9712,13 @@ local function handle_command(cmd, config, messages)
   else
     print("Unknown command: " .. command .. ". Type /help for commands.")
   end
+  -- 会话边界补记指针: /new（归档后开新会话）与 /reset（清空不归档）
+  -- 都会把 messages 归零或重建，但两者都**不碰** history_path——上次
+  -- /session <name> 留下的指针若还在，重启就会把用户拉回那个旧会话
+  -- （与 /new 的"开新会话"语义直接冲突）。此处按当前真实路径补记一次:
+  -- switch_to 内部对"指针==默认主会话 → 清指针"与"值相同 → 不写盘"
+  -- 双短路，常规命令（/model /ctx /help…）零开销、零写盘。
+  session_mod.switch_to(session_mod.current_path())
   return false, config, messages
 end
 
@@ -11048,6 +11067,11 @@ if _TEST_MODE then
     get_sessions_dir = session_mod.get_sessions_dir,
     set_sessions_dir = session_mod.set_sessions_dir,
     current_session_path = session_mod.current_path,
+    -- 活动会话持久化（重启自动恢复）测试钩子
+    switch_to = session_mod.switch_to,
+    restore_active = session_mod.restore_active,
+    clear_active = session_mod.clear_active,
+    active_name = session_mod.active_name,
     handle_command = handle_command,
     process_exchange = process_exchange,
     wait_modem_message = subagent_mod.wait_modem_message,

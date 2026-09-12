@@ -571,6 +571,11 @@ local function handle_command(cmd, config, messages)
     else
       print("No messages to archive")
     end
+    -- 切回默认主会话再清空重建（/new 语义 = "开新会话"，主会话是它的家）。
+    -- **必须切回**: rebuild_history 是 `io.open(history_path,"w")`——留在
+    -- 命名会话上直接把该命名会话清空成 0 字节（内容虽已进归档，但会话名
+    -- 被毁，重启后还用它续写会得到空文件）。2026-09-12 测试实证。
+    session_mod.switch_to(HISTORY_PATH)
     messages = {}
     rebuild_history(messages)
     if UI_HOOKS.loadHistory then UI_HOOKS.loadHistory(messages) end
@@ -1415,6 +1420,8 @@ local function handle_command(cmd, config, messages)
     print("  /compact        Compress conversation (LLM summary + keep recent 4 msgs)")
     print("  /reset          Clear history without archiving")
     print("  /restart        Reboot this computer (agent auto-restarts via /init.lua)")
+    print("  /resume         Reopen a previous session (survives /restart: the active")
+    print("                  session is remembered and restored on boot)")
     print("  /hist           Show current session name and message count")
     print("  /sessions       List saved sessions")
     print("  /session <name> Switch to (or create) a named session; default = main")
@@ -1450,6 +1457,13 @@ local function handle_command(cmd, config, messages)
   else
     print("Unknown command: " .. command .. ". Type /help for commands.")
   end
+  -- 会话边界补记指针: /new（归档后开新会话）与 /reset（清空不归档）
+  -- 都会把 messages 归零或重建，但两者都**不碰** history_path——上次
+  -- /session <name> 留下的指针若还在，重启就会把用户拉回那个旧会话
+  -- （与 /new 的"开新会话"语义直接冲突）。此处按当前真实路径补记一次:
+  -- switch_to 内部对"指针==默认主会话 → 清指针"与"值相同 → 不写盘"
+  -- 双短路，常规命令（/model /ctx /help…）零开销、零写盘。
+  session_mod.switch_to(session_mod.current_path())
   return false, config, messages
 end
 
@@ -2798,6 +2812,11 @@ if _TEST_MODE then
     get_sessions_dir = session_mod.get_sessions_dir,
     set_sessions_dir = session_mod.set_sessions_dir,
     current_session_path = session_mod.current_path,
+    -- 活动会话持久化（重启自动恢复）测试钩子
+    switch_to = session_mod.switch_to,
+    restore_active = session_mod.restore_active,
+    clear_active = session_mod.clear_active,
+    active_name = session_mod.active_name,
     handle_command = handle_command,
     process_exchange = process_exchange,
     wait_modem_message = subagent_mod.wait_modem_message,

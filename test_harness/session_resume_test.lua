@@ -180,6 +180,117 @@ do
   end
 end
 
+-- ④ 活动会话持久化（重启自动恢复上次会话，2026-09-12 用户要求）
+-- 回归目标: 会话切换必须落盘 config.last_session，重启时 restore_active
+-- 读回——此前切换只改进程内 history_path，重启恒回落默认主会话
+-- （真机实证: 640 条/554KB 的 sessions/*.jsonl 重启后无人读 → TUI 空屏）。
+do
+  local cfg_mod = require("agent.config")
+  local saved_path = sess_mod.current_path()
+  -- 备份真实 config 数据（set_paths 不再写盘，但 switch_to 会）
+  local f0 = io.open(cfg_mod.config_path, "r")
+  local backup = f0 and f0:read("*a") or nil
+  if f0 then f0:close() end
+
+  local tdir = "test_active_session_tmp"
+  os.execute('rm -rf "' .. tdir .. '"')
+  os.execute('mkdir -p "' .. tdir .. '"')
+  local named = tdir .. "/alpha.jsonl"
+  local nf = io.open(named, "w")
+  nf:write(json.encode({role = "user", content = "hello"}), "\n")
+  nf:close()
+
+  -- ① set_paths 不落盘（纯重定向——测试/内部用）
+  local cfg0 = cfg_mod.load() or {}
+  cfg0.last_session = "SENTINEL"
+  cfg_mod.save(cfg0)
+  sess_mod.set_paths(named)
+  local cfg1 = cfg_mod.load() or {}
+  test("active: set_paths 不写盘（SENTINEL 保留）",
+    cfg1.last_session == "SENTINEL", tostring(cfg1.last_session))
+
+  -- ② switch_to 落盘指针
+  sess_mod.switch_to(named)
+  local cfg2 = cfg_mod.load() or {}
+  test("active: switch_to 写 config.last_session",
+    cfg2.last_session == named, tostring(cfg2.last_session))
+
+  -- ③ restore_active: 指针指向存在的文件 → 恢复路径
+  sess_mod.set_paths(cfg_mod.history_path)  -- 先回默认（模拟重启初值）
+  local got = sess_mod.restore_active()
+  test("active: restore_active 恢复上次会话路径",
+    got == named and sess_mod.current_path() == named,
+    "got=" .. tostring(got) .. " cur=" .. tostring(sess_mod.current_path()))
+
+  -- ④ 失效指针（文件已删）→ 不恢复、不改路径（不建空文件顶掉旧记录）
+  os.remove(named)
+  cfg0 = cfg_mod.load() or {}
+  cfg0.last_session = tdir .. "/ghost.jsonl"  -- 不存在的文件
+  cfg_mod.save(cfg0)
+  sess_mod.set_paths(cfg_mod.history_path)
+  local got2 = sess_mod.restore_active()
+  test("active: 失效指针不恢复（保持主会话）",
+    got2 == nil and sess_mod.current_path() == cfg_mod.history_path,
+    "got=" .. tostring(got2) .. " cur=" .. tostring(sess_mod.current_path()))
+
+  -- ⑤ 主会话（default）不写指针——否则 /new 后重启会被拉回旧命名会话
+  sess_mod.switch_to(cfg_mod.history_path)
+  local cfg3 = cfg_mod.load() or {}
+  test("active: 切回主会话清掉指针",
+    cfg3.last_session == nil, tostring(cfg3.last_session))
+
+  -- ⑥ clear_active（/relocate 用）
+  sess_mod.switch_to(named)
+  sess_mod.clear_active()
+  local cfg4 = cfg_mod.load() or {}
+  test("active: clear_active 清指针", cfg4.last_session == nil,
+    tostring(cfg4.last_session))
+
+  -- ⑦ active_name: 主会话 → default；命名会话 → basename 去后缀
+  sess_mod.set_paths(cfg_mod.history_path)
+  local n_def = sess_mod.active_name()
+  sess_mod.set_paths("/x/sessions/beta.jsonl")
+  local n_named = sess_mod.active_name()
+  test("active: active_name（default / 命名会话）",
+    n_def == "default" and n_named == "beta",
+    "def=" .. tostring(n_def) .. " named=" .. tostring(n_named))
+
+  -- ⑧ handle_command 会话边界补记: /session <name> 落盘、/new 清指针
+  if agent_test and agent_test.handle_command then
+    local cc = {model = "m", api_key = ""}
+    local cm = {{role = "user", content = "x"}}
+    sess_mod.set_paths(cfg_mod.history_path)
+    agent_test.handle_command("/session " .. tdir .. "_cmd", cc, cm)
+    local cfg5 = cfg_mod.load() or {}
+    -- /session 的路径由 SESSIONS_DIR 拼出（非本临时目录），只断言"写了一个
+    -- .jsonl 指针"——具体路径取决于 config 的 sessions 目录。
+    test("active: /session <name> 落盘指针",
+      type(cfg5.last_session) == "string"
+      and cfg5.last_session:sub(-6) == ".jsonl",
+      tostring(cfg5.last_session))
+    -- /new 归档后开新会话 → 指针必须回主会话
+    local _ = agent_test.handle_command("/new", cc, cm)
+    local cfg6 = cfg_mod.load() or {}
+    test("active: /new 后指针回主会话（不被旧会话拉回）",
+      cfg6.last_session == nil, tostring(cfg6.last_session))
+    -- 清理 /session 造出的文件
+    if type(cfg5.last_session) == "string" then os.remove(cfg5.last_session) end
+  else
+    test("active: agent_test.handle_command 可用", false, "hook missing")
+  end
+
+  -- 恢复现场: 还原 config 与 session 路径
+  if backup then
+    local fb = io.open(cfg_mod.config_path, "w")
+    fb:write(backup)
+    fb:close()
+  else
+    os.remove(cfg_mod.config_path)
+  end
+  sess_mod.set_paths(saved_path)
+  os.execute('rm -rf "' .. tdir .. '"')
+end
+
 -- ════════════════════════════════════════════════════════════════
 print(string.format("RESULT: %d pass, %d fail", pass, fail))
 if not _IN_RUN_TESTS then
