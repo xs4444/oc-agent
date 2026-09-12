@@ -17,6 +17,10 @@ local http_mod = require("agent.http")
 local http_post = http_mod.post
 local json = require("agent.json")
 local tools_mod = require("agent.tools")
+-- 消息真实字节口径（OOM 修复，见 session.lua msg_bytes/msg_tokens）。
+-- session.lua 不 require chat.lua（init.lua 是唯一汇聚点），无循环依赖。
+local session_mod = require("agent.session")
+local msg_bytes = session_mod.msg_bytes
 
 local function safe_call(fn, ...)
   if type(fn) == "function" then
@@ -201,23 +205,17 @@ local function chat(messages, config, opts)
   -- out 表、最终一次 concat）。守卫用 1.5x（实测 + 20% 余量）——
   -- 曾误用 3x（旧 json 时代的数字）导致合法请求被误拒（200KB 请求体
   -- + 600KB free 时 3x 超阈值但实际 240KB 峰值完全可行）。
-  pcall(collectgarbage, "collect")
-  do
-    local ok_c2, computer2 = pcall(require, "computer")
-    if ok_c2 and type(computer2) == "table" and computer2.freeMemory then
-      local ok_f2, free2 = pcall(computer2.freeMemory)
-      local est = 2048  -- 基础（model/tools 声明/尾部 runtime 等）
-      for _, m in ipairs(api_messages) do
-        if type(m.content) == "string" then est = est + #m.content end
-        if type(m.tool_calls) == "table" then est = est + 256 * #m.tool_calls end
-      end
-      if ok_f2 and type(free2) == "number" and est * 1.5 > free2 * 0.85 then
-        return { error = "请求编码失败 (内存不足): 请求体估算 " .. est
-          .. "B（encode 峰值 ≈1.5x）超出可用 " .. free2
-          .. "B。请先压缩历史（compact_history 工具或 /compact）释放内存后重试" }
-      end
-    end
-  end
+  -- 峰值系数（真机实测 2026-09-12，/mnt/bb7/agent/json.lua encode 探针）:
+  --   增量 = encode 峰值 − 起始 free，实测 body=313KB→532KB(1.70x)、
+  --   626KB→1,260KB(2.01x)、939KB→1,527KB(1.63x)、825KB→3.14MB 绝对峰值。
+  --   取 2.0x 覆盖最坏（+~19% 余量）。旧值 1.5x 源自"分片优化后 1.2x"
+  --   的注释假设，与实测不符（真机现场 554KB 请求体在 free 2.8MB 仍 OOM）。
+  --   **注意**: 本轮实测已证「分块 concat」反而更差（4.34x→5.6x 峰值），
+  --   「数组按元素子缓冲」更差（6.39x）——不要按旧注释的方向优化 json.lua。
+  -- OOM 可复现性关键发现: 同一 626KB payload 在 free=1.79MB 成功、
+  --   1.57MB 失败 → 失败由 **free 水位**主导而非 body 大小（见下方判定 2）。
+  -- （守卫本体移至 req_tools 构建之后——需要 tools 声明的真实字节）
+
   local req_tools = nil
   if not opts.skip_tools then
     -- 工具集覆盖（v0.3.84, explorer 子代理）: opts.tools 显式传列表时
@@ -240,6 +238,80 @@ local function chat(messages, config, opts)
         end
         if type(params.required) == "table" and next(params.required) == nil then
           params.required = nil
+        end
+      end
+    end
+  end
+  local PEAK_FACTOR = 2.0
+  -- 水位判据（判定 2）——**仅对超大请求生效**，按 totalMemory 比例。
+  -- 教训（本次修复过程实测）: 先写死绝对值 1450000B，4 个回归用例失败
+  -- （mock 是 2MB 机/free=524288）；再改无条件比例 0.30 仍失败（mock
+  -- 水位 25%）。水位判据对**小请求**没有意义——小请求在任何水位都能
+  -- encode 成功，无条件套用只会误拒。故限定 est > LARGE_BODY 才检查。
+  -- 真机 4MB 实测失败带从 free/total ≈ 0.39 起（626KB body 于 0.399 失败、
+  -- 于 0.426 成功）→ 取 0.30 为下限，留 ~23% 余量，且只在真实大请求时生效。
+  local LARGE_BODY = 400000
+  local MIN_FREE_RATIO = 0.30
+  pcall(collectgarbage, "collect")
+  do
+    local ok_c2, computer2 = pcall(require, "computer")
+    if ok_c2 and type(computer2) == "table" and computer2.freeMemory then
+      local ok_f2, free2 = pcall(computer2.freeMemory)
+      local total2 = 0
+      if computer2.totalMemory then
+        local ok_t2, t2 = pcall(computer2.totalMemory)
+        if ok_t2 and type(t2) == "number" and t2 > 0 then total2 = t2 end
+      end
+      -- 真实字节口径（OOM 修复）: 逐条 msg_bytes + 固定开销 + system/tools。
+      -- 旧口径三处漏算导致守卫永不触发（真机现场 est=337,068B vs 真实
+      -- 570,200B，est*1.5=505,602 << free*0.85=1,931,761 → 放行后 OOM）:
+      --   ① tool_calls 用 256*#tool_calls 而非 #arguments（真实 198,759B
+      --      被记成 77,312B，低估 2.57x）；
+      --   ② build_system_prompt() + tools 声明（真机实测 system=6,618B +
+      --      tools=8,678B = 15,296B）完全没进 est（旧注释写"基础 2048"）；
+      --   ③ 每条消息 JSON 结构开销与转义膨胀未计。
+      if ok_f2 and type(free2) == "number" then
+        local est = 4096  -- 固定开销: model/max_tokens/temperature 等顶层键 + runtime 尾部块
+        for _, m in ipairs(api_messages) do
+          est = est + msg_bytes(m)
+        end
+        -- 每条消息的结构开销（键名/引号/逗号）: 真机实测 640 条 554,904B
+        -- JSONL 对应 encode 产物 554,976B，纯内容 457,463B → 结构 97,513B
+        -- ≈ 152B/条（含 tool_call 骨架，见 session.msg_bytes_json 的
+        -- STRUCT_PER_MSG/STRUCT_PER_CALL 分摊）。此处按消息数粗算，
+        -- 与 token 路径同源。
+        est = est + 160 * #api_messages
+        -- system_prompt + tools 声明（旧口径完全漏算）
+        local sp = build_system_prompt()
+        if type(sp) == "string" then est = est + #sp end
+        -- tools 声明真实字节（旧口径完全漏算；真机实测 8,678B）。
+        -- 用 json.encode 量准，失败则退回粗估（绝不让守卫自身抛错）。
+        local ok_tj, tools_json = pcall(json.encode, req_tools)
+        if ok_tj and type(tools_json) == "string" then
+          est = est + #tools_json
+        else
+          est = est + 8192 * #(req_tools or {})
+        end
+        -- 判定 1: 估算峰值超可用内存
+        if est * PEAK_FACTOR > free2 * 0.85 then
+          return { error = "请求编码失败 (内存不足): 请求体估算 " .. est
+            .. "B（encode 峰值 ≈" .. PEAK_FACTOR .. "x）超出可用 " .. free2
+            .. "B。请先压缩历史（compact_history 工具或 /compact）释放内存后重试" }
+        end
+        -- 判定 2: 超大请求的 free 水位比例下限。真机实测: 同一 626KB body
+        -- 在 free=1.79MB(0.426×total) 成功、1.57MB(0.399) 失败——body 估算
+        -- 无法解释该差异，说明连续块可得性由 free 水位主导。仅 est 超过
+        -- LARGE_BODY 时检查（小请求在任何水位都能成功，无条件套用会误拒
+        -- ——本次修复中该误拒已被回归用例捕获）。
+        if est > LARGE_BODY then
+          local min_free = 0
+          if total2 > 0 then min_free = total2 * MIN_FREE_RATIO end
+          if min_free > 0 and free2 < min_free then
+            return { error = "请求编码失败 (内存紧张): 可用内存 " .. free2
+              .. "B 低于安全水位 " .. math.floor(min_free) .. "B——encode 需要"
+              .. "一次性连续块，碎片化堆会直接 OOM。请先压缩历史"
+              .. "（compact_history 工具或 /compact）后重试" }
+          end
         end
       end
     end

@@ -704,6 +704,50 @@ test("should_compact false below 60% window ratio",
 test("should_compact no window falls back to count",
   not should_compact(sc_small, nil))
 
+do  -- OOM 回归测试作用域（避免新增顶层 local 撞 200 上限）
+local estimate_tokens = agent_test.estimate_tokens
+local msg_tokens = agent_test.msg_tokens
+local msg_bytes = agent_test.msg_bytes
+-- ═══ OOM 根因回归（真机 2026-09-12，agent_history_162903596.4.jsonl）═══
+-- 现场: 640 条历史 / 554,904B JSONL，302 个 tool_call 的 arguments 合计
+-- 198,759B。旧口径 estimate_tokens(tostring(m.tool_calls)) 把 tool_calls
+-- 记成 "table: 0x..."（21B/条 ≈ 6 tok），整份历史只报 80,336 tok
+-- （62.8% 窗口）→ 80% 硬保护（102,400）与 60% 压缩引导全部静默漏过
+-- → 历史无限膨胀 → encode 在 table.concat OOM → 卡死 170 分钟。
+-- 正确口径 153,261 tok（provider 上报 ≈128,000）必触发保护。
+local oom_msgs = {}
+local oom_tcid = "chatcmpl-tool-" .. string.rep("0", 22)
+for i = 1, 302 do
+  oom_msgs[#oom_msgs + 1] = {
+    role = "assistant", content = string.rep("c", 120),
+    tool_calls = {{ id = oom_tcid, type = "function",
+      ["function"] = { name = "write_file",
+        arguments = '{"path":"/tmp/x.lua","content":"' .. string.rep("A", 900) .. '"}' } }},
+  }
+  oom_msgs[#oom_msgs + 1] = { role = "tool",
+    tool_call_id = oom_tcid, content = string.rep("r", 260) }
+end
+local old_est, new_est = 0, 0
+for _, m in ipairs(oom_msgs) do
+  old_est = old_est + estimate_tokens(m.content or "")
+      + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+  new_est = new_est + msg_tokens(m)
+end
+test("OOM: msg_tokens counts tool_calls arguments (not tostring)",
+  new_est > old_est * 2)
+test("OOM: msg_tokens on tool_calls-heavy history exceeds 80% window",
+  new_est > 128000 * 0.8)
+test("OOM: legacy tostring estimate alone stays under 80% (the bug)",
+  old_est < 128000 * 0.8)
+test("OOM: msg_bytes includes tool_call arguments",
+  msg_bytes(oom_msgs[1]) > 900)
+test("OOM: msg_bytes ignores non-string arguments safely",
+  msg_bytes({role="assistant", tool_calls={{["function"]={arguments=nil}}}}) == 0)
+test("OOM: should_compact triggers on real-site history at 128K",
+  should_compact(oom_msgs, 128000))
+end
+
+
 -- compact_history returns nil when nothing to compact
 test("compact_history nil on tiny history", compact_history({{role="u", content="x"}}, {}) == nil)
 

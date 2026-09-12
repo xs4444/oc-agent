@@ -75,6 +75,11 @@ local function estimate_tokens(s)
   return math.floor(ascii / 4 + non_ascii * 0.45)
 end
 
+-- 消息真实字节（唯一正确实现）: content + 每个 tool_call 的 arguments。
+-- **不要**用 tostring(m.tool_calls) 估体积——Lua 的 tostring(table) 返回
+-- "table: 0x..."（约 21 字节），会把 198KB 的 arguments 记成 300 字节级，
+-- 低估 3~60 倍（真机 2026-09-12 OOM 根因: 640 条历史 est 仅 80,630 tok
+-- 而非真实 128,000 tok，80% 硬保护与自动折叠全部静默漏过）。
 local function msg_bytes(msg)
   local total = 0
   if type(msg.content) == "string" then total = total + #msg.content end
@@ -86,6 +91,51 @@ local function msg_bytes(msg)
     end
   end
   return total
+end
+
+-- 消息真实字节 + JSON 结构开销估算（键名/引号/逗号/id 串等）。
+-- 真机实测（640 条现场，554,904B JSONL）: msg_bytes 合计 457,463B
+-- （content 258,704 + arguments 198,759），而 json.encode 产物 554,976B
+-- → 结构开销 ≈ 97,513B（17.6%）。按条目数计: 每条消息骨架 ≈ 90B
+-- （role/content/tool_call_id 键名 + 引号 + 逗号），每个 tool_call
+-- 另有 id(43B) + type/function 键名(≈40B) ≈ 83B。
+local STRUCT_PER_MSG = 90
+local STRUCT_PER_CALL = 85
+local function msg_bytes_json(msg)
+  local total = msg_bytes(msg) + STRUCT_PER_MSG
+  if type(msg.tool_calls) == "table" then
+    total = total + STRUCT_PER_CALL * #msg.tool_calls
+  end
+  return total
+end
+
+-- 单条消息的 token 估算（**取代 estimate_tokens(tostring(m.tool_calls))**）。
+-- 逐字节累加 content + 每个 tool_call 的 arguments（零分配——不拼接临时串，
+-- 否则在 OOM 修复路径上反而制造新的大块分配），再套 estimate_tokens 的
+-- 字节→token 比率（ascii/4 + non_ascii*0.45）。JSON 结构开销按估算字节
+-- 补入 ascii 侧（键名/引号/id 全是 ASCII）。
+-- 4 处历史累计点（force_trim / est_msgs / est_now / 400 重试）与
+-- should_compact 统一改用本函数——真机实测该口径 130,134 tok 对 provider
+-- 上报 128,000 tok 误差仅 +1.7%（旧 tostring 口径 80,630 tok，低 1.59x）。
+local function msg_tokens(msg)
+  local ascii, non_ascii = 0, 0
+  local function add(s)
+    for i = 1, #s do
+      if s:byte(i) < 128 then ascii = ascii + 1 else non_ascii = non_ascii + 1 end
+    end
+  end
+  if type(msg.content) == "string" then add(msg.content) end
+  if type(msg.tool_calls) == "table" then
+    for _, tc in ipairs(msg.tool_calls) do
+      local fn = tc["function"]
+      if fn and type(fn.arguments) == "string" then add(fn.arguments) end
+      if type(tc.id) == "string" then add(tc.id) end
+    end
+    -- 每个 tool_call 的 {"id":"","type":"function","function":{"name":"","arguments":""}} 骨架
+    ascii = ascii + STRUCT_PER_CALL * #msg.tool_calls
+  end
+  ascii = ascii + STRUCT_PER_MSG
+  return math.floor(ascii / 4 + non_ascii * 0.45)
 end
 
 local function trim_history(messages)
@@ -495,8 +545,7 @@ local function should_compact(messages, window)
   local est = 0
   for _, m in ipairs(messages) do
     if not m.folded then
-      est = est + estimate_tokens(m.content or "")
-          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      est = est + msg_tokens(m)
       if est >= w * COMPACT_WINDOW_RATIO then return true end
     end
   end
@@ -752,6 +801,12 @@ local M = {
   TOOL_RESULT_KEEP = TOOL_RESULT_KEEP,
   -- 单一 token 估算实现（init.lua 引用，避免重复定义）
   estimate_tokens = estimate_tokens,
+  -- 单条消息口径（OOM 修复）: msg_tokens 取代
+  -- estimate_tokens(tostring(m.tool_calls))；msg_bytes/msg_bytes_json 供
+  -- chat.lua 守卫与 init.lua 字节预算复用，保证全仓库只有一套正确口径。
+  msg_bytes = msg_bytes,
+  msg_bytes_json = msg_bytes_json,
+  msg_tokens = msg_tokens,
 }
 -- 测试钩子: _TEST_MODE 下暴露内部函数（run_tests.lua 断言用）
 if _TEST_MODE then

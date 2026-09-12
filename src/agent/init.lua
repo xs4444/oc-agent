@@ -79,6 +79,12 @@ local first_run_setup = config_mod.first_run
 local WRITABLE_BASE, CONFIG_PATH, HISTORY_PATH, SESSIONS_DIR =
   config_mod.writable_base, config_mod.config_path, config_mod.history_path, config_mod.sessions_dir
 
+-- 默认上下文窗口（token）。2026-09-12 用户要求 128000 → 262144（256K）。
+-- 单一来源: 原先 7 处 `or 128000` 硬编码各自漂移，改窗口时必漏改某处
+-- （守卫/压缩/显示口径不一致 → 静默失效，正是本次 OOM 的同类病根）。
+-- 真机 config 里若已写 context_window（/preset-256k 会写），仍以 config 为准。
+local DEFAULT_CONTEXT_WINDOW = 262144
+
 local session_mod = require("agent.session")
 local trim_history, compact_history, should_compact, summarize_history =
   session_mod.trim_history, session_mod.compact_history, session_mod.should_compact, session_mod.summarize_history
@@ -86,7 +92,27 @@ local load_history, append_history, rebuild_history =
   session_mod.load_history, session_mod.append_history, session_mod.rebuild_history
 -- 物理字节裁剪（session.lua 导出）: mem_pressure 内存紧张时释放内存用
 local trim_to_bytes = session_mod.trim_to_bytes
+-- OOM 错误识别（真机 2026-09-12 卡死根因修复）: chat.lua 的 encode pcall
+-- 捕获后错误串形如
+--   "请求编码失败（内存不足）: /mnt/bb7/agent/agent.lua:123: not enough
+--    memory for buffer allocation"
+-- 其中 "not enough memory" 是 stock Lua 5.3 的原生消息（出自 luaL_Buffer
+-- resizebox，已由本地 /usr/bin/lua5.3 二进制指纹与真机错误串比对确认）。
+-- 另一变体是裸 "not enough memory"（探针实测 1.6MB 目标时的报错）。
+-- 同时覆盖中文前缀，防措辞调整后识别失效。
+local function is_oom_error(err)
+  if type(err) ~= "string" then return false end
+  if err:find("not enough memory", 1, true) then return true end
+  if err:find("内存不足", 1, true) then return true end
+  if err:find("内存紧张", 1, true) then return true end
+  return false
+end
 local estimate_tokens = session_mod.estimate_tokens
+-- 单条消息口径（OOM 修复）: 取代 estimate_tokens(tostring(m.tool_calls))。
+-- tostring(table) = "table: 0x..."（21B），把 198KB arguments 记成 6 tok，
+-- 使 est_msgs/force_trim/est_now/400 重试全部低估 1.59x（真机现场实证）。
+local msg_tokens = session_mod.msg_tokens
+local msg_bytes = session_mod.msg_bytes
 local MAX_TOOL_RESULT = session_mod.MAX_TOOL_RESULT
 local TOOL_RESULT_KEEP = session_mod.TOOL_RESULT_KEEP
 
@@ -305,7 +331,7 @@ end
 -- 运行时上下文自动显示: 每次 LLM 响应后一行（opencode TUI 底栏同款数据）
 local function show_ctx_line(usage, config)
   if not (usage and usage.prompt_tokens) then return end
-  local window = tonumber(config.context_window) or 128000
+  local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
   local total = usage.prompt_tokens
   local pct = window > 0 and (total / window) or 0
   local line = "[ctx] " .. fmt_num(total) .. " / " .. fmt_num(window) .. " tokens ("
@@ -320,7 +346,7 @@ local function show_ctx_line(usage, config)
 end
 
 local function cmd_ctx(config, messages, usage_override)
-  local window = tonumber(config.context_window) or 128000
+  local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
   local usage = usage_override or LAST_USAGE
   print("")
   print("═══ 上下文使用 ═══")
@@ -347,9 +373,7 @@ local function cmd_ctx(config, messages, usage_override)
   local msg_count = 0
   for _, m in ipairs(messages) do
     msg_count = msg_count + 1
-    local extra = ""
-    if m.tool_calls then extra = tostring(m.tool_calls) end
-    local t = estimate_tokens(m.content or "") + estimate_tokens(extra)
+    local t = msg_tokens(m)
     if m.role == "system" then sys_tok = sys_tok + t
     elseif m.role == "tool" then tool_tok = tool_tok + t
     else conv_tok = conv_tok + t end
@@ -1344,17 +1368,15 @@ end
 -- 用于压缩失败（LLM 已超限，summarize 同样 400）与 400 重试路径。
 -- 返回裁剪后的估算值。
 local function force_trim(messages, config)
-  local window = tonumber(config.context_window) or 128000
+  local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
   local target = window * 0.6
   local est = 0
   for _, m in ipairs(messages) do
-    est = est + estimate_tokens(m.content or "")
-        + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+    est = est + msg_tokens(m)
   end
   -- 保留头部锚点（缓存前缀），最低 1 + 4 条
   while #messages > 5 and est > target do
-    est = est - estimate_tokens(messages[2].content or "")
-        - estimate_tokens(messages[2].tool_calls and tostring(messages[2].tool_calls) or "")
+    est = est - msg_tokens(messages[2])
     table.remove(messages, 2)
   end
   return est
@@ -1364,15 +1386,14 @@ end
 -- 已超限，summarize 同样 400）强制裁剪最早消息——防止 400 死循环。
 -- 返回 (新 messages, 估算 tokens)。
 local function ensure_context_budget(messages, config, persist, session)
-  local window = tonumber(config.context_window) or 128000
+  local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
   local function est_msgs(msgs)
     local e = 0
     for _, m in ipairs(msgs) do
       -- folded 分支保留为无害兼容（compact_history 已物理删除折叠段，
       -- 不再产生 folded 消息）
       if not m.folded then
-        e = e + estimate_tokens(m.content or "")
-            + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+        e = e + msg_tokens(m)
       end
     end
     return e
@@ -1416,8 +1437,7 @@ local function ensure_context_budget(messages, config, persist, session)
   local byte_est = 0
   for _, m in ipairs(messages) do
     if not m.folded then
-      byte_est = byte_est + #(m.content or "")
-          + #(m.tool_calls and tostring(m.tool_calls) or "")
+      byte_est = byte_est + msg_bytes(m)
     end
   end
   local MEM_SCALE_I = (require("agent.config")).mem_scale or 1
@@ -1430,8 +1450,7 @@ local function ensure_context_budget(messages, config, persist, session)
       guard = guard + 1
       local m2 = messages[2]
       if m2 and not m2.folded then
-        byte_est = byte_est - #(m2.content or "")
-            - #(m2.tool_calls and tostring(m2.tool_calls) or "")
+        byte_est = byte_est - msg_bytes(m2)
       end
       table.remove(messages, 2)
     end
@@ -1497,6 +1516,47 @@ local function now_uptime()
     if ok_u and u then return u end
   end
   return 0
+end
+
+-- ═══ Append-only 错误日志（真机 2026-09-12 OOM 现场取证教训）═══
+-- agent_diag.json 是**覆盖式**快照: mem_curve 只留 20 点、last_chat 只留
+-- 最后一次——真机复查明证现场会被后续成功请求覆盖（本次复查时
+-- mem_curve 已从 20 点缩到 4 点）。OOM 现场能留住只因之后再无成功 chat。
+-- 本日志每条错误追加一行 JSONL，永不覆盖，供 /debug 与 gist 报告取证。
+-- 写入失败静默（不因诊断日志本身拖垮请求路径）；_TEST_MODE 跳过。
+local ERROR_LOG_FILE = WRITABLE_BASE .. "/agent_errors.jsonl"
+local MAX_ERROR_LOG_BYTES = 262144  -- 256KB 上限，超出后轮转（保 .old 一份）
+local err_log_disabled = false
+local function log_error(kind, detail, extra)
+  if _TEST_MODE or err_log_disabled then return end
+  -- 轮转: 超限时把当前文件改名为 .old（覆盖旧 .old），避免无限增长占盘
+  local ok_sz, sz = pcall(function()
+    local h = io.open(ERROR_LOG_FILE, "r")
+    if not h then return 0 end
+    local n = h:seek("end")
+    h:close()
+    return n or 0
+  end)
+  if ok_sz and type(sz) == "number" and sz > MAX_ERROR_LOG_BYTES then
+    os.remove(ERROR_LOG_FILE .. ".old")
+    os.rename(ERROR_LOG_FILE, ERROR_LOG_FILE .. ".old")
+  end
+  local f = io.open(ERROR_LOG_FILE, "a")
+  if not f then err_log_disabled = true return end
+  local rec = {
+    uptime = now_uptime(),
+    kind = kind,
+    detail = tostring(detail):sub(1, 400),
+  }
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do
+      if rec[k] == nil and (type(v) == "number" or type(v) == "string") then
+        rec[k] = v
+      end
+    end
+  end
+  f:write(json.encode(rec) .. "\n")
+  f:close()
 end
 
 -- 内存压力强制裁剪（真机第二次/第三次 OOM 根因修复，gist 10d45721/3c0c3914）:
@@ -1585,8 +1645,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
   local byte_now = 0
   for _, m in ipairs(messages) do
     if not m.folded then
-      byte_now = byte_now + #(m.content or "")
-          + #(m.tool_calls and tostring(m.tool_calls) or "")
+      byte_now = byte_now + msg_bytes(m)
     end
   end
   if byte_now > prefold_bytes then
@@ -1609,12 +1668,11 @@ local function process_exchange(messages, config, user_input, persist, session, 
 
   -- 上下文占用反馈: 注入运行时尾部块，模型据此决定何时调用 compact_history。
   -- est_now 在 exchange 开始时快照（工具循环多轮请求共用，粒度足够）。
-  local window_now = tonumber(config.context_window) or 128000
+  local window_now = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
   local est_now = 0
   for _, m in ipairs(messages) do
     if not m.folded then
-      est_now = est_now + estimate_tokens(m.content or "")
-          + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+      est_now = est_now + msg_tokens(m)
     end
   end
   chat_mod.set_runtime_extra(function()
@@ -1634,6 +1692,9 @@ local function process_exchange(messages, config, user_input, persist, session, 
 
   local final_text = {}
   local retried_400 = false
+  -- OOM 恢复网（真机 2026-09-12 卡死根因修复）: encode 内存不足时只重试一次
+  -- 强制压缩/裁剪路径，防"裁剪后仍 OOM → 无限循环"。第二次仍 OOM 才报错。
+  local retried_oom = false
   -- 工具循环轮次上限（oc-ai maxSteps / reasonix tool-round cap 借鉴）:
   -- **默认关闭**（opencode 默认 Infinity，2026-09-03 用户要求）——仅当
   -- config.max_tool_steps 显式配置整数时启用（安全网防无限循环）。
@@ -1680,8 +1741,7 @@ local function process_exchange(messages, config, user_input, persist, session, 
     -- 请求体估算（与 encode 守卫同口径）: 非 folded 消息字节和
     for _, m in ipairs(messages) do
       if not m.folded then
-        DIAG.chat_started.est = DIAG.chat_started.est
-          + #(m.content or "") + #(m.tool_calls and tostring(m.tool_calls) or "")
+        DIAG.chat_started.est = DIAG.chat_started.est + msg_bytes(m)
       end
     end
     persist_diag()
@@ -1720,10 +1780,9 @@ local function process_exchange(messages, config, user_input, persist, session, 
         retried_400 = true
         local est = 0
         for _, m in ipairs(messages) do
-          est = est + estimate_tokens(m.content or "")
-              + estimate_tokens(m.tool_calls and tostring(m.tool_calls) or "")
+          est = est + msg_tokens(m)
         end
-        local window = tonumber(config.context_window) or 128000
+        local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
         if est > window * 0.85 then
           print("HTTP 400（上下文估算 " .. fmt_num(est) .. "/" .. fmt_num(window) .. " 超限），强制裁剪后重试...")
           force_trim(messages, config)
@@ -1737,12 +1796,56 @@ local function process_exchange(messages, config, user_input, persist, session, 
             .. " 未超限，非上下文原因），请求失败: " .. tostring(response.error):sub(1, 200))
           return {error = response.error}
         end
+      elseif not retried_oom and is_oom_error(response.error) then
+        -- ═══ OOM 恢复路径（真机 2026-09-12 卡死 170 分钟根因修复）═══
+        -- 现场: encode 在 table.concat 抛 "not enough memory for buffer
+        -- allocation"（chat.lua pcall 捕获为 error）→ 旧代码走下方 else
+        -- 直接 return {error=...}，**不压缩、不裁剪、不重置任何状态**。
+        -- 同一份超限历史留在内存与磁盘，用户每次重试/每轮新回合都重放
+        -- 同一个 OOM，永不衰减 → 状态栏 +170m19s、ctx 100%、无任何请求
+        -- 成功（DIAG 冻结在 uptime=1022.65）。守卫口径修复后此路径理论上
+        -- 不再进入，但错误兜底必须自愈——依赖"守卫永不误判"是脆弱的。
+        retried_oom = true
+        print("[oom] 请求编码内存不足，强制压缩/裁剪历史后重试...")
+        -- 现场取证（append-only，不被后续请求覆盖）
+        local est_before = 0
+        for _, m in ipairs(messages) do est_before = est_before + msg_tokens(m) end
+        local ok_fc, free_now = pcall(function()
+          local c = require("computer")
+          return c.freeMemory()
+        end)
+        log_error("oom_encode", response.error, {
+          msgs = #messages, est_tokens = est_before,
+          free = (ok_fc and type(free_now) == "number") and free_now or -1,
+        })
+        local compacted = compact_history(messages, config)
+        if compacted then
+          messages = compacted
+        else
+          -- 压缩失败（LLM 可能已超限）: 按 token 与字节双口径强裁到 60%
+          -- 窗口，并直接砍到内存安全水位（真机实测 <145 万 free 时
+          -- 626KB body 必失败，故裁剪目标取窗口 60% 与绝对值孰小）
+          force_trim(messages, config)
+          trim_to_bytes(messages, tonumber(config.mem_trim_bytes) or 120000)
+        end
+        if persist then
+          if session then rebuild_session_history(session, messages)
+          else rebuild_history(messages) end
+        end
+        -- 无法 GC（真机无 collectgarbage 全局）时，裁剪已物理释放表条目，
+        -- 下次 chat 的守卫会以新的 free 重新判定——继续循环即自愈。
       else
+        -- 错误留痕（append-only）: DIAG 只存最后一次会被覆盖，
+        -- agent_errors.jsonl 保留全部失败历史（含 OOM 之外的 HTTP/超时）。
+        log_error("chat_error", response.error, { msgs = #messages })
         return {error = response.error}
       end
     else
-      -- 请求成功，重置 400 重试标记（后续轮次仍可重试）
+      -- 请求成功，重置重试标记（后续轮次仍可重试）
       retried_400 = false
+      -- OOM 网同样在成功后重新武装: 长工具循环里历史会再次增长，
+      -- 若只允许"整场 exchange 一次"恢复，第二次 OOM 会直接报错。
+      retried_oom = false
 
     -- 保存 provider 上报的 usage（/ctx 显示用）+ 运行时自动显示
     -- TUI 模式（UI_INPUT ~= nil）跳过 [ctx] 行：状态栏 setStatusData 已实时
@@ -2350,7 +2453,7 @@ local function main(config, ...)
       ui.setStatusData(function()
         local parts = {}
         if LAST_USAGE and LAST_USAGE.prompt_tokens then
-          local win = tonumber(config.context_window) or 128000
+          local win = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
           local pt = tonumber(LAST_USAGE.prompt_tokens) or 0
           local pct = win > 0 and (pt / win * 100) or 0
           parts[#parts + 1] = string.format("ctx %.0f%%", pct)
@@ -2574,6 +2677,11 @@ if _TEST_MODE then
     wait_modem_message = subagent_mod.wait_modem_message,
     cmd_ctx = cmd_ctx,
     estimate_tokens = estimate_tokens,
+    -- OOM 口径测试钩子（回归防线）: 锁死"tool_calls 用 arguments 而非
+    -- tostring"这一修复，防未来有人改回低估口径。
+    msg_tokens = msg_tokens,
+    msg_bytes = msg_bytes,
+    is_oom_error = is_oom_error,
     ctx_bar = ctx_bar,
     show_ctx_line = show_ctx_line,
     cache_stats = cache_stats,

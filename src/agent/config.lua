@@ -105,7 +105,11 @@ local function load()
     -- ——在 4MB 机器跑 256K 上下文需 /preset-256k（context_window=262144）
     --（字节类阈值已按内存 scale² 放大：4MB 下 byte_budget/prefold/
     -- load_budget=800KB，足以承载 200K tokens ≈700KB 中文历史）。
-    if not data.context_window then data.context_window = 128000 end
+    -- 默认 262144（256K，2026-09-12 用户要求: 真机模型窗口已按 256K 使用，
+    -- 128000 会让 /ctx 显示、60% 压缩引导、80% 硬保护全部按旧窗口衡量，
+    -- 导致历史被过早折叠）。模型窗口是模型属性，与硬件无关。
+    -- 字节类阈值另按内存 scale² 放大（见下方 mem_* 项）。
+    if not data.context_window then data.context_window = 262144 end
     -- 运行时自动显示上下文（每次响应后一行 [ctx]），可设 false 关闭
     if data.ctx_auto == nil then data.ctx_auto = true end
     -- 内存压力压缩阈值（字节）: freeMemory() 低于此值即强制折叠早期消息
