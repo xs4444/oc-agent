@@ -1545,7 +1545,7 @@ local function load()
     -- 默认值（/ctx 上下文显示用；模型窗口按实际配置）
     -- 模型上下文窗口（token）: /ctx 显示、60% 压缩引导、80% 硬保护、
     -- 请求估算的基准。**窗口是模型属性，与硬件无关，不随内存自动缩放**
-    -- ——在 4MB 机器跑 256K 上下文需 /preset-256k（context_window=262144）
+    -- ——窗口值用 /context 调整（如 /context 256K，立即生效）
     --（字节类阈值已按内存 scale² 放大：4MB 下 byte_budget/prefold/
     -- load_budget=800KB，足以承载 200K tokens ≈700KB 中文历史）。
     -- 默认 262144（256K，2026-09-12 用户要求: 真机模型窗口已按 256K 使用，
@@ -1579,7 +1579,7 @@ local function load()
     -- 折叠（opencode 传统模式——不等模型调 compact_history 工具；模型
     -- 需 ≥60% 窗口才自觉压缩，OC 内存下永远到不了）。默认 200KB×scale²
     --（2026-08-10: 内存翻倍 → 可承载请求体 4 倍——4MB 机器 800KB 才
-    -- 折叠，配合 /preset-256k（262144）中文长史可跑至 ~230K tokens；
+    -- 折叠，配合 /context 256K 中文长史可跑至 ~210K tokens（实测编码上限）；
     -- 2MB 机器 scale=1 时 200KB 略高于旧 100KB——2MB 下编码峰值
     -- 137-230KB 实测仍安全，且 byte_budget 兜底裁剪），先于 mem_pressure
     -- 裁剪触发（宽裕期保上下文）；折叠段物理回收后表字节真实下降。
@@ -1771,7 +1771,7 @@ local sessions_dir = config_mod.sessions_dir
 -- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 2026-09-03 256K 窗口目标）:
 -- 硬常量按 config_mod.mem_scale（= totalMemory/2MB）的**平方**缩放——
 -- 内存翻倍 → 可承载请求体 4 倍（4MB 机器 MAX_HISTORY=480 条/1.2MB
--- 历史表，配合 /preset-256k（262144）达成 256K 窗口；2MB 机器
+-- 历史表，配合 /context 256K 达成 256K 窗口；2MB 机器
 -- scale=1 时 120 条/300KB——比旧 60 条/200KB 大，字节预算与编码峰值
 -- 实测安全）。显式 config（mem_load_budget 等）仍优先——此处仅模块级
 -- 硬常量。
@@ -2415,6 +2415,8 @@ end
 
 -- Redirect history storage (replaces the old agent_test HISTORY_PATH
 -- rebinding hack). Tests call agent_test.set_history_path → this.
+-- **不落盘**（纯路径重定向，测试/内部用）——用户可见的会话切换一律走
+-- switch_to（见下方活动会话持久化）。
 local function set_paths(p)
   history_path = p
 end
@@ -2422,6 +2424,97 @@ end
 -- 当前会话文件路径（/hist 显示会话名用）
 local function current_path()
   return history_path
+end
+
+-- ── 活动会话持久化（重启自动恢复上次会话）────────────────────────
+-- 背景（用户报告 + 真机 2026-09-12 实证）: 会话切换（/session <name>、
+-- /resume 恢复归档/命名会话）此前只改进程内 history_path，**进程退出即
+-- 丢**——重启后 init.lua 的 load_history() 读的仍是默认
+-- /home/agent_history.txt（/new 归档后为 0 字节）→ TUI 空屏，用户必须
+-- 再敲一次 /resume。实证: 重启后 require("agent.session").current_path()
+-- 恒为 /home/agent_history.txt（0 字节），而真正在用的
+-- /home/sessions/agent_history_162903596.4.jsonl（554904B/640 条）无人读。
+-- 语义对齐 opencode 的当前会话指针 / pi 的 --continue: 把活动会话写进
+-- config（与 data_dir 引导复用同一份配置 → 跨重启生效），启动时
+-- restore_active() 读回。
+-- 主会话（config_mod.history_path）**不写指针**（它就是默认值）——顺带
+-- 使 /new"归档后开新会话"能覆盖上次存的命名会话（否则重启又拉回旧会话）。
+local function with_config(mutate)
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  if not ok_cfg or type(config_mod.load) ~= "function"
+     or type(config_mod.save) ~= "function" then return false end
+  local ok_l, cfg = pcall(config_mod.load)
+  if not ok_l or type(cfg) ~= "table" then return false end
+  local changed = mutate(cfg, config_mod)
+  if not changed then return false end
+  local ok_s = pcall(config_mod.save, cfg)
+  return ok_s
+end
+
+-- 把当前 history_path 写进 config.last_session（主会话 → 清指针）。
+-- 值与已存一致时**不写盘**（重启路径上 switch_to 只在真切换时调用，
+-- 但 /resume 每次带参数都会走一遍——避免无谓的 config 重写）。
+local function persist_active()
+  with_config(function(cfg, config_mod)
+    if history_path == config_mod.history_path then
+      if cfg.last_session == nil then return false end
+      cfg.last_session = nil
+      return true
+    end
+    if cfg.last_session == history_path then return false end
+    cfg.last_session = history_path
+    return true
+  end)
+end
+
+-- 清掉活动会话指针（/relocate 迁移用——旧盘路径在新盘上仍"存在"，
+-- 不清理会让重启后的 restore_active 恢复旧盘会话并在那里续写，
+-- 污染新盘主会话）。
+local function clear_active()
+  with_config(function(cfg)
+    if cfg.last_session == nil then return false end
+    cfg.last_session = nil
+    return true
+  end)
+end
+
+-- 切换活动会话 + 落盘（/session <name>、/resume、启动恢复用）。
+-- persist=false 用于迁移/测试等"只改路径不记指针"的场景。
+local function switch_to(p, persist)
+  history_path = p
+  if persist ~= false then persist_active() end
+end
+
+-- 启动时恢复活动会话路径。返回恢复到的路径；无指针/指针失效 → nil
+-- （调用方保持默认主会话）。
+-- **失效指针不 set_paths**——否则 load_history 读空文件、后续 append 会在
+-- 死路径上重建空会话，静默顶掉用户的上次会话（比不恢复更糟）。
+-- 失效判定 = 文件不存在（fs.exists）；主会话与命名会话同判据。
+-- 指针 == 当前默认主会话（如 /relocate 后 config 引导已把默认切到该盘）
+-- 时视为无需恢复，返回 nil。
+local function restore_active()
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  if not ok_cfg or type(config_mod.load) ~= "function" then return nil end
+  local ok_l, cfg = pcall(config_mod.load)
+  if not ok_l or type(cfg) ~= "table" then return nil end
+  local p = cfg.last_session
+  if type(p) ~= "string" or p == "" then return nil end
+  if p == config_mod.history_path then return nil end
+  local ok_fs, fs = pcall(require, "filesystem")
+  if not ok_fs or type(fs.exists) ~= "function" then return nil end
+  local ok_e, e = pcall(fs.exists, p)
+  if not ok_e or not e then return nil end
+  history_path = p
+  return p
+end
+
+-- 活动会话显示名（启动横幅/恢复提示用）: 主会话 → "default"，
+-- 命名会话 → basename 去 .jsonl。
+local function active_name()
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  local def = ok_cfg and config_mod.history_path or ""
+  if history_path == def then return "default" end
+  return (history_path:match("([^/]+)$") or history_path):gsub("%.jsonl$", "")
 end
 
 -- 会话列表（类 opencode /session）: 扫描目录下 *.jsonl 会话文件
@@ -2522,6 +2615,11 @@ local M = {
   ensure_archive_space = ensure_archive_space,
   set_chat = set_chat,
   current_path = current_path,
+  -- 活动会话持久化（重启自动恢复上次会话）——用户可见的切换走 switch_to
+  switch_to = switch_to,
+  restore_active = restore_active,
+  clear_active = clear_active,
+  active_name = active_name,
   list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,
@@ -8239,7 +8337,7 @@ local WRITABLE_BASE, CONFIG_PATH, HISTORY_PATH, SESSIONS_DIR =
 -- 默认上下文窗口（token）。2026-09-12 用户要求 128000 → 262144（256K）。
 -- 单一来源: 原先 7 处 `or 128000` 硬编码各自漂移，改窗口时必漏改某处
 -- （守卫/压缩/显示口径不一致 → 静默失效，正是本次 OOM 的同类病根）。
--- 真机 config 里若已写 context_window（/preset-256k 会写），仍以 config 为准。
+-- 真机 config 里若已写 context_window（/context 会写），仍以 config 为准。
 local DEFAULT_CONTEXT_WINDOW = 262144
 
 local session_mod = require("agent.session")
@@ -8606,6 +8704,45 @@ end
 -- 看不到（/paste 误判 REPL 分支）。main() 初始化 TUI 后赋值；nil =
 -- REPL 模式（io.read 回退，无输入行可注入）。
 local UI_REF = nil
+
+-- ── /context 与 /maxout 共用的数值解析与写入（2026-09-12）──
+-- 取代 /preset-256k 这个"一键打包"命令: 原实现把窗口硬写成 262144 并
+-- 声称"重启后生效"——实际用户常在换模型时只想调其中一项，打包命令既
+-- 不灵活也容易误导（改完发现没生效）。拆成两个各管一项的命令，且
+-- **原地修改活 config 表**（与 /model 同款），故**立即生效**，无需重启。
+--
+-- 支持后缀 K/M（大小写不敏感）: "256K"=262144, "1M"=1048576。
+-- 也接受纯数字。返回 (值, 错误串)；值锚定为整数。
+local function parse_size_arg(s)
+  if type(s) ~= "string" or s == "" then return nil, "空参数" end
+  local num, suffix = s:match("^(%d+%.?%d*)([KkMm]?)$")
+  if not num then return nil, "无法解析: " .. tostring(s) end
+  local n = tonumber(num)
+  if not n then return nil, "无法解析: " .. tostring(s) end
+  if suffix == "K" or suffix == "k" then n = n * 1024
+  elseif suffix == "M" or suffix == "m" then n = n * 1048576 end
+  if n ~= math.floor(n) then n = math.floor(n + 0.5) end
+  return n
+end
+
+-- 写入一条 config 字段并持久化（save 失败不影响内存态，但要告知用户）
+local function apply_config_field(config, field, value, label)
+  config[field] = value
+  local ok_s, err_s = pcall(save_config, config)
+  if not ok_s then
+    print("[" .. label .. "] ⚠️ 写盘失败: " .. tostring(err_s)
+      .. "（本次会话内仍生效，重启后会丢失）")
+  end
+end
+
+-- context_window / max_tokens 的合理区间（防呆: 0 会让 pct 除爆、
+-- 超大值会立刻撞 OOM）。上限宽松——模型窗口由用户负责，但拦明显错误。
+local WINDOW_MIN, WINDOW_MAX = 4096, 2097152        -- 4K ~ 2M tokens
+local MAXTOK_MIN, MAXTOK_MAX = 256, 262144          -- 256 ~ 256K tokens
+
+-- 有效输出预算: chat.lua 用 `opts.max_tokens or config.max_tokens or 8192`
+-- 三档回退，展示默认值时必须与之一致，否则 /maxout 显示骗人。
+local DEFAULT_MAX_TOKENS = 8192
 
 local function handle_command(cmd, config, messages)
   local parts = {}
@@ -9397,38 +9534,88 @@ local function handle_command(cmd, config, messages)
     for _, t in ipairs(TOOLS) do
       print("  " .. t["function"].name .. ": " .. t["function"].description)
     end
-  elseif command == "/preset-256k" or command == "/preset-200k" then
-    -- 一键 256K 上下文配置（2026-08-10 用户需求，2026-09-03 200K→256K）:
-    -- context_window=262144。/preset-200k 为兼容别名（旧命令/输入历史不报错）。
-    -- 字节预算（byte_budget/mem_prefold_bytes/mem_load_budget）按内存 scale²
-    -- 放大（4MB→800KB ≈ ~230K tokens 中文），本命令只写窗口并校验硬件
-    -- 是否匹配——纯中文长史在 4MB 下会在喂满 256K 窗口前触发折叠，英文/
-    -- 代码为主（1-2 字节/token）可喂满。2MB 平台警告但照设（窗口是模型
-    -- 属性，与硬件无关；只是历史装不满会被折叠浪费）。
-    local ok_c, comp = pcall(require, "computer")
-    local total = 0
-    if ok_c and type(comp) == "table" and comp.totalMemory then
-      local ok_t, t = pcall(comp.totalMemory)
-      if ok_t and type(t) == "number" then total = t end
-    end
-    local cfg_ok, cfg_p = pcall(load_config)
-    local cfg_d = cfg_ok and cfg_p or {}
-    cfg_d.context_window = 262144
-    local ok_s, err_s = pcall(save_config, cfg_d)
-    if not ok_s then
-      print("[preset-256k] 写入失败: " .. tostring(err_s))
-    else
-      print("[preset-256k] context_window=262144 已写入 config")
-      if total > 0 and total < 4194304 then
-        print("[preset-256k] ⚠️ 当前内存 " .. math.floor(total / 1048576)
-          .. "MB < 4MB——字节预算约 " .. math.floor(200000 / 3.5 / 1000)
-          .. "K tokens（中文），窗口喂不满会被折叠浪费；建议装 4MB 内存条")
-      else
-        print("[preset-256k] 内存充足（4MB+）：字节预算已按 scale² 放大，"
-          .. "可承载 ~230K tokens 中文（英文/代码可喂满 256K 窗口）✓")
+  elseif command == "/context" then
+    -- 上下文窗口（token）。取代 /preset-256k（2026-09-12 用户要求）。
+    --   /context            显示当前窗口 + 内存适配提示
+    --   /context 256K       设为 262144（K/M 后缀或纯数字）
+    -- **原地改活 config** → 立即生效（无需重启，与旧 preset 的关键差异）。
+    local window = tonumber(config.context_window) or DEFAULT_CONTEXT_WINDOW
+    if not parts[2] then
+      print("context_window = " .. fmt_num(window) .. " tokens")
+      -- 内存适配诊断: encode 峰值 ≈ 2x 请求体，真机实测 4MB 机安全上限
+      -- 约 940KB body（≈210K tokens 中文），故给出"能否喂满"的判断。
+      local ok_c, comp = pcall(require, "computer")
+      local total = 0
+      if ok_c and type(comp) == "table" and comp.totalMemory then
+        local ok_t, t = pcall(comp.totalMemory)
+        if ok_t and type(t) == "number" then total = t end
       end
-      print("[preset-256k] 重启 agent 后生效（当前进程仍用旧窗口）")
+      if total > 0 then
+        local bpb = 4.45  -- 实测字节/token 比率（真机 570,200B ↔ 128,000 tok）
+        -- 实测编码安全上限: 4MB 机约 940KB body → 940000/4.45 ≈ 211K tokens
+        local cap_tokens = math.floor((940000 * (total / 4194304)) / bpb)
+        print(string.format("  内存 %dMB，本机可承载约 %s tokens（实测编码上限）",
+          math.floor(total / 1048576), fmt_num(cap_tokens)))
+        if window > cap_tokens then
+          print("  ⚠️ 窗口大于本机可承载量——超出部分喂不满，会被字节预算提前折叠")
+        end
+      end
+      print("  用法: /context <tokens>   例: /context 256K  (当前: "
+        .. fmt_num(window) .. ")")
+    else
+      local v, err = parse_size_arg(parts[2])
+      if not v then
+        print("[context] 参数无效（" .. tostring(err) .. "）。用法: /context 256K")
+      elseif v < WINDOW_MIN or v > WINDOW_MAX then
+        print("[context] 超出合理范围 " .. fmt_num(WINDOW_MIN) .. " ~ "
+          .. fmt_num(WINDOW_MAX) .. " tokens，未修改")
+      else
+        apply_config_field(config, "context_window", v, "context")
+        print("[context] context_window = " .. fmt_num(v) .. " tokens 已生效 ✓")
+      end
     end
+  elseif command == "/maxout" then
+    -- 单次回复的输出预算（max_tokens）。取代 /preset-256k 的打包语义
+    -- （2026-09-12 用户要求）。chat.lua: `opts.max_tokens or
+    -- config.max_tokens or 8192`。
+    --   /maxout             显示当前值
+    --   /maxout 16384       设为 16384
+    -- 注意与 max_tokens 相关的两条经验（见 chat.lua/config.lua 注释）:
+    --   1. 过小（2048）会让长思考挤掉可见回答 → content 空;
+    --   2. 过大（16384+）会让长 reasoning 进历史 → 下次请求 encode 暴涨 → OOM。
+    local cur = tonumber(config.max_tokens) or DEFAULT_MAX_TOKENS
+    if not parts[2] then
+      print("max_tokens = " .. fmt_num(cur) .. " tokens")
+      if config.max_tokens == nil then
+        print("  （未在 config 中设置，使用默认 " .. fmt_num(DEFAULT_MAX_TOKENS)
+          .. "）")
+      end
+      print("  用法: /maxout <tokens>   例: /maxout 16384  (当前: "
+        .. fmt_num(cur) .. ")")
+    else
+      local v, err = parse_size_arg(parts[2])
+      if not v then
+        print("[maxout] 参数无效（" .. tostring(err) .. "）。用法: /maxout 16384")
+      elseif v < MAXTOK_MIN or v > MAXTOK_MAX then
+        print("[maxout] 超出合理范围 " .. fmt_num(MAXTOK_MIN) .. " ~ "
+          .. fmt_num(MAXTOK_MAX) .. " tokens，未修改")
+      else
+        apply_config_field(config, "max_tokens", v, "maxout")
+        print("[maxout] max_tokens = " .. fmt_num(v) .. " tokens 已生效 ✓")
+        if v > 8192 then
+          print("  ⚠️ 较大输出预算会显著增大下次请求的历史体积（长 reasoning），"
+            .. "OC 内存紧张时可能 OOM")
+        end
+      end
+    end
+  elseif command == "/preset-256k" or command == "/preset-200k" then
+    -- 兼容别名（2026-09-12）: 旧命令保留但改为转发 /context 256K，
+    -- 不再"打包"其它设置、不再要求重启。仅提示迁移，不静默改变行为。
+    print("[/preset-256k] 已由 /context 取代（现在立即生效，无需重启）")
+    local v = parse_size_arg("256K")
+    apply_config_field(config, "context_window", v, "preset-256k")
+    print("[preset-256k] context_window = " .. fmt_num(v)
+      .. " tokens 已生效 ✓  建议改用: /context 256K")
   elseif command == "/ctx" then
     cmd_ctx(config, messages)
   elseif command == "/paste" then
@@ -9483,7 +9670,8 @@ local function handle_command(cmd, config, messages)
     print("  /session <name> Switch to (or create) a named session; default = main")
     print("  /resume [n|name] Resume history: picker (no args), by number or name; also restores /new archives")
     print("  /relocate       Move config/history/sessions to another (writable) disk — guided")
-    print("  /preset-256k    One-shot: set context_window=262144 (+ memory check)")
+    print("  /context [t]    Context window (tokens): no arg = show; /context 256K = set (live)")
+    print("  /maxout [t]     Max output tokens: no arg = show; /maxout 16384 = set (live)")
     print("  /up /down       Scroll content (alias /pgup /pgdn; or /top /bottom)")
     print("  /browse         Keyboard browse/select mode (hjkl move, Space select, y copy, q quit)")
     print("  /search <text>  Search content history (jump + highlight; /snext /sprev repeat)")
@@ -9587,7 +9775,7 @@ local function ensure_context_budget(messages, config, persist, session)
   -- 时 table.concat 一次性分配崩溃（json.lua:70 "not enough memory"）。
   -- 独立字节预算（config.byte_budget 可调，默认 200KB×scale²——4MB 机器
   -- 800KB：可承载 ~230K tokens 中文文本（≈800KB），配合
-  -- /preset-256k（262144）即开 256K 窗口；2MB 机器 scale=1 时
+  -- /context 256K 即开 256K 窗口；2MB 机器 scale=1 时
   -- 200KB，真机 encode 峰值实测 137-230KB 安全），作为自动折叠
   -- （mem_prefold_bytes）之后的最终兜底：超限直接裁剪早期消息
   -- （保留 head 锚点 + 最近 5 条）。
@@ -10538,6 +10726,21 @@ local function main(config, ...)
   end
 
   local messages = load_history()
+  -- ── 重启自动恢复上次会话（2026-09-12 用户要求）────────────────
+  -- 会话切换（/session <name> / /resume）现把活动会话写进 config 的
+  -- last_session 指针（agent.session.switch_to），此处读回——否则重启
+  -- 恒读默认主会话（/new 归档后为 0 字节）→ TUI 空屏，用户必须再敲一次
+  -- /resume（真机实证: 640 条/554KB 的 sessions/*.jsonl 重启后无人读）。
+  -- 开关: config.resume_on_start=false 关闭。
+  -- 失效指针（文件已删）→ restore_active 返回 nil，保持主会话——
+  -- 不建空文件顶掉旧记录（不可逆的静默数据丢失）。
+  -- 时序: 必须在任何 append_history 之前执行（否则别处已按主会话建了
+  -- 0 字节文件，恢复路径虽以 config 指针为准仍能恢复，但会留孤儿文件）。
+  local restored_session = nil
+  if config.resume_on_start ~= false then
+    restored_session = session_mod.restore_active()
+    if restored_session then messages = load_history() end
+  end
   local term_history = {}
 
   -- ── 文件服务（v0.3.84）: explorer 子代理经 modem 读主代理硬盘 ──
@@ -10600,6 +10803,11 @@ local function main(config, ...)
       end
       ui.print("OC Agent TUI ready. Model: " .. config.model)
       ui.print("Type /help for commands.", ui.colors.dim)
+      -- 重启恢复到非默认会话时明示（否则用户看到历史却不知是哪一份）
+      if restored_session then
+        ui.print("Resumed last session: " .. session_mod.active_name()
+          .. " (" .. #messages .. " msgs)", ui.colors.dim)
+      end
       -- 进入 TUI 显示当前会话历史（填充内容区——避免空屏/输入区占半屏感知）
       ui.printHistory(messages)
       -- print 代理: 所有日志（工具行/[ctx]/reasoning/命令输出）进内容区
@@ -10641,7 +10849,7 @@ local function main(config, ...)
       end)
       -- Tab 补全: 命令 + 工具名
       local comps = {"/help", "/ctx", "/ml", "/new", "/resume", "/reset", "/restart", "/compact", "/hist",
-        "/sessions", "/session", "/relocate", "/preset-256k", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
+        "/sessions", "/session", "/relocate", "/context", "/maxout", "/up", "/down", "/pgup", "/pgdn", "/top", "/bottom",
         "/browse", "/search", "/snext", "/sprev", "/version", "/debug", "/tools", "/model", "/key", "/url", "/tavily",
         "/gist-token", "/exit"}
       for _, t in ipairs(TOOLS) do
@@ -10696,6 +10904,8 @@ local function main(config, ...)
   -- 否则顶部 setStatus("Ready") 会把错误状态立刻刷掉（端点报错一闪而过,
   -- 用户以为还卡在 Thinking）
   local failStatus = nil
+  -- REPL 恢复提示只打一次（TUI 分支各自打印，见上方 restored_session）
+  local repl_resume_noticed = false
   while true do
     if ui then
       -- TUI 主循环: 输入/命令/交换（assistant 文本已由 print 代理进内容区）
@@ -10739,6 +10949,15 @@ local function main(config, ...)
       end
       ui.print("", ui.colors.foreground)
       goto continue
+    end
+
+    -- REPL 分支: 恢复提示（TUI 分支在 print 被代理前已打印过，互斥）
+    if not repl_resume_noticed then
+      repl_resume_noticed = true
+      if restored_session then
+        print("[resume] 已恢复上次会话: " .. session_mod.active_name()
+          .. " (" .. #messages .. " msgs)")
+      end
     end
 
     io.write("> ")

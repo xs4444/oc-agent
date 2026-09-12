@@ -43,7 +43,7 @@ local sessions_dir = config_mod.sessions_dir
 -- 内存自适应缩放（2026-08-10 真机 4MB 升级 + 2026-09-03 256K 窗口目标）:
 -- 硬常量按 config_mod.mem_scale（= totalMemory/2MB）的**平方**缩放——
 -- 内存翻倍 → 可承载请求体 4 倍（4MB 机器 MAX_HISTORY=480 条/1.2MB
--- 历史表，配合 /preset-256k（262144）达成 256K 窗口；2MB 机器
+-- 历史表，配合 /context 256K 达成 256K 窗口；2MB 机器
 -- scale=1 时 120 条/300KB——比旧 60 条/200KB 大，字节预算与编码峰值
 -- 实测安全）。显式 config（mem_load_budget 等）仍优先——此处仅模块级
 -- 硬常量。
@@ -687,6 +687,8 @@ end
 
 -- Redirect history storage (replaces the old agent_test HISTORY_PATH
 -- rebinding hack). Tests call agent_test.set_history_path → this.
+-- **不落盘**（纯路径重定向，测试/内部用）——用户可见的会话切换一律走
+-- switch_to（见下方活动会话持久化）。
 local function set_paths(p)
   history_path = p
 end
@@ -694,6 +696,97 @@ end
 -- 当前会话文件路径（/hist 显示会话名用）
 local function current_path()
   return history_path
+end
+
+-- ── 活动会话持久化（重启自动恢复上次会话）────────────────────────
+-- 背景（用户报告 + 真机 2026-09-12 实证）: 会话切换（/session <name>、
+-- /resume 恢复归档/命名会话）此前只改进程内 history_path，**进程退出即
+-- 丢**——重启后 init.lua 的 load_history() 读的仍是默认
+-- /home/agent_history.txt（/new 归档后为 0 字节）→ TUI 空屏，用户必须
+-- 再敲一次 /resume。实证: 重启后 require("agent.session").current_path()
+-- 恒为 /home/agent_history.txt（0 字节），而真正在用的
+-- /home/sessions/agent_history_162903596.4.jsonl（554904B/640 条）无人读。
+-- 语义对齐 opencode 的当前会话指针 / pi 的 --continue: 把活动会话写进
+-- config（与 data_dir 引导复用同一份配置 → 跨重启生效），启动时
+-- restore_active() 读回。
+-- 主会话（config_mod.history_path）**不写指针**（它就是默认值）——顺带
+-- 使 /new"归档后开新会话"能覆盖上次存的命名会话（否则重启又拉回旧会话）。
+local function with_config(mutate)
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  if not ok_cfg or type(config_mod.load) ~= "function"
+     or type(config_mod.save) ~= "function" then return false end
+  local ok_l, cfg = pcall(config_mod.load)
+  if not ok_l or type(cfg) ~= "table" then return false end
+  local changed = mutate(cfg, config_mod)
+  if not changed then return false end
+  local ok_s = pcall(config_mod.save, cfg)
+  return ok_s
+end
+
+-- 把当前 history_path 写进 config.last_session（主会话 → 清指针）。
+-- 值与已存一致时**不写盘**（重启路径上 switch_to 只在真切换时调用，
+-- 但 /resume 每次带参数都会走一遍——避免无谓的 config 重写）。
+local function persist_active()
+  with_config(function(cfg, config_mod)
+    if history_path == config_mod.history_path then
+      if cfg.last_session == nil then return false end
+      cfg.last_session = nil
+      return true
+    end
+    if cfg.last_session == history_path then return false end
+    cfg.last_session = history_path
+    return true
+  end)
+end
+
+-- 清掉活动会话指针（/relocate 迁移用——旧盘路径在新盘上仍"存在"，
+-- 不清理会让重启后的 restore_active 恢复旧盘会话并在那里续写，
+-- 污染新盘主会话）。
+local function clear_active()
+  with_config(function(cfg)
+    if cfg.last_session == nil then return false end
+    cfg.last_session = nil
+    return true
+  end)
+end
+
+-- 切换活动会话 + 落盘（/session <name>、/resume、启动恢复用）。
+-- persist=false 用于迁移/测试等"只改路径不记指针"的场景。
+local function switch_to(p, persist)
+  history_path = p
+  if persist ~= false then persist_active() end
+end
+
+-- 启动时恢复活动会话路径。返回恢复到的路径；无指针/指针失效 → nil
+-- （调用方保持默认主会话）。
+-- **失效指针不 set_paths**——否则 load_history 读空文件、后续 append 会在
+-- 死路径上重建空会话，静默顶掉用户的上次会话（比不恢复更糟）。
+-- 失效判定 = 文件不存在（fs.exists）；主会话与命名会话同判据。
+-- 指针 == 当前默认主会话（如 /relocate 后 config 引导已把默认切到该盘）
+-- 时视为无需恢复，返回 nil。
+local function restore_active()
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  if not ok_cfg or type(config_mod.load) ~= "function" then return nil end
+  local ok_l, cfg = pcall(config_mod.load)
+  if not ok_l or type(cfg) ~= "table" then return nil end
+  local p = cfg.last_session
+  if type(p) ~= "string" or p == "" then return nil end
+  if p == config_mod.history_path then return nil end
+  local ok_fs, fs = pcall(require, "filesystem")
+  if not ok_fs or type(fs.exists) ~= "function" then return nil end
+  local ok_e, e = pcall(fs.exists, p)
+  if not ok_e or not e then return nil end
+  history_path = p
+  return p
+end
+
+-- 活动会话显示名（启动横幅/恢复提示用）: 主会话 → "default"，
+-- 命名会话 → basename 去 .jsonl。
+local function active_name()
+  local ok_cfg, config_mod = pcall(require, "agent.config")
+  local def = ok_cfg and config_mod.history_path or ""
+  if history_path == def then return "default" end
+  return (history_path:match("([^/]+)$") or history_path):gsub("%.jsonl$", "")
 end
 
 -- 会话列表（类 opencode /session）: 扫描目录下 *.jsonl 会话文件
@@ -794,6 +887,11 @@ local M = {
   ensure_archive_space = ensure_archive_space,
   set_chat = set_chat,
   current_path = current_path,
+  -- 活动会话持久化（重启自动恢复上次会话）——用户可见的切换走 switch_to
+  switch_to = switch_to,
+  restore_active = restore_active,
+  clear_active = clear_active,
+  active_name = active_name,
   list_sessions = list_sessions,
   -- Exported because agent.lua's process_exchange still uses this constant.
   MAX_TOOL_RESULT = MAX_TOOL_RESULT,

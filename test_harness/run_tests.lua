@@ -2842,6 +2842,64 @@ do  -- 包裹成块: 主 chunk 局部变量贴 200 上限时 VM 寄存器错乱�
   -- /restart: 测试环境无 computer.shutdown（oc_mock 未提供）→ 优雅降级不崩
   local exit10 = agent_test.handle_command("/restart", cmd_cfg, cmd_msgs)
   test("/restart degrades gracefully without computer.shutdown", not exit10)
+
+  -- ═══ /context 与 /maxout（拆出独立作用域: 主 chunk 200 local 上限）═══
+  -- 关键语义: ①不带参数=显示；②带参数=**原地改活 config 并立即生效**
+  -- （旧 preset 改的是 load_config() 读出的另一个表 → 必须重启，是用户
+  -- 反馈的痛点）;③K/M 后缀解析;④非法值/越界不动配置。
+  test("/context & /maxout", (function()
+    local cc = {model = "m", api_key = "", context_window = 128000}
+    local cm = {{role = "user", content = "hi"}}
+    local ok = true
+    local function chk(name, cond)
+      if not cond then ok = false; print("    FAIL: " .. name) end
+    end
+    agent_test.handle_command("/context", cc, cm)
+    chk("/context show keeps value", cc.context_window == 128000)
+    agent_test.handle_command("/maxout", cc, cm)
+    chk("/maxout show leaves nil", cc.max_tokens == nil)
+    agent_test.handle_command("/context 256K", cc, cm)
+    chk("/context 256K -> 262144 live", cc.context_window == 262144)
+    agent_test.handle_command("/context 64k", cc, cm)
+    chk("/context 64k lowercase -> 65536", cc.context_window == 65536)
+    agent_test.handle_command("/context 32000", cc, cm)
+    chk("/context plain number", cc.context_window == 32000)
+    agent_test.handle_command("/context 1M", cc, cm)
+    chk("/context 1M -> 1048576", cc.context_window == 1048576)
+    agent_test.handle_command("/maxout 16384", cc, cm)
+    chk("/maxout 16384 live", cc.max_tokens == 16384)
+    -- 非法/越界必须拒绝且不破坏原值
+    local bw, bo = cc.context_window, cc.max_tokens
+    agent_test.handle_command("/context 0", cc, cm)
+    chk("/context 0 rejected", cc.context_window == bw)
+    agent_test.handle_command("/context 99999999", cc, cm)
+    chk("/context huge rejected", cc.context_window == bw)
+    agent_test.handle_command("/context abc", cc, cm)
+    chk("/context non-numeric rejected", cc.context_window == bw)
+    agent_test.handle_command("/context -5", cc, cm)
+    chk("/context negative rejected", cc.context_window == bw)
+    agent_test.handle_command("/maxout 0", cc, cm)
+    chk("/maxout 0 rejected", cc.max_tokens == bo)
+    agent_test.handle_command("/maxout xyz", cc, cm)
+    chk("/maxout non-numeric rejected", cc.max_tokens == bo)
+    return ok
+  end)())
+  test("/preset-256k alias still sets 262144 (compat)", (function()
+    local pc = {model = "m", api_key = ""}
+    agent_test.handle_command("/preset-256k", pc, {{role="user", content="x"}})
+    local a = pc.context_window == 262144
+    local pc2 = {model = "m", api_key = ""}
+    agent_test.handle_command("/preset-200k", pc2, {{role="user", content="x"}})
+    return a and pc2.context_window == 262144
+  end)())
+  test("/help advertises /context and /maxout (doc-impl sync)", (function()
+    local hf = io.open("../src/agent/init.lua", "r")
+    if not hf then return true end
+    local src_all = hf:read("*a"); hf:close()
+    return src_all:find("/context %[t%]") ~= nil
+      and src_all:find("/maxout %[t%]") ~= nil
+  end)())
+
   -- 清理
   os.remove(sdir .. "/alpha.jsonl")
   os.remove(sdir .. "/beta.jsonl")
