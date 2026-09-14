@@ -89,7 +89,7 @@ local function exec_cmd(cmd)
     local content = f:read("*a")
     f:close()
     local fs = require("filesystem")
-    pcall(fs.delete, outpath)
+    pcall(fs.remove or fs.delete, outpath)  -- 新版 OpenOS 是 fs.remove (旧版 fs.delete)
     if #content == 0 then
       return "(no output)"
     end
@@ -142,9 +142,13 @@ local function write_file(path, escaped)
 end
 
 -- 删除文件 (v5.1 新增; v5.2: "remote: " 前缀同 write)
+-- 注意: 新版 OpenOS 的删除函数是 filesystem.remove (旧版叫 delete) ——
+-- 用 or 兜底跨版本。首次部署后真机 delete op 报 "attempt to call a nil
+-- value" 即此因 (OpenOS 1.8.9, full_filesystem.lua:241 filesystem.remove)。
 local function delete_file(path)
   local fs = require("filesystem")
-  local ok, err = pcall(fs.delete, path)
+  local del = fs.remove or fs.delete
+  local ok, err = pcall(del, path)
   if ok then
     return "ok|remote: deleted " .. path
   else
