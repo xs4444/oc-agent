@@ -20,6 +20,22 @@
 挂起、CPU 时间不走 → deadline 永不触发 → 探测线程永久挂起（世界重载前不清）。
 **静默本身没有被协议表达**："没电"对主控侧不可见。
 
+**事故 B 的源码全链路（2026-09-14 补钉，`repos/opencomputers` 实证）**：
+1. OC 网络层**确实会广播对端停机**：`Machine.tryClose()`（`Machine.scala:581/935`）
+   → `node.sendToReachable("computer.stopped")`。
+2. 但接收端 `NetworkCard.onMessage`（`NetworkCard.scala:142`）对
+   `computer.stopped`/`computer.started` 只做内部 `openPorts.clear()`，
+   **不转成 Lua 可见信号**——只有 `network.message` 包经
+   `WakeMessageAware.receivePacket` → `computer.signal("modem_message", ...)`
+   才会到 `event.pull()`。**即：agent 的 Lua 永远看不到 `computer.stopped`，
+   掉电在协议层只能靠超时发现。**
+3. 机器人侧**没有预报警通道**：本版本 Lua 无 `computer.onCrash` 钩子
+   （全树 grep 空）；`robot.level()`（`robot/lib/robot.lua:13`）是
+   **experience 组件的经验等级**，不是电量——机器人方法表无任何能量 API。
+   掉电瞬间整机（含 remote_debug 守护）一起死，连"再见"消息都发不出。
+4. 结论：**"静默"至少四种含义**（没电/超距/世界暂停/守护崩溃），keepalive
+   是协议层必需品而非优化项（§4）——平台信号不可见，必须自建心跳。
+
 结论：裸 request/reply 协议 + 每次由 LLM 现场生成客户端框架代码 = 歧义 bug
 反复出现。需要稳定客户端库（结构化结果）+ 完整服务器语义（流分离/显式离线/
 分块传输）。
@@ -38,6 +54,7 @@
 | OC API 漂移：`fs.delete`→`fs.remove`；`robot.direction()` 新版不存在；`pairs(comp)`≠组件迭代 | 本次真机实测（c114）+ `full_filesystem.lua:241` |
 | 共享内存小（机器人 1MB / 主控曾 2MB OOM）→ 服务器缓冲必须小 | 第四次 OOM（gist 59379f） |
 | `lua` 包装器对任何 `os.exit()` 向 stderr 打 `terminated` | `loot/openos/bin/lua.lua:23-26` |
+| 掉电广播 `computer.stopped` 对 Lua 不可见 → 离线只能靠协议层心跳/超时 | `Machine.scala:581/935` `sendToReachable("computer.stopped")` 被 `NetworkCard.scala:142` 内部消费（仅 `openPorts.clear()`）；`robot.level()`=经验等级非电量；本版本无 `computer.onCrash` 钩子 |
 
 ## 3. 阶段计划
 
@@ -87,9 +104,13 @@
 - **auth（v6.1）**：连接后首条 `v6|0|auth|<token>`；token 存服务器文件头部
   常量（空=关闭，启动时打印告警）。当前协议零认证——modem 覆盖范围内任何
   机器都能发 exec，v6.1 前按可信域使用。
-- **keepalive**：客户端空闲期每 10s 发 ping；连续 3 次无回复 → `h.alive=false`，
-  后续 op 直接返回 `{ok=false, offline=true, err="REMOTE_OFFLINE"}`（不再干等
-  超时）。服务器侧无需动作（事件循环等消息即可）。
+- **keepalive（必需品，非优化项）**：客户端空闲期每 10s 发 ping；连续 3 次无回复
+  → `h.alive=false`，后续 op 直接返回 `{ok=false, offline=true,
+  err="REMOTE_OFFLINE"}`（不再干等超时）。服务器侧无需动作（事件循环等消息
+  即可）。**必须自建的原因**（事故 B 源码链路，§1）：OC 的
+  `computer.stopped` 网络广播被 `NetworkCard.onMessage` 内部消费
+  （`openPorts.clear()`），Lua 侧不可见；机器人又无电量 API / onCrash 钩子
+  可预报警——"没电"对 agent 只能表现为静默，心跳是唯一的显式离线判据。
 - **超时预算（客户端，全墙钟 `computer.uptime()`）**：ping 5s；exec 默认 120s
   （单次调用可覆盖）；文件块间隙 10s（gap=断连，立即 abort，不等总超时）；
   write 总量 300s。
@@ -103,10 +124,12 @@ REPLY_MAX=7680B）。部署：主控机 `/home/remote_client.lua`，
 ```lua
 local h = remote.connect(remote_addr, {port=8001, op_timeout=30})
 h:ping()  → {ok=true} | {ok=false, offline=true}
-h:info()  → {ok=true, info="id=..|uptime=..|..."}
+h:info()  → {ok=true, info="id=..|uptime=..|..|pd=<版本>", pd=<版本?>}
+          -- pd 由 v5.2.2+ 服务器提供 (协议版本); 客户端缓存供管道守卫用
 h:exec(cmd, timeout_s?) → {ok=true, code=0, out=..., truncated=false}
                         | {ok=false, code=1, err=...}
                         | {ok=false, offline=true, err="REMOTE_OFFLINE (no reply within Ns)"}
+          -- cmd 含 shell 管道 '|': 仅 pd≥5.2.1 放行, 否则显式报错
 h:read(path) → {ok=true, content=..., size=n} | {ok=false, err="cannot open .."} | offline
 h:write(path, content) → {ok=true, bytes=n}   -- v5.2 一次性写 ≤6000B；更大报"用 v6"
 h:delete(path) → {ok=true} | {ok=false, err=...}
@@ -165,3 +188,7 @@ h:close()
 8. `(no output)` = 命令无输出，不是失败（agent shell 工具约定）。
 9. 空回复 ≠ 成功：v5.2 起空载荷有显式标记；v5.0/v5.1 的 `ok|` 空载荷一律
    按"未知"处理。
+10. 掉电 = 永久静默，且**平台不给 Lua 看**：`computer.stopped` 广播被
+    `NetworkCard` 内部消费（`openPorts.clear()`）；`robot.level()` 是经验
+    等级不是电量；无 `computer.onCrash` 钩子。远端死活只能靠协议层
+    keepalive/墙钟超时判（§1 事故 B 源码链路）。
