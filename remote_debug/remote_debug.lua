@@ -24,6 +24,9 @@
 --   - write/delete 回复加 "remote: " 前缀, 明确文件在远端设备 (旧版
 --     "ok|N bytes written to /home/x.lua" 被主控侧 LLM 当本机路径 ls,
 --     必然 No such file or directory -> 困惑循环)。
+--   - exec 追加 "2>&1" 捕获 stderr —— 脚本崩溃信息此前被吞 (只重定向
+--     stdout), 主控侧只能看到 "EXEC: ok|" 空载荷, 永远不知道远端脚本
+--     为什么没产出数据。
 
 local component = require("component")
 local event = require("event")
@@ -63,12 +66,18 @@ end
 -- 执行 shell 命令 (v5.1: 重定向到 /home 而非 /tmp, 避开 /tmp 文件数上限)
 -- v5.2: 失败走 err 信封 (旧版 shell.execute 失败回 "ok|Error: nil" —— 错误
 --   语义走 ok 通道, 主控侧 LLM 无法区分"成功无输出"与"执行失败");
---   空输出显式标记 "(no output)" (旧版 "ok|" 空载荷同样歧义)。
+--   空输出显式标记 "(no output)" (旧版 "ok|" 空载荷同样歧义);
+--   追加 "2>&1" 捕获 stderr (关键: 脚本崩溃信息走 stderr, 旧版只重定向
+--   stdout 把崩溃吞掉 → "EXEC: ok|" 空载荷, 主控侧永远看不到探针为什么没
+--   数据。实证: agent_history_162903596.4 的 probe_env 脚本用 pairs(comp)
+--   迭代 component 表 (返回 22 个 方法名=function, 而非 地址=类型) →
+--   table.sort 比较 function 崩溃 → io.open("w") 已创建空文件但首行 w()
+--   未执行 → 每轮都留下空 /home/probe_out.txt → 主控侧 10 轮困惑循环)。
 local function exec_cmd(cmd)
   local outpath = "/home/exec_out_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000))
   local ok, result = pcall(function()
     local shell = require("shell")
-    local ok2, err2 = shell.execute(cmd .. " > " .. outpath)
+    local ok2, err2 = shell.execute(cmd .. " > " .. outpath .. " 2>&1")
     if not ok2 then
       error("exec failed: " .. tostring(err2))
     end
