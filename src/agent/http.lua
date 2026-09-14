@@ -262,6 +262,17 @@ local function http_post(url, headers, body, on_retry, on_wait)
   end
 end
 
+-- GET 请求: 复用 post 的重试/超时/中断保护。3 参形式 internet.request(url,
+-- nil, headers) 按 body 推断方法——body=nil 即 GET（真机 OpenOS 1.8.9 与
+-- ocvm 均如此；显式第 4 参 method 部分模拟器忽略，见 http_post_once 注释）。
+-- v0.3.127: gist 会话（agent_history_193138275.6）里 LLM 临时脚本猜测
+-- http.get 不存在 → "attempt to call a nil value (field 'get')" → 困惑 +
+-- 反复重写脚本（Bearer/Basic/NoAuth 多轮误诊，其中 NoAuth 200 返回的是
+-- GitHub 全局 featured gists 而非 token 名下——假阳性）。get 成为一等导出。
+local function http_get(url, headers, on_retry, on_wait)
+  return http_post(url, headers, nil, on_retry, on_wait)
+end
+
 -- 运行时策略调整（config 热更新: chat() 每次请求前调用）
 local function set_budget(b)
   retry_budget = b
@@ -277,6 +288,7 @@ end
 
 return {
   post = http_post,
+  get = http_get,
   set_budget = set_budget,
   set_response_timeout = set_response_timeout,
   set_response_body_limit = set_response_body_limit,

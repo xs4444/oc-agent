@@ -1,4 +1,4 @@
--- remote_debug.lua v5.1 — 纯文本协议 (避免 JSON 解析 bug)
+-- remote_debug.lua v5.2 — 纯文本协议 (避免 JSON 解析 bug)
 -- 运行在目标设备上, 通过 modem 接收主控机的调试指令并返回结果
 -- 协议格式 (纯文本, 用 | 分隔):
 --   请求: op|param1|param2
@@ -13,6 +13,17 @@
 -- 关键: modem_message 事件参数 (subagent.lua:162 真机验证):
 --   sig[1]=事件名 sig[2]=本地 sig[3]=远程 sig[4]=端口 sig[5]=距离 sig[6]=数据
 -- v5.1: exec 重定向路径 /tmp -> /home (避开 /tmp 目录文件数上限)
+-- v5.2: 回复消歧 (治"信息困惑导致重复循环", 见 agent_history_162903596.4
+--   尾部 doom-loop: 主控侧 LLM 把远端 /home 路径当本机 ls + 空载荷 ok| 无法
+--   区分"成功但无数据"与故障, 同命令重复 3 轮触发护栏):
+--   - 空载荷永不出现: exec 无输出 -> "ok|(no output)"; read 空文件 ->
+--     "ok|(empty file)"。主控侧拿到 ok| 即保证 data 非空。
+--   - exec 失败走 err 信封 (旧版 shell.execute 失败回 "ok|Error: nil" ——
+--     错误语义走 ok 通道, 主控侧无法区分): "err|exec failed: <err>" /
+--     "err|exec redirect failed: cannot open <outpath>"。
+--   - write/delete 回复加 "remote: " 前缀, 明确文件在远端设备 (旧版
+--     "ok|N bytes written to /home/x.lua" 被主控侧 LLM 当本机路径 ls,
+--     必然 No such file or directory -> 困惑循环)。
 
 local component = require("component")
 local event = require("event")
@@ -33,7 +44,7 @@ end
 local PORT = 8001
 component.invoke(modemAddr, "open", PORT)
 local isWireless = component.invoke(modemAddr, "isWireless")
-print("Remote Debug v5.1: " .. (isWireless and "wireless" or "wired"))
+print("Remote Debug v5.2: " .. (isWireless and "wireless" or "wired"))
 print("Addr: " .. modemAddr)
 print("Port " .. PORT .. " open: " .. tostring(component.invoke(modemAddr, "isOpen", PORT)))
 print("Waiting for commands... (Ctrl+C to stop)")
@@ -50,20 +61,29 @@ local function send_reply(sender, port, payload)
 end
 
 -- 执行 shell 命令 (v5.1: 重定向到 /home 而非 /tmp, 避开 /tmp 文件数上限)
+-- v5.2: 失败走 err 信封 (旧版 shell.execute 失败回 "ok|Error: nil" —— 错误
+--   语义走 ok 通道, 主控侧 LLM 无法区分"成功无输出"与"执行失败");
+--   空输出显式标记 "(no output)" (旧版 "ok|" 空载荷同样歧义)。
 local function exec_cmd(cmd)
   local outpath = "/home/exec_out_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000))
   local ok, result = pcall(function()
     local shell = require("shell")
     local ok2, err2 = shell.execute(cmd .. " > " .. outpath)
-    if not ok2 then return "Error: " .. tostring(err2) end
+    if not ok2 then
+      error("exec failed: " .. tostring(err2))
+    end
     local f = io.open(outpath, "r")
     if not f then
-      return "(no output)"
+      -- 重定向文件打不开 (如目录文件数上限) —— 与"命令无输出"区分
+      error("exec redirect failed: cannot open " .. outpath)
     end
     local content = f:read("*a")
     f:close()
     local fs = require("filesystem")
     pcall(fs.delete, outpath)
+    if #content == 0 then
+      return "(no output)"
+    end
     return content
   end)
   if ok then
@@ -73,7 +93,8 @@ local function exec_cmd(cmd)
   end
 end
 
--- 读取文件
+-- 读取文件 (v5.2: 空文件显式标记 "(empty file)" —— 旧版 "ok|" 空载荷,
+-- 主控侧无法区分"文件存在但为空"与其他异常; 文件不存在仍回 err 信封)
 local function read_file(path)
   local f = io.open(path, "r")
   if not f then
@@ -81,6 +102,9 @@ local function read_file(path)
   end
   local content = f:read("*a")
   f:close()
+  if #content == 0 then
+    return "ok|(empty file)"
+  end
   return "ok|" .. content
 end
 
@@ -104,15 +128,16 @@ local function write_file(path, escaped)
   end
   f:write(content)
   f:close()
-  return "ok|" .. #content .. " bytes written to " .. path
+  -- v5.2: "remote: " 前缀 —— 文件在远端设备, 明确提示主控侧 LLM 勿对本机 ls
+  return "ok|remote: " .. #content .. " bytes written to " .. path
 end
 
--- 删除文件 (v5.1 新增)
+-- 删除文件 (v5.1 新增; v5.2: "remote: " 前缀同 write)
 local function delete_file(path)
   local fs = require("filesystem")
   local ok, err = pcall(fs.delete, path)
   if ok then
-    return "ok|deleted " .. path
+    return "ok|remote: deleted " .. path
   else
     return "err|cannot delete " .. path .. ": " .. tostring(err)
   end
