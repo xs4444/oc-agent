@@ -387,14 +387,40 @@ def cmd_serve(args):
     log("stopped")
 
 
-def http_json(url, body=None, timeout=15):
+def _redact_token(text, secret):
+    """把文本里出现的 token 明文(及其 URL 编码形式)替换为 ***。
+
+    urllib 的异常信息含完整 URL (?token=<明文>), 直接上抛会把 token 打进
+    终端/日志。token 经 urllib.parse.quote 后可能含 %XX 转义, 两种形式都要抹。
+    """
+    if not secret:
+        return text
+    for variant in {secret, urllib.parse.quote(secret, safe="")}:
+        if variant:
+            text = text.replace(variant, "***")
+    return text
+
+
+def http_json(url, body=None, timeout=15, _secret=None):
     data = None
     headers = {"Content-Type": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError:
+        # HTTPError 的 str 不含 URL, 且调用方按类型分别处理 (403/413/429/400),
+        # 原样上抛以保持既有语义。
+        raise
+    except Exception as e:
+        # 脱敏: 不能只追加脱敏后缀 —— str(e) 里已含明文 token, 外层
+        # "发送命令失败: %s" 会照打出来。必须先把明文替换掉再格式化。
+        # 也不能 raise type(e)(...) —— HTTPError 等构造参数不同会崩溃。
+        safe = url.split("?", 1)[0]
+        msg = _redact_token(str(e), _secret)
+        raise RuntimeError("%s (url: %s?token=***)" % (msg, safe)) from None
 
 
 def wait_result(base, tok, rid, deadline):
@@ -456,7 +482,7 @@ def cmd_client(args):
     if args.status:
         # v0.3.125r6: 健康快照（在线性/队列/最近命令）
         try:
-            r = http_json("%s/status?token=%s" % (base, tok))
+            r = http_json("%s/status?token=%s" % (base, tok), _secret=args.token)
         except urllib.error.HTTPError as e:
             print("error: server HTTP %d: %s" %
                   (e.code, e.read().decode("utf-8", "replace")[:300]),
@@ -505,7 +531,8 @@ def cmd_client(args):
         return 2
 
     try:
-        r = http_json("%s/cmd?token=%s" % (base, tok), {"op": op, "args": op_args})
+        r = http_json("%s/cmd?token=%s" % (base, tok),
+                      {"op": op, "args": op_args}, _secret=args.token)
     except urllib.error.HTTPError as e:
         # v0.3.125r6: 服务器拒收（400 单行/emoji、413 过大、429 队列满）
         # 把原因打全，而不是笼统"发送失败"

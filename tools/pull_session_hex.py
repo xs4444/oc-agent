@@ -12,6 +12,7 @@ chunk 读取 → string.format("%02x") → 本地 bytes.fromhex 还原。
   python3 tools/pull_session_hex.py --remote /home/sessions/x.jsonl --local /tmp/x.jsonl
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -52,7 +53,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--remote", required=True)
     ap.add_argument("--local", required=True)
-    ap.add_argument("--base", default="https://mc.<REDACTED>.nyat.app:37057")
+    # 脱敏: 内网穿透域名不入库。用环境变量 OC_REMOTE_BASE 或 --base 传入
+    # (与 tools/oc_deploy.py 的约定一致)。
+    ap.add_argument("--base", default=os.environ.get("OC_REMOTE_BASE", ""))
     ap.add_argument("--chunk", type=int, default=CHUNK)
     args = ap.parse_args()
 

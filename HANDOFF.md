@@ -50,7 +50,7 @@ cancel、auth。设计文档：`docs/REMOTE_PROTOCOL.md`（§8 有 32 条实证�
 | `remote_debug/rc.d_remoted.lua` | rc 服务草案（装到 `/etc/rc.d/remoted.lua`）：`start()` 必须尽快返回 |
 | `remote_debug/RESCUE.md` | 分阶段救援手册（含三条已修缺陷记录） |
 | `remote_client/remote_client.lua` | 主控侧客户端库 **v6-only**（`h:exec/read/write/delete/ping/info/cancel`） |
-| `tools/remote_server.py` | 本机→游戏机命令通道（base `https://mc.<REDACTED>.nyat.app:37057`） |
+| `tools/remote_server.py` | 本机→游戏机命令通道（base 用 `OC_REMOTE_BASE` 环境变量或 `--base` 传入，见下） |
 | `tools/oc_deploy.py` | **推游戏机文件**（分块→校验→原子替换）。**勿用 write op** |
 | `.oc-remote-token` | 远控 token |
 | `repos/opencomputers/` | OC 源码（设计取证用） |
@@ -59,16 +59,25 @@ cancel、auth。设计文档：`docs/REMOTE_PROTOCOL.md`（§8 有 32 条实证�
 
 ```bash
 cd /home/hcj/aiProjects/mieAgent
+# 内网穿透地址属敏感信息，不入库：用环境变量传入（实际地址问用户/见本地笔记）
+export OC_REMOTE_BASE="https://<你的内网穿透域名>:<端口>"
+
 # 在机器人上跑 Lua（经游戏机中转；大文件用 tools/pull_session_hex.py）
-python3 tools/remote_server.py client \
+python3 tools/remote_server.py client --base "$OC_REMOTE_BASE" \
   --token "$(cat .oc-remote-token)" --lua '<lua 代码>' --wait N
 # 推文件到游戏机（脚本会分块+校验+原子替换，自动备份）
 python3 tools/oc_deploy.py <本地文件> /home/<远端路径> \
-  --base "https://mc.<REDACTED>.nyat.app:37057" --token "$(cat .oc-remote-token)"
+  --base "$OC_REMOTE_BASE" --token "$(cat .oc-remote-token)"
 # v6 e2e 复跑（在游戏机上执行 e2e_v6.lua）
-python3 tools/remote_server.py client --token "$(cat .oc-remote-token)" \
+python3 tools/remote_server.py client --base "$OC_REMOTE_BASE" \
+  --token "$(cat .oc-remote-token)" \
   --lua 'local f=assert(loadfile("/home/e2e_v6.lua")) return f()' --wait 280
 ```
+
+> **脱敏约定**：内网穿透域名/端口**不写进任何入库文件**。
+> `tools/oc_deploy.py` 与 `tools/pull_session_hex.py` 的 `--base` 默认值均为
+> `os.environ.get("OC_REMOTE_BASE", "")`（空则须显式传参），
+> 与 `.oc-remote-token` 一样受 `.gitignore` 保护。
 
 **注意两个机器的区别**：`--lua` 在**游戏机**上执行；`h:exec(...)` 在**机器人**上执行。
 `h:write(path, ...)` 写的是**机器人**的文件系统——不要把游戏机要的文件推错机器。
