@@ -84,9 +84,10 @@ local function exec_cmd(cmd)
   local ok, result = pcall(function()
     local shell = require("shell")
     local ok2, err2 = shell.execute(cmd .. " > " .. outpath .. " 2>&1")
-    if not ok2 then
-      error("exec failed: " .. tostring(err2))
-    end
+    -- v5.2.2: 先读重定向文件再判失败——2>&1 已把 stderr 落进 outpath,
+    -- 失败时附在 err 里 (对照 ssh: 流数据先于 exit-status 帧, session.c:2344)。
+    -- 旧版在此处直接 error("exec failed: " .. err2), 已捕获的崩溃行被丢弃
+    -- (附输出块成死代码), 主控侧只看到 "exec failed: nil"。
     local f = io.open(outpath, "r")
     local content = f and f:read("*a") or ""
     if f then f:close() end
@@ -183,6 +184,8 @@ local function get_info()
     .. "|freeMem=" .. tostring(computer.freeMemory())
     .. "|totalMem=" .. tostring(computer.totalMemory())
     .. "|components=" .. table.concat(comps, ",")
+    .. "|pd=5.2.2"  -- 协议版本 (客户端据此判断服务器能力: 管道支持 v5.2.1+;
+    -- 旧服务器无此字段 → 客户端按保守能力处理)
   return "ok|" .. info
 end
 
