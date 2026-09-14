@@ -150,7 +150,7 @@ h:close()
 
 | Phase 1 行为 | ssh 对应（源码位置） | 结论 |
 |---|---|---|
-| exec 终态 `code=0|1` | `session.c:2344` `exit-status` 通道请求（u32 exit code）；信号终止走独立 `exit-signal` 帧（`session.c:2350`，含信号名/coredump/备注） | ✓ 正确简化：OC 无真 exit code/信号，0/1 + err 终帧覆盖 exit-status 与 exit-signal 两帧的语义 |
+| exec 终态 `code=0|1` | `session.c:2344` `exit-status` 通道请求（u32 exit code）；信号终止走独立 `exit-signal` 帧（`session.c:2350`，含信号名/coredump/备注） | ✓ 正确简化：OC 无真 exit code/信号，0/1 + err 终帧覆盖 exit-status 与 exit-signal 两帧的语义。**注意**：`lua` 脚本崩溃被包装器内吞 → `code=0` 且崩溃行在 `out` 里（§8-12）——code 只是 shell 层信号，脚本成败看输出文本 |
 | exec 失败附已捕获输出（v5.2.2 服务器，待软盘摆渡） | ssh 流数据先于 exit-status 帧到达（`session.c:2344` 之前的 channel data 帧） | ✓ `err\|exec failed: <err> \| output: <2>&1 捕获内容>`，客户端透传为 `r.err`——此前失败只回 `exec failed: nil`，崩溃行被丢弃 |
 | 无回复 → 显式 `offline=true` | `serverloop.c:112` `client_alive_check()`：alive 超时次数 > `client_alive_count_max` → 断连；探测=全局请求 `keepalive@openssh.com`（server→client 方向） | ✓ 语义一致；方向相反（client→server）——OC 里两台机器都可能断电，需要的方向恰是客户端探服务器 |
 | `truncated=true`（服务器 7680B 截断） | ssh 全量流式，无截断 | OC 8192B 单包约束下的文档化扩展 |
@@ -192,3 +192,12 @@ h:close()
     `NetworkCard` 内部消费（`openPorts.clear()`）；`robot.level()` 是经验
     等级不是电量；无 `computer.onCrash` 钩子。远端死活只能靠协议层
     keepalive/墙钟超时判（§1 事故 B 源码链路）。
+11. OpenOS `lua` 包装器**不支持 `-e`**（`bin/lua.lua:9` 恒把 `args[1]` 当
+    文件名）——内联代码须先写脚本文件再 `lua <path>`。
+12. **`lua` 脚本崩溃 ≠ shell.execute 失败**：包装器内部 pcall + 崩溃行打
+    stderr + `os.exit(false)`（`bin/lua.lua:23-27`），shell 层仍回
+    `ok2=true` → exec `code=0`。**code=0 ≠ 脚本成功；输出文本里的崩溃行
+    （如 "attempt to compare table with function"）才是真相**（2026-09-14
+    真机实测：复现 pairs(comp)+table.sort 事故 → code=0 + out 带崩溃行 +
+    空残留文件，三要素与事故 A 完全一致）。v5.2.2 的 2>&1 + 附输出正是
+    为此存在——v5.0/v5.1 丢弃 stderr 时该崩溃行根本到不了主控侧。
