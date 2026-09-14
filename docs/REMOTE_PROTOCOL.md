@@ -4,6 +4,33 @@
 远控协议（仿 ssh 的**语义**而非传输层），消灭"信息歧义导致 agent 困惑循环"
 这一类 bug。
 
+## 状态（2026-09-14 更新）
+
+**v5 已废弃，项目现为 v6-only。** 项目 owner 裁定："不需要为兼容保留，该程序还在
+开发中"。理由（均为实证）：
+
+1. **v5 是 v6 的严格子集**：v5 ops 为 `ping/info/exec/read/write/delete`（6 个），
+   v6 全含且另有 `auth`/`write_chunk`/`cancel`（9 个）——v5 无任何 v6 没有的能力。
+2. **v5 严格更弱**：exec 输出 7680B 截断（v6 流式无上限）；无真 stdout/stderr 分离
+   （v5 `2>&1` 合流，v6 `> out 2> err`）；无 `cancel`（v5 超时的 exec 继续占机器人
+   单核）；`write` ≤6000B（v6 分块 ≤1MB）；无消息 ID（迟到回复可能错配，v5 需
+   `drain_stale` 兜底）。
+3. **v5 无真冗余**：冗余需独立故障域，但 v5 与 v6 同机、同 modem、同 Lua VM、同事件
+   队列——真机实证：两者同死。
+4. **双守护共存曾致真实故障**：一台机器跑两个守护 = 两个竞争的原生 `event.pull`
+   消费者，机器信号队列每个信号只投递给一个消费者（`NetworkCard`/`Machine.popSignal`
+   语义，winner-take-all 而非 ~50/50）。实测：port-8001 守护 0/40 回复、port-8100
+   守护 40/40。保留 v5 还被迫引入 `thread.create` 启动器 hack，其缺失的 `detach()`
+   让进程永久卡在 `join`，杀死 v5 通道并阻塞 console。
+5. **无外部消费者**：唯一客户端是本仓库 `remote_client/remote_client.lua`，与服务器
+   同仓同发——"兼容"无对象。
+
+v6 真机验收：`/home/e2e_v6.lua` → `PASS 11/11 | ALL GREEN`（T1 ping … T11 cancel）。
+autostart 现为 **rc 服务**（`/etc/rc.d/remoted.lua`，`rc remoted enable`，配置
+`/etc/rc.cfg`），以 detached 线程拉起 v6 守护；`/home/.shrc`（含
+`lua /home/start_all.lua`）为二级保险。两者经标记文件（`/home/.remoted_lock_<port>`）
+幂等。真机验证：远程重启（`computer.shutdown(true)`）后 v6 通道自动恢复，e2e 11/11。
+
 ## 1. 背景：两次事故的实证教训
 
 **事故 A（2026-09-14，会话 162903596.4 尾部 doom-loop）**：主控侧 LLM 探针脚本
@@ -83,7 +110,7 @@ T3 exec 简单、T4 exec 大输出、T5 exec 管道、T6 exec 失败、T7 write+
 T8 write+read 大（50KB）、T9 delete、T10 offline、T11 cancel）。以下规范与
 实现一致；唯一偏差是 `info` 的 `oc=` 字段（见下）。
 
-- **端口 8100**（8001=v5.x 保留兼容；9090/9091/9092=subagent）。
+- **端口 8100**（8001=v5.x **已废弃**，见状态节；9090/9091/9092=subagent）。
 - **信封**：纯文本 `v6|<id>|<op>|<payload...>`；`id` = 客户端单调递增整数；
   **每条回复回显 id**（客户端按 id 分流，多路复用的基础）；`|` 转义规则同
   v5.2 write（`\\`、`\|`）。
@@ -124,35 +151,37 @@ T8 write+read 大（50KB）、T9 delete、T10 offline、T11 cancel）。以下�
   （单次调用可覆盖）；文件块间隙 10s（gap=断连，立即 abort，不等总超时）；
   write 总量 300s。
 
-## 5. Phase 1 客户端 API（`remote_client/remote_client.lua`）
+## 5. 客户端 API（`remote_client/remote_client.lua`，v6-only）
 
-服务器兼容 remote_debug v5.2（一次性 op|args → `ok|data`/`err|msg`，
-REPLY_MAX=7680B）。部署：主控机 `/home/remote_client.lua`，
-`local remote = dofile("/home/remote_client.lua")`。
+服务器为 v6 `remote_host.lua`（端口 **8100**，§4）。部署：主控机
+`/home/remote_client.lua`，`local remote = dofile("/home/remote_client.lua")`。
 
 ```lua
-local h = remote.connect(remote_addr, {port=8001, op_timeout=30})
+local h = remote.connect(remote_addr, {port=8100, op_timeout=30})
 h:ping()  → {ok=true} | {ok=false, offline=true}
-h:info()  → {ok=true, info="id=..|uptime=..|..|pd=<版本>", pd=<版本?>}
-          -- pd 由 v5.2.2+ 服务器提供 (协议版本); 客户端缓存供管道守卫用
-h:exec(cmd, timeout_s?) → {ok=true, code=0, out=..., truncated=false}
-                        | {ok=false, code=1, err=...}
+h:info()  → {ok=true, info="id=..|uptime=..|freeMem=..|totalMem=..|components=..|pd=6.0"}
+h:exec(cmd, timeout_s?) → {ok=true, code=0, out=..., stderr=...}   -- 流式，无截断
+                        | {ok=false, code=1, err=..., out=..., stderr=...}
                         | {ok=false, offline=true, err="REMOTE_OFFLINE (no reply within Ns)"}
-          -- cmd 含 shell 管道 '|': 仅 pd≥5.2.1 放行, 否则显式报错
+          -- cmd 含 shell 管道 '|' 恒放行（v6 真流分离，无 pd= 守卫）
 h:read(path) → {ok=true, content=..., size=n} | {ok=false, err="cannot open .."} | offline
-h:write(path, content) → {ok=true, bytes=n}   -- v5.2 一次性写 ≤6000B；更大报"用 v6"
+h:write(path, content) → {ok=true, bytes=n}   -- v6 分块写，≤1MB
 h:delete(path) → {ok=true} | {ok=false, err=...}
+h:cancel(id)  → {ok=true, cancelled=id} | {ok=false, err=...}   -- 杀指定 id 的 exec（v6 恒可用）
 h:close()
 ```
 
 规则：所有等待 = `event.pull(0.25)` 循环 + `computer.uptime()` deadline
-（**禁用 `os.clock()`**）；无回复 → `offline=true`（显式，不是 nil）；
-回复尾部 `...[TRUNCATED]`（v5.2 REPLY_MAX 标记）→ `truncated=true`。
-超时后的下一个 op 先排空 2s 内滞留的旧回复（`drain_stale`——一次性协议
-无消息 ID，迟到的旧回复会被误配给新 op；ssh 用通道 ID 序号根治，v6
-同理）。
+（**禁用 `os.clock()`**）；无回复 → `offline=true`（显式，不是 nil）。
+v6 每条回复回显消息 id（§4），客户端按 id 分流——**无 `truncated`、无
+`drain_stale`**（一次性协议的截断/错配问题在 v6 消息 ID 下根治）。
 
-## 6. Phase 1 已知限制（2026-09-14 对照 OpenSSH 源码逐条核对）
+## 6. Phase 1 已知限制（**v5 时代记录**，2026-09-14 对照 OpenSSH 源码逐条核对）
+
+> **已废弃**：下表是 Phase 1（v5.2，端口 8001）时代的限制记录。v5 已于
+> 2026-09-14 废弃（见状态节），v6（端口 8100）已根治其中多数项（消息 ID、
+> 流式 exec、分块传输、cancel、真流分离）。保留此表仅作历史对照，勿据此
+> 认为存在 v5 路径。
 
 核对基准：`repos/openssh-portable`（openssh/openssh-portable 浅克隆，
 2026-09-14）。
@@ -175,7 +204,7 @@ h:close()
 
 | 端口 | 用途 |
 |---|---|
-| 8001 | remote_debug v5.x（一次性 op 协议） |
+| 8001 | ~~remote_debug v5.x~~ **已废弃**（2026-09-14）：v5 是 v6 严格子集，双守护共存致 winner-take-all 饿死（见状态节、§8-23）；服务器文件已从仓库删除，软盘副本同步删除 |
 | 8100 | v6 remote_host（已实现 + 真机验收，§4） |
 | 9090/9091/9092 | subagent（任务/回复/文件代理，Phase 3 收编） |
 
@@ -185,7 +214,7 @@ h:close()
 
 实际部署状态（真机，2026-09-14）：v6 服务器在机器人 `/home/remote_host.lua`
 （16164 字节，与本仓库 `remote_debug/remote_host.lua` 逐字节一致），**不在软盘**；
-软盘 `/mnt/3e9/remote_debug.lua` 是 v5.2.2（已验证），`/mnt/3e9/remote_host.lua`
+软盘 `/mnt/3e9/remote_debug.lua`（v5.2.2）随 v5 废弃同步删除，`/mnt/3e9/remote_host.lua`
 不存在。
 
 ## 8. OC 实测坑清单（append-only，写探针/客户端代码前过一遍）
@@ -303,12 +332,12 @@ h:close()
     的"两条命令"）不可执行的原因。**正确做法**：一律经 detached 线程启动器
     （`remote_debug/start_all.lua`：`thread.create(fn):detach()` 后立即返回）
     或 rc 服务拉起；启动器本身在前台跑是安全的（它立即返回）。
-22. **双守护共存已真机验收通过（B4′ 架构定案）**（真机，2026-09-14）：
-    把 v5(8001) 与 v6(8100) 各作为 `thread.create(fn):detach()` 线程拉起后，
-    **两者互不饿死**：交替各 40 次 ping 得 **8001=40/40、8100=40/40**，
-    单条 ping 只收到 **1** 条回复（无重复守护）。这实证了第 13 条的模型
-    （线程=注册消费者，先消费后广播），也推翻了"第二个守护必饿死第一个"
-    的旧判断。
+22. **守护以 detached 线程运行 + autostart 已真机验收（架构定案）**
+    （真机，2026-09-14；**本节的双守护部分已被第 23 条取代，保留作机制实证**）：
+    **线程守护互不饿死**：把守护各作为 `thread.create(fn):detach()` 线程拉起后，
+    交替 ping 可达 **双 40/40**，单条 ping 只收到 **1** 条回复（无重复守护）。
+    这实证了第 13 条的模型（线程=注册消费者，先消费后广播），也推翻了
+    "第二个守护必饿死第一个"的旧判断。
     **autostart 落地**：`/etc/rc.d/remoted.lua` + `rc remoted enable`
     （`/etc/rc.cfg` → `enabled = {"remoted"}`），另以 `/home/.shrc`
     （内容 `lua /home/start_all.lua`）作二级保险；两者都靠 `start_all.lua`
@@ -318,12 +347,37 @@ h:close()
     `lib/core/cursor.lua:246` 以 `computer.pullSignal(.5)` **持续 park 原生泵**
     （2Hz），线程守护的唤醒注册因此一直有人服务。第 16 条的"未验证一环"
     至此**已验证**。
-    **重启验收**（`computer.shutdown(true)` 远程触发，见第 20 条）：重启后
-    8001 与 8100 **同时自动恢复**（各 5/5 ping，`pd=5.2.2`；v6 uptime 归零
-    重新计时），无重复守护，e2e **11/11 ALL GREEN**。
-    **注意**：`start_all.lua` 的幂等守卫依据**端口变量**判断，而守护自身的
-    监听端口由各自脚本内的常量决定（`remote_host.lua:51` `PORT = 8100`、
-    `remote_debug.lua:53` `PORT = 8001`）。故**不要**用"只改调用方端口变量"
-    的方式起第二个实例——实测那样会在原端口上多起一个同端口守护
-    （单条 ping 收到 2 条回复）。要起备用实例须同时替换被加载脚本的端口常量
-    （`start_rh2.lua` 即如此做，并断言替换恰好一次）。
+    **重启验收**（`computer.shutdown(true)` 远程触发，见第 20 条）：重启后守护
+    **自动恢复**，无重复守护，e2e **11/11 ALL GREEN**。
+    **注意（仍适用）**：`start_all.lua` 的幂等守卫依据**端口变量**判断，而守护
+    自身的监听端口由被加载脚本内的常量决定（`remote_host.lua:53`
+    `PORT = 8100`）。故**不要**用"只改调用方端口变量"的方式起第二个实例——
+    实测那样会在原端口上多起一个同端口守护（单条 ping 收到 2 条回复）。
+    要起备用实例须同时替换被加载脚本的端口常量（`start_rh2.lua` 即如此做，
+    并断言替换恰好一次）。
+23. **v5 废弃、单守护定案（项目 owner 裁定，2026-09-14）**：owner 裁定"不需要为
+    兼容保留，该程序还在开发中"。v5（8001）是 v6（8100）的严格子集且严格更弱
+    （exec 7680B 截断、无真流分离、无 cancel、write ≤6000B、无消息 ID），且 v5
+    与 v6 同机/同 modem/同 Lua VM/同事件队列——无独立故障域，真机实证两者同死，
+    无真冗余。双守护共存曾致真实故障：两个竞争的原生 `event.pull` 消费者，机器
+    信号队列每信号只投递给一个消费者（`NetworkCard`/`Machine.popSignal` 语义，
+    winner-take-all 而非 ~50/50；实测 port-8001 守护 0/40、port-8100 守护 40/40，
+    见第 13 条）。故**废弃 v5、只留 v6 单守护**：`start_all.lua` 现只起 v6
+    （`/home/remote_host.lua`，端口 8100，`thread.create(fn):detach()`），端口
+    8001 废弃，`remote_debug.lua` 已从仓库删除（软盘副本同步删除）。
+    **单守护下的平台事实（均已实证，写代码前过一遍）**：
+    - `os.sleep(n)` 存在且是墙钟 + `event.pull` 实现（`boot/02_os.lua:25-31`），
+      `computer.sleep` 是 nil——等待一律用 `os.sleep(n)`（第 19 条）。
+    - `computer.shutdown(true)` 是远程重启杠杆（`boot.lua:15-22` →
+      `machine.lua:1408`），可脱困被前台守护占死的 console——**前提是已有
+      autostart**（rc 服务，第 16 条），否则重启后无通道、须人工介入（第 20 条）。
+    - **绝不在 console 前台起长驻守护**：OpenOS 无作业控制（无 `&`），守护主循环
+      永不返回，`shell.execute` 把子进程跑到完成 → console 被占死到重启。一律经
+      detached 线程启动器（`start_all.lua`）或 rc 服务拉起（第 21 条）。
+    - **两个守护 = 两个竞争原生 puller = winner-take-all 饿死**——这正是废弃 v5
+      所消除的。注意区分：竞争的是**原生** puller（普通进程）；`thread.create`
+      出的线程是**注册消费者**（consume-then-broadcast），不饿死兄弟线程（第 13 条）。
+    - **勿只改调用方端口变量起第二实例**：被加载的服务器脚本硬编码自己的 `PORT`
+      （`remote_host.lua:53` `PORT = 8100`），只改调用方变量会在**同端口**多起一个
+      实例（重复帧）。起第二实例必须替换服务器脚本的端口常量（`start_rh2.lua` 即
+      如此做，并断言替换恰好一次；第 22 条）。

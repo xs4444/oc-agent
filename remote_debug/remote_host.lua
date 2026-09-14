@@ -2,7 +2,9 @@
 -- 配套客户端: remote_client.lua (主控侧, v6 自动探测)
 -- 协议规范: docs/REMOTE_PROTOCOL.md §4
 --
--- 与 remote_debug.lua (v5.x, 端口 8001, 保留兼容) 的区别:
+-- 协议代际: v5 一次性协议 (remote_debug.lua / 端口 8001) 已于 2026-09-14
+--   整体退役 (它是本协议的严格子集, 且同机双守护会互抢事件) ——
+--   本文件是当前唯一守护。以下为相对 v5 的能力差异 (历史记录):
 --   - 消息 ID 多路复用: 信封 v6|<id>|<op>|<payload>, 每条回复回显 id,
 --     多个 op 可同时在飞 (对照 ssh 通道 ID; session.c:2344)
 --   - exec 流式: out/err 真流分离 (cmd > out 2> err), ≤7000B 分块
@@ -48,7 +50,7 @@ if not modemAddr then
   os.exit(1)
 end
 
-local PORT = 8100  -- 8001 = v5.x 兼容保留; 9090/9091/9092 = subagent
+local PORT = 8100  -- v6 唯一守护端口 (v5/8001 已退役; 9090/9091/9092 = subagent)
 component.invoke(modemAddr, "open", PORT)
 local isWireless = component.invoke(modemAddr, "isWireless")
 
