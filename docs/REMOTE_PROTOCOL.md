@@ -303,3 +303,27 @@ h:close()
     的"两条命令"）不可执行的原因。**正确做法**：一律经 detached 线程启动器
     （`remote_debug/start_all.lua`：`thread.create(fn):detach()` 后立即返回）
     或 rc 服务拉起；启动器本身在前台跑是安全的（它立即返回）。
+22. **双守护共存已真机验收通过（B4′ 架构定案）**（真机，2026-09-14）：
+    把 v5(8001) 与 v6(8100) 各作为 `thread.create(fn):detach()` 线程拉起后，
+    **两者互不饿死**：交替各 40 次 ping 得 **8001=40/40、8100=40/40**，
+    单条 ping 只收到 **1** 条回复（无重复守护）。这实证了第 13 条的模型
+    （线程=注册消费者，先消费后广播），也推翻了"第二个守护必饿死第一个"
+    的旧判断。
+    **autostart 落地**：`/etc/rc.d/remoted.lua` + `rc remoted enable`
+    （`/etc/rc.cfg` → `enabled = {"remoted"}`），另以 `/home/.shrc`
+    （内容 `lua /home/start_all.lua`）作二级保险；两者都靠 `start_all.lua`
+    的标记文件幂等，重复触发安全。
+    **泵的来源已确证**：不必有人打字——`boot/03_io.lua:14` 强制
+    `core_stdin.tty = true`，`lib/tty.lua:10` `blink=true`，故 shell 读输入时
+    `lib/core/cursor.lua:246` 以 `computer.pullSignal(.5)` **持续 park 原生泵**
+    （2Hz），线程守护的唤醒注册因此一直有人服务。第 16 条的"未验证一环"
+    至此**已验证**。
+    **重启验收**（`computer.shutdown(true)` 远程触发，见第 20 条）：重启后
+    8001 与 8100 **同时自动恢复**（各 5/5 ping，`pd=5.2.2`；v6 uptime 归零
+    重新计时），无重复守护，e2e **11/11 ALL GREEN**。
+    **注意**：`start_all.lua` 的幂等守卫依据**端口变量**判断，而守护自身的
+    监听端口由各自脚本内的常量决定（`remote_host.lua:51` `PORT = 8100`、
+    `remote_debug.lua:53` `PORT = 8001`）。故**不要**用"只改调用方端口变量"
+    的方式起第二个实例——实测那样会在原端口上多起一个同端口守护
+    （单条 ping 收到 2 条回复）。要起备用实例须同时替换被加载脚本的端口常量
+    （`start_rh2.lua` 即如此做，并断言替换恰好一次）。
