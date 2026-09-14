@@ -8,6 +8,12 @@
 主控机：`/home/remote_client.lua`（直接经 `tools/remote_server.py --lua`
 hex 分块写入 + 回读校验 + 现场 `loadfile`，2026-09-14 已部署）。
 
+## v6 状态
+
+v6 服务器（`remote_debug/remote_host.lua`，端口 8100）已实现、部署于机器人
+`/home/remote_host.lua`、真机验收通过（PASS 11/11，见 `docs/REMOTE_PROTOCOL.md`
+§4）。本 README 描述 Phase 1 客户端（v5.2，端口 8001）。
+
 ## 用法
 
 ```lua
@@ -35,14 +41,15 @@ h:close()
    事故：机器人没电 + os.clock = 探测线程永久挂起）。
 2. **无回复 = 显式 `offline=true`**，绝不返回 nil 让调用方猜（没电/超距
    对 modem 就是静默）。
-3. **exec 命令不得含 `|`**（v5.2 服务器会静默截断 → 库内显式报错；
-   v5.2.1 服务器取第一个 `|` 后原文，可解除）。
+3. **exec 管道守卫自适应**——命令含 `|` 时，仅当 `h:info()` 探测到
+   服务器 `pd=5.2.1+` 放行；版本未知/过旧显式报错（v5.2 服务器会在
+   第一个 `|` 处静默截断命令）。
 4. **write ≤6000B**（modem 单包 8192B，serialization+转义膨胀后须留余量）；
-   大文件 → v6 分块传输（Phase 2）。
+   大文件 → v6 分块传输（已实现，端口 8100）。
 5. 回复尾部 `...[TRUNCATED]`（服务器 REPLY_MAX=7680B 截断标记）→
    `truncated=true`。
 
 真机 e2e（2026-09-14，对 BeeMaster 机器人 84f13777-...）：
 ping/info/exec/write/read/delete/离线探测 全链路通过；delete 在软盘版
 升级前报 `attempt to call a nil value`（旧 OpenOS `fs.delete` 问题，
-v5.2.1 已修，待软盘摆渡）。
+v5.2.1 已修；软盘现为 v5.2.2，真机已验证 2026-09-14）。

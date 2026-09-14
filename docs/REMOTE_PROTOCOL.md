@@ -67,13 +67,21 @@
   库——包装现有 v5.2 一次性协议，提供结构化结果（`{ok, code, out, err,
   offline, truncated}`）+ 全墙钟超时 + 显式 `offline`。机器人侧不动（继续
   跑 v5.2）。**LLM 以后只写 `h:exec(...)`，不再现场发明 modem 框架代码。**
-- **Phase 2**：`remote_host.lua` 服务器（v6 协议）——消息 ID 多路复用、
+- **Phase 2（已完成 2026-09-14）**：`remote_host.lua` 服务器（v6 协议）——消息 ID 多路复用、
   流式 exec（out/err 分块）、分块文件传输 + 校验、keepalive、auth token。
   客户端获得真"ssh 化"体验（流式输出、大文件传输）。
+  v6.0 已实现、已部署、真机验收通过（PASS 11/11，§4）。
 - **Phase 3（可选）**：subagent 协议（9090/9091/9092，`src/agent/subagent.lua`）
   收编进 v6 channel，消掉两套并行 modem 协议。
 
-## 4. v6 协议规范（Phase 2 目标，先定稿防返工）
+## 4. v6 协议规范（v6.0 已实现 + 真机验收通过）
+
+状态（真机，2026-09-14）：v6.0 已实现（`remote_debug/remote_host.lua`，
+16164 字节，与部署的 `/home/remote_host.lua` 逐字节一致）、已部署、已验收——
+`/home/e2e_v6.lua` 报告 `PASS 11/11 | ALL GREEN`（T1 ping、T2 info pd=6.0、
+T3 exec 简单、T4 exec 大输出、T5 exec 管道、T6 exec 失败、T7 write+read 小、
+T8 write+read 大（50KB）、T9 delete、T10 offline、T11 cancel）。以下规范与
+实现一致；唯一偏差是 `info` 的 `oc=` 字段（见下）。
 
 - **端口 8100**（8001=v5.x 保留兼容；9090/9091/9092=subagent）。
 - **信封**：纯文本 `v6|<id>|<op>|<payload...>`；`id` = 客户端单调递增整数；
@@ -81,9 +89,10 @@
   v5.2 write（`\\`、`\|`）。
 - **ops**：
   - `ping` → `v6|id|pong|ok`
-  - `info` → `v6|id|info|ok|id=..|uptime=..|freeMem=..|totalMem=..|components=..|oc=<version>`
-    （`require("opencomputers").version()`——把 OC 版本写进 info，API 漂移
-    可诊断）
+  - `info` → `v6|id|info|ok|id=..|uptime=..|freeMem=..|totalMem=..|components=..|pd=6.0`
+    （实际实现 `remote_debug/remote_host.lua:353-365` `get_info_payload()`，
+    止于 `pd=6.0`，**无 `oc=` 字段**：`require("opencomputers")` 真机不可用
+    （`oc_require=false`），`oc=<version>` 未实现）
   - `exec|<cmd>` → 服务器跑 `cmd > /home/rh_out_<id> 2> /home/rh_err_<id>`
     （真流分离）→ 若干 `v6|id|exec_chunk|ok|out|<≤7000B>` +
     `v6|id|exec_chunk|ok|err|<≤7000B>` + 终帧
@@ -155,7 +164,7 @@ h:close()
 | 无回复 → 显式 `offline=true` | `serverloop.c:112` `client_alive_check()`：alive 超时次数 > `client_alive_count_max` → 断连；探测=全局请求 `keepalive@openssh.com`（server→client 方向） | ✓ 语义一致；方向相反（client→server）——OC 里两台机器都可能断电，需要的方向恰是客户端探服务器 |
 | `truncated=true`（服务器 7680B 截断） | ssh 全量流式，无截断 | OC 8192B 单包约束下的文档化扩展 |
 | write ≤6000B + 服务端解码校验 | scp/sarchive：按文件 size 校验（`scp.c` 进度/汇总按 `st_size` 计） | ✓ 同构（先声明 size、收满才落盘；坏载荷 → `err|decode failed`） |
-| 串行 request/response（无多路复用） | `channels.c` 单连接多通道（window/maxpack 按通道独立） | 已知限制 → v6 消息 ID（Phase 2） |
+| 串行 request/response（无多路复用） | `channels.c` 单连接多通道（window/maxpack 按通道独立） | 已知限制 → v6 消息 ID（已实现，§4） |
 | 运行中 exec 无 cancel | `signal` 通道请求 + `exit-signal`（`session.c:2350`） | 已知限制 → v6 `cancel|<id>`（§4）；Phase 1 超时的 exec 继续占机器人单核 |
 | 零认证 | `auth2.c` 恒认证 | 已知限制 → v6.1 auth token（当前按可信域使用，§4 已注） |
 | 迟到旧回复可能错配新 op | 通道 ID + 序号 | Phase 1 缓解：`drain_stale`（超时后下个 op 前排空 2s）；超 grace 仍会错配 → v6 根治 |
@@ -167,12 +176,17 @@ h:close()
 | 端口 | 用途 |
 |---|---|
 | 8001 | remote_debug v5.x（一次性 op 协议） |
-| 8100 | v6 remote_host（Phase 2） |
+| 8100 | v6 remote_host（已实现 + 真机验收，§4） |
 | 9090/9091/9092 | subagent（任务/回复/文件代理，Phase 3 收编） |
 
 部署路径：机器人侧文件走软盘摆渡（机器人无 modem 写自身能力之外的通道）；
 主控侧文件可直接经 `tools/remote_server.py --lua` 写入（hex 分块 + 回读校验 +
 现场 `loadfile`）。推真机的文件必须提交本仓库（AGENTS.md）。
+
+实际部署状态（真机，2026-09-14）：v6 服务器在机器人 `/home/remote_host.lua`
+（16164 字节，与本仓库 `remote_debug/remote_host.lua` 逐字节一致），**不在软盘**；
+软盘 `/mnt/3e9/remote_debug.lua` 是 v5.2.2（已验证），`/mnt/3e9/remote_host.lua`
+不存在。
 
 ## 8. OC 实测坑清单（append-only，写探针/客户端代码前过一遍）
 
@@ -201,3 +215,91 @@ h:close()
     真机实测：复现 pairs(comp)+table.sort 事故 → code=0 + out 带崩溃行 +
     空残留文件，三要素与事故 A 完全一致）。v5.2.2 的 2>&1 + 附输出正是
     为此存在——v5.0/v5.1 丢弃 stderr 时该崩溃行根本到不了主控侧。
+13. **事件抢占：抢的是"原生 puller"，不是"第二个事件循环"**（真机 + 源码，2026-09-14）：
+    机器级信号队列是单队列（`Machine.scala:372` `popSignal()` 做 `signals.dequeue()`），
+    一个信号只被一个消费者取出。多个**原生** `event.pull`（普通进程：v5 守护、
+    前台 `lua`）互相抢占 → **winner-take-all，非 ~50/50**（实测 port-8001 守护
+    0/40、port-8100 守护 40/40，两端口同时 `isOpen=true`）。
+    **`thread.create` 出的线程是"注册消费者"而非原生 puller**：其 `event.pull`
+    是注册进 handlers 表的一次性唤醒处理器（`lib/thread.lua:209-218` `mt.register`），
+    由执行原生 pull 的一方代为服务；分发"先消费后广播"（`lib/event.lua:54` 唯一
+    消费，`event.lua:57-79` 同一 event_data 触发所有匹配 handler）→ **两个 thread
+    守护互不饿死，各自都收到事件**（官方文档：注册 handler "unaffected by signal
+    robbers"）。
+    实测 0/40 的精确机制：卡死的 `start_rh.lua` 停在 `waitForDeath` 的无过滤
+    `event.pull(deadline-uptime)`（`lib/thread.lua:41`），充当机器唯一原生泵 →
+    消费并丢弃 8001 流量（无 v5 handler 匹配），**同时仍分发 ROOT handler 表**
+    ——这正是 v6 thread 守护仍 40/40 的原因（v5 死 v6 活，非"两者对称竞争"）。
+    端口不隔离信号队列：`openPorts` 是组件字段（`NetworkCard.scala:39`，机器级
+    非进程级），端口只是接收过滤器（`NetworkCard.scala:150-158`）；`close()` 无参
+    关全部端口，重启后端口清空须由守护重开——但两个 thread 守护在不同端口仍
+    共存（注册消费者）。
+14. **`thread.create` 出的守护不随创建者进程退出而存活**（真机 + 源码，2026-09-14）：
+    父进程在 `join` 里永久阻塞（`lib/thread.lua:121` `self.close = self.join`；
+    timeout `math.huge` 见 `thread.lua:13,94-96`；teardown 循环 `lib/process.lua:140-145`）
+    ——创建者线程存活时父进程无法退出。故 v6 重启后消失（实测：重启后 port 8100
+    CLOSED `isOpen(8100)=false` 而 8001 开且健康——v6 根本没在跑）。
+    **修法 `t:detach()`**（`lib/thread.lua:102-104` → `attach(init_thread)`）：把句柄
+    重挂到不朽的根 `/init.lua` 进程（`init.lua:17-26`），父进程可退出且线程存活到
+    重启。
+    **关键细节：`detach()` 不仅为创建者存活，更为 handler 路由**——`thread.create`
+    给每个线程自己的私有 handler 集（`lib/thread.lua:206-207`
+    `mt.process.data.handlers = {}`）；`detach()` 把 `mt.attached` 重挂到 init 进程，
+    其 `data.handlers` **就是**共享 ROOT 表（`thread.lua:297`）。故由"本身是线程的
+    创建者"spawn 的守护若**不 detach**，其唤醒注册进瞬态私有集 → **守护生来即死
+    却仍打印健康启动横幅**。验证必须功能化（ping/exec），绝不看横幅。
+15. **守护线程未处理错误 = 静默死通道**（源码，2026-09-14）：线程体里的未处理
+    错误不会拖垮 init 进程或整机——`os.exit` 在 OpenOS 是纯 Lua 错误
+    （`lib/core/full_filesystem.lua:349-350` `error({reason="terminated", code=code}, 0)`），
+    被 pipe/dispatch 路径捕获（`thread.lua:157-192`、`pipe.lua:28-42`），分发器对每个
+    回调都 `pcall`（`event.lua:72-74`）→ 记入 `/tmp/event.log`。真实危害是**服务
+    停止应答且无明显症状**（静默死通道）。实践：每个线程体都 pcall 包裹；
+    `/tmp/event.log` 是事后取证源。
+16. **v6 无可用 autostart；正确机制是 rc 服务**（真机 + 源码，2026-09-14）：
+    当前 `/home/.shrc` 是空文件，v6 重启后不自动起。本平台正确机制 = **rc 服务**：
+    `/etc/rc.d/<name>.lua` 里定义全局 `function start()`，`rc <name> enable` 启用，
+    由 `boot/89_rc.lua` 在 `init` 信号驱动 → `/bin/rc.lua`（配置 `/etc/rc.cfg`）。
+    关键性质：**每次启动恰好跑一次**（区别于 `.shrc`/autorun）；**headless 安全**
+    （无 shell/gpu/screen/keyboard 也起）；`start()` **必须尽快返回**——它在单一
+    init 进程内执行，阻塞循环会卡住启动、shell 重生循环和所有其他进程。
+    对照 `.shrc`：仅从交互分支 source（`bin/sh.lua:10-18` → `etc/profile.lua:41-43`），
+    每次启动可能跑多次——不是可行的启动钩子。
+    **未验证一环**：无人输入的机器人上，shell 的输入等待是否真的 park 一个原生
+    pull（那个 parked pull 正是 thread 守护依赖的泵）——标记未验证，勿断言。
+17. **`computer.sleep` 在机器人和游戏机上都是 NIL**（真机，2026-09-14）：
+    `computer.sleep=nil`，`computer.uptime` 是函数。任何等待必须用墙钟循环
+    `computer.uptime()` + `event.pull(0.1)`。
+18. **`fs.spaceTotal` 在本 OpenOS 构建不存在**（真机，2026-09-14）：调用
+    `filesystem.spaceTotal(...)` 抛 `attempt to call a nil value (field 'spaceTotal')`。
+    `fs.spaceUsed`、`fs.move` 同样**不存在**（真机实测 `nil`）；存在的是
+    `fs.copy`/`fs.rename`/`fs.exists`/`fs.get`。无 `fs.move` → 需流式拷贝
+    （`remote_host.lua` 已如此实现）。
+19. **`os.sleep` 存在且可用——修正第 17 条的读法**（真机 + 源码，2026-09-14）：
+    第 17 条说"任何等待必须用墙钟循环"易被误读为必须手写循环。实测
+    `os.sleep(1)` 精确等待 1.00s（`os.sleep_ok=true`）；源码
+    `boot/02_os.lua:25-31` 的实现**正是**墙钟 + `event.pull`
+    （`local deadline = computer.uptime() + timeout; repeat event.pull(...)
+    until computer.uptime() >= deadline`）——即它已经是"让出式墙钟等待"。
+    **结论：`computer.sleep` 是 nil，但 `os.sleep` 可用且等价于推荐的墙钟写法**；
+    直接 `os.sleep(n)` 即可，不必手写循环。注意它内部走 `event.pull`，
+    因此与其它原生 puller 同样存在抢占（第 13 条）。
+20. **`computer.shutdown(reboot)` 是远程重启杠杆**（源码 + 真机，2026-09-14）：
+    机器人上 `computer.shutdown` 存在（`boot.lua:15-22` 包装 → `machine.lua:1408`
+    `coroutine.yield(not not reboot)`）；传真值即**重启**。真机 `component.methods`
+    的 computer 全表为 `beep,getDeviceInfo,getProgramLocations,isRunning,start,stop`
+    （**无** `stop`/`isRunning` 的 Lua 直通，但 `shutdown` 由 OpenOS 层提供）。
+    **用途**：当机器人 console 已被前台守护占死（见第 21 条）而 modem 通道仍活时，
+    可经远控触发重启脱困——**前提是机器人已有可用的 autostart**（rc 服务，
+    第 16 条），否则重启后无通道，须人工 console 介入。
+21. **前台启动常驻守护 = console 被占死到重启**（源码，2026-09-14）：
+    OpenOS shell **无作业控制**（无 `&` 后台符，`full_sh.lua`/`sh.lua` 无 job
+    control）；守护主循环 `while true do event.pull(0.5) ... end`
+    （`remote_debug.lua:193`，仅 `"interrupted"` 退出）**永不返回**；而
+    `shell.execute` 把子进程跑到结束（`lib/core/full_shell.lua:13-14`
+    → `process.internal.continue`）。
+    **故**：在 console 前台跑 `lua /mnt/3e9/remote_debug.lua` 或
+    `lua /home/remote_host.lua` 会**永久占住 console**，操作员再也拿不到提示符
+    ——这正是当前活体状态 console 阻塞的成因，也是历史恢复流程（交接文档 §8
+    的"两条命令"）不可执行的原因。**正确做法**：一律经 detached 线程启动器
+    （`remote_debug/start_all.lua`：`thread.create(fn):detach()` 后立即返回）
+    或 rc 服务拉起；启动器本身在前台跑是安全的（它立即返回）。
