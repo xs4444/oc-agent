@@ -1,4 +1,4 @@
--- remote_debug.lua v5.2 — 纯文本协议 (避免 JSON 解析 bug)
+-- remote_debug.lua v5.2.1 — 纯文本协议 (避免 JSON 解析 bug)
 -- 运行在目标设备上, 通过 modem 接收主控机的调试指令并返回结果
 -- 协议格式 (纯文本, 用 | 分隔):
 --   请求: op|param1|param2
@@ -27,6 +27,9 @@
 --   - exec 追加 "2>&1" 捕获 stderr —— 脚本崩溃信息此前被吞 (只重定向
 --     stdout), 主控侧只能看到 "EXEC: ok|" 空载荷, 永远不知道远端脚本
 --     为什么没产出数据。
+-- v5.2.1: exec 命令体取第一个 '|' 之后的原文 —— 旧版 split_unescaped
+--   重切后只取 parts[2], 命令含 shell 管道 '|' 时第一个 '|' 之后的内容
+--   静默丢失 (ls | grep x → 只跑 ls)。read/write/delete 不受影响。
 
 local component = require("component")
 local event = require("event")
@@ -47,7 +50,7 @@ end
 local PORT = 8001
 component.invoke(modemAddr, "open", PORT)
 local isWireless = component.invoke(modemAddr, "isWireless")
-print("Remote Debug v5.2: " .. (isWireless and "wireless" or "wired"))
+print("Remote Debug v5.2.1: " .. (isWireless and "wireless" or "wired"))
 print("Addr: " .. modemAddr)
 print("Port " .. PORT .. " open: " .. tostring(component.invoke(modemAddr, "isOpen", PORT)))
 print("Waiting for commands... (Ctrl+C to stop)")
@@ -213,7 +216,11 @@ while true do
       elseif op == "info" then
         reply = get_info()
       elseif op == "exec" then
-        reply = exec_cmd(parts[2] or "")
+        -- v5.2.1: 命令体取第一个 '|' 之后的原文 (不再用 split_unescaped 重切):
+        -- 命令含 shell 管道 '|' 时旧版只取 parts[2] → 第一个 '|' 后的内容静默
+        -- 丢失。第一个 '|' 必为分隔符 (客户端恒以 "exec|" 前缀发送)。
+        local raw = data:sub(6)  -- 剥掉 "exec|" (5 字符)
+        reply = exec_cmd(raw or "")
       elseif op == "read" then
         reply = read_file(parts[2] or "")
       elseif op == "write" then
