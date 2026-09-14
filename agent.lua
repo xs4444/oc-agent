@@ -3004,7 +3004,13 @@ local function build_system_prompt()
     .. "1. `components` (or `components <type>`) to list connected components; `components -l` also shows each component's methods and one-line docs\n"
     .. "2. `man <component-type>` or the offline docs for method details\n"
     .. "3. Call a method: write_file a script (e.g. /tmp/c.lua) with `local r = component.invoke(\"<address>\", \"<method>\", <Lua literal args>)` and `io.open(\"/tmp/c_out.txt\",\"w\"):write(tostring(r))`, then `lua /tmp/c.lua; cat /tmp/c_out.txt` (no lua -e; boolean/table args need real Lua — the shell can't carry them inline)\n\n"
-    .. "Current computer address: " .. tostring(address) .. "\n"
+    .. "REMOTE-CONTROL SCRIPTING (a peer computer over the modem — read this BEFORE writing any modem/Lua probe):\n"
+    .. "Use the ready-made client library instead of hand-rolling packet code: `local remote = dofile(\"/home/remote_client.lua\")` then `remote.connect(addr, {modem=<your modem addr>, port=8100})` gives you h:ping()/info()/exec()/read()/write()/delete()/cancel(). Each returns a table {ok=..., out=..., err=..., offline=...}. Hand-written send+recv loops are the #1 cause of hung probes.\n"
+    .. "!!! NEVER use `os.clock()` as a timeout/deadline. It measures CPU time, and a thread parked in event.pull does not consume CPU — so the clock FREEZES and any `while os.clock() < deadline` loop NEVER EXITS (measured: 0.047s of os.clock over 15s of wall time; an 8s timeout ran 75s+ and had to be hard-capped). This exact bug has caused repeated outages. ALWAYS use the wall clock: `local computer = require(\"computer\"); local deadline = computer.uptime() + timeout; while computer.uptime() < deadline do event.pull(0.25) end`.\n"
+    .. "Waiting: `os.sleep(n)` EXISTS and is a proper yielding wall-clock wait (it needs require nothing; it is not the same as computer.sleep, which is nil on OpenOS). Use `os.sleep(n)` — do not hand-roll sleep loops.\n"
+    .. "Ports: the only remote-control port is 8100 (the v6 protocol). Port 8001 and the old v5 `remote_debug.lua` are RETIRED and deleted — sending to 8001 gets zero replies forever. Do not write probes against 8001.\n"
+    .. "Timeouts: shell_execute kills a command at its timeout and does NOT return the partial output captured so far — a timing-out probe therefore yields no evidence at all. Make remote probes bail out fast, write progress to a file with `io.open`/`:flush()` as they go, and `cat` that file separately so a timeout still leaves you a clue.\n"
+    .. "Diagnosing a silent peer: an empty reply is ambiguous (powered off / out of range / crashed / not listening). retrying the identical command cannot disambiguate it — change the probe (different port, different address, check your own modem with `components`) or ask the user. Repeated identical retries get killed by the loop guard anyway.\n\n"    .. "Current computer address: " .. tostring(address) .. "\n"
   return CACHED_SYSTEM_PROMPT
 end
 
@@ -7898,9 +7904,16 @@ local GUARDS = {
   {pat = "^%s*curl", hint = "curl: not available in OpenOS. OpenOS has `wget <url> [-O file]` for HTTP; or use web_search for web info."},
 }
 
--- 护栏: 返回 nil + 错误信息 = 拒绝; 返回 true = 放行。
--- 裸 lua/luac（无参数或仅行尾注释）= 交互式 REPL，永久阻塞等 stdin。
--- 注: `(组)?` 可选捕获组合在此环境不可靠，先剥离行尾注释再匹配。
+-- 已退役的 v5 远控端口 (8001)。v5 (remote_debug.lua) 已删除, 该端口永不
+-- 应答 —— 命中此模式的命令会永久静默, 是"对端无响应"误判的高频来源。
+-- 只拦"显式打到 8001"的字面量, 不误伤其它含 8001 的数字。
+local RETIRED_PORT_HINT = "port 8001 is RETIRED (the v5 remote_debug.lua daemon was deleted) "
+  .. "and will never reply — probing it just hangs. The live remote-control port is 8100 "
+  .. "(v6). Use the client library instead of hand-written modem code: "
+  .. "`local remote = dofile(\"/home/remote_client.lua\")` then "
+  .. "`remote.connect(<modem addr>, {modem=<your modem addr>, port=8100})`. "
+  .. "Also: NEVER use os.clock() as a timeout (it freezes while event.pull waits) — use computer.uptime()."
+
 local function guard_command(cmd)
   if type(cmd) ~= "string" then return nil, "command must be a string" end
   local stripped = cmd:gsub("%s*#.*$", "")
@@ -7913,6 +7926,10 @@ local function guard_command(cmd)
         return nil, "rejected by guard: " .. g.hint .. " (command: " .. cmd:sub(1, 120) .. ")"
       end
     end
+  end
+  -- 退役端口: 匹配 `8001` 前后为非数字边界 (避免命中 18001 等)
+  if cmd:match("%f[%d]8001%f[%D]") then
+    return nil, "rejected by guard: " .. RETIRED_PORT_HINT .. " (command: " .. cmd:sub(1, 120) .. ")"
   end
   return true
 end
@@ -7961,14 +7978,24 @@ local function exec(name, args, deps)
       local sh = require("shell")
       local done = false
       local out, out_err = nil, false
+      -- 增量缓冲: 句柄是闭包 upvalue, 子线程被 kill 后父线程仍能读到已累积
+      -- 的内容 (若只在读完 EOF 才赋值 out, 超时被杀时 out 恒为 nil → 丢失
+      -- 全部证据)。分块读而非 read("*a"), 才能让部分输出"提前可见"。
+      local buf = {}
       local t = thread.create(function()
         local okc, res, res_err = pcall(function()
           -- Capture stdout+stderr via io.popen instead of shell.execute
           -- (shell.execute returns only exit status, not output)
           local handle = io.popen(args.command .. " 2>&1")
           if not handle then return "Error: failed to execute command", true end
-          local output = handle:read("*a")
+          local CHUNK = 512
+          while true do
+            local chunk = handle:read(CHUNK)
+            if chunk == nil or chunk == "" then break end
+            buf[#buf + 1] = chunk
+          end
           handle:close()
+          local output = table.concat(buf)
           return (output ~= "" and output or "(no output)"), false
         end)
         if okc then
@@ -7981,7 +8008,14 @@ local function exec(name, args, deps)
       local wok, werr = thread.waitForAll({t}, timeout)
       if not wok then
         pcall(t.kill, t)
-        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command), true
+        -- 超时不丢证据: 被杀命令此前累积的部分输出往往是唯一诊断线索
+        -- (实证: 远端探针挂死时 agent 只看到"超时"三字、无任何判据 →
+        --  误判"对端无响应"并重复重试同一命令, 直至撞循环护栏)。
+        local partial = table.concat(buf)
+        return "shell_execute timeout after " .. timeout .. "s (command killed): "
+          .. tostring(args.command)
+          .. (partial ~= "" and ("\n--- partial output before kill ---\n" .. partial)
+                            or "\n(no output was captured before the kill)"), true
       end
       return (out or "(no output)"), out_err
     end)

@@ -32,9 +32,16 @@ local GUARDS = {
   {pat = "^%s*curl", hint = "curl: not available in OpenOS. OpenOS has `wget <url> [-O file]` for HTTP; or use web_search for web info."},
 }
 
--- 护栏: 返回 nil + 错误信息 = 拒绝; 返回 true = 放行。
--- 裸 lua/luac（无参数或仅行尾注释）= 交互式 REPL，永久阻塞等 stdin。
--- 注: `(组)?` 可选捕获组合在此环境不可靠，先剥离行尾注释再匹配。
+-- 已退役的 v5 远控端口 (8001)。v5 (remote_debug.lua) 已删除, 该端口永不
+-- 应答 —— 命中此模式的命令会永久静默, 是"对端无响应"误判的高频来源。
+-- 只拦"显式打到 8001"的字面量, 不误伤其它含 8001 的数字。
+local RETIRED_PORT_HINT = "port 8001 is RETIRED (the v5 remote_debug.lua daemon was deleted) "
+  .. "and will never reply — probing it just hangs. The live remote-control port is 8100 "
+  .. "(v6). Use the client library instead of hand-written modem code: "
+  .. "`local remote = dofile(\"/home/remote_client.lua\")` then "
+  .. "`remote.connect(<modem addr>, {modem=<your modem addr>, port=8100})`. "
+  .. "Also: NEVER use os.clock() as a timeout (it freezes while event.pull waits) — use computer.uptime()."
+
 local function guard_command(cmd)
   if type(cmd) ~= "string" then return nil, "command must be a string" end
   local stripped = cmd:gsub("%s*#.*$", "")
@@ -47,6 +54,10 @@ local function guard_command(cmd)
         return nil, "rejected by guard: " .. g.hint .. " (command: " .. cmd:sub(1, 120) .. ")"
       end
     end
+  end
+  -- 退役端口: 匹配 `8001` 前后为非数字边界 (避免命中 18001 等)
+  if cmd:match("%f[%d]8001%f[%D]") then
+    return nil, "rejected by guard: " .. RETIRED_PORT_HINT .. " (command: " .. cmd:sub(1, 120) .. ")"
   end
   return true
 end
@@ -95,14 +106,24 @@ local function exec(name, args, deps)
       local sh = require("shell")
       local done = false
       local out, out_err = nil, false
+      -- 增量缓冲: 句柄是闭包 upvalue, 子线程被 kill 后父线程仍能读到已累积
+      -- 的内容 (若只在读完 EOF 才赋值 out, 超时被杀时 out 恒为 nil → 丢失
+      -- 全部证据)。分块读而非 read("*a"), 才能让部分输出"提前可见"。
+      local buf = {}
       local t = thread.create(function()
         local okc, res, res_err = pcall(function()
           -- Capture stdout+stderr via io.popen instead of shell.execute
           -- (shell.execute returns only exit status, not output)
           local handle = io.popen(args.command .. " 2>&1")
           if not handle then return "Error: failed to execute command", true end
-          local output = handle:read("*a")
+          local CHUNK = 512
+          while true do
+            local chunk = handle:read(CHUNK)
+            if chunk == nil or chunk == "" then break end
+            buf[#buf + 1] = chunk
+          end
           handle:close()
+          local output = table.concat(buf)
           return (output ~= "" and output or "(no output)"), false
         end)
         if okc then
@@ -115,7 +136,14 @@ local function exec(name, args, deps)
       local wok, werr = thread.waitForAll({t}, timeout)
       if not wok then
         pcall(t.kill, t)
-        return "shell_execute timeout after " .. timeout .. "s (command killed): " .. tostring(args.command), true
+        -- 超时不丢证据: 被杀命令此前累积的部分输出往往是唯一诊断线索
+        -- (实证: 远端探针挂死时 agent 只看到"超时"三字、无任何判据 →
+        --  误判"对端无响应"并重复重试同一命令, 直至撞循环护栏)。
+        local partial = table.concat(buf)
+        return "shell_execute timeout after " .. timeout .. "s (command killed): "
+          .. tostring(args.command)
+          .. (partial ~= "" and ("\n--- partial output before kill ---\n" .. partial)
+                            or "\n(no output was captured before the kill)"), true
       end
       return (out or "(no output)"), out_err
     end)

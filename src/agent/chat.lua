@@ -103,7 +103,13 @@ local function build_system_prompt()
     .. "1. `components` (or `components <type>`) to list connected components; `components -l` also shows each component's methods and one-line docs\n"
     .. "2. `man <component-type>` or the offline docs for method details\n"
     .. "3. Call a method: write_file a script (e.g. /tmp/c.lua) with `local r = component.invoke(\"<address>\", \"<method>\", <Lua literal args>)` and `io.open(\"/tmp/c_out.txt\",\"w\"):write(tostring(r))`, then `lua /tmp/c.lua; cat /tmp/c_out.txt` (no lua -e; boolean/table args need real Lua — the shell can't carry them inline)\n\n"
-    .. "Current computer address: " .. tostring(address) .. "\n"
+    .. "REMOTE-CONTROL SCRIPTING (a peer computer over the modem — read this BEFORE writing any modem/Lua probe):\n"
+    .. "Use the ready-made client library instead of hand-rolling packet code: `local remote = dofile(\"/home/remote_client.lua\")` then `remote.connect(addr, {modem=<your modem addr>, port=8100})` gives you h:ping()/info()/exec()/read()/write()/delete()/cancel(). Each returns a table {ok=..., out=..., err=..., offline=...}. Hand-written send+recv loops are the #1 cause of hung probes.\n"
+    .. "!!! NEVER use `os.clock()` as a timeout/deadline. It measures CPU time, and a thread parked in event.pull does not consume CPU — so the clock FREEZES and any `while os.clock() < deadline` loop NEVER EXITS (measured: 0.047s of os.clock over 15s of wall time; an 8s timeout ran 75s+ and had to be hard-capped). This exact bug has caused repeated outages. ALWAYS use the wall clock: `local computer = require(\"computer\"); local deadline = computer.uptime() + timeout; while computer.uptime() < deadline do event.pull(0.25) end`.\n"
+    .. "Waiting: `os.sleep(n)` EXISTS and is a proper yielding wall-clock wait (it needs require nothing; it is not the same as computer.sleep, which is nil on OpenOS). Use `os.sleep(n)` — do not hand-roll sleep loops.\n"
+    .. "Ports: the only remote-control port is 8100 (the v6 protocol). Port 8001 and the old v5 `remote_debug.lua` are RETIRED and deleted — sending to 8001 gets zero replies forever. Do not write probes against 8001.\n"
+    .. "Timeouts: shell_execute kills a command at its timeout and does NOT return the partial output captured so far — a timing-out probe therefore yields no evidence at all. Make remote probes bail out fast, write progress to a file with `io.open`/`:flush()` as they go, and `cat` that file separately so a timeout still leaves you a clue.\n"
+    .. "Diagnosing a silent peer: an empty reply is ambiguous (powered off / out of range / crashed / not listening). retrying the identical command cannot disambiguate it — change the probe (different port, different address, check your own modem with `components`) or ask the user. Repeated identical retries get killed by the loop guard anyway.\n\n"    .. "Current computer address: " .. tostring(address) .. "\n"
   return CACHED_SYSTEM_PROMPT
 end
 
