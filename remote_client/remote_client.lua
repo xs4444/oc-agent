@@ -15,7 +15,7 @@
 --   else print(r.out) end
 --   h:close()
 --
--- 硬规则（docs/REMOTE_PROTOCOL.md §7 实证坑清单）:
+-- 硬规则（docs/REMOTE_PROTOCOL.md §8 实证坑清单）:
 --   1. 所有 deadline 用 computer.uptime()（墙钟）。os.clock 是 CPU 时间，
 --      等回复时线程挂起、CPU 时间不走 → deadline 永不触发（2026-09-14
 --      c110 事故: 机器人没电 + os.clock deadline = 探测线程永久挂起）。
@@ -68,10 +68,31 @@ local function recv_reply(h, timeout)
   return nil
 end
 
+-- 排空迟到回复: 上一 op 超时（_stale）后，服务器可能只是"慢"而非离线——
+-- 旧回复稍后到达会被下一个 op 的 recv_reply 误当成本 op 的回复（错配）。
+-- ssh 用通道 ID 根治，v6 消息 ID 同理；Phase 1 一次性协议无 ID，发送前
+-- 先排空 grace 秒内的滞留消息。残余风险: 迟到超过 grace 的旧回复仍会
+-- 错配（v6 才彻底解决）。
+local function drain_stale(h, grace)
+  local event = require("event")
+  local computer = require("computer")
+  local deadline = computer.uptime() + (grace or 2)
+  while computer.uptime() < deadline do
+    local sig = { event.pull(0.1) }
+    if sig[1] == "modem_message" and sig[3] == h.addr and sig[4] == h.port then
+      -- 滞留的旧回复, 丢弃
+    end
+  end
+  h._stale = false
+end
+
 -- 发一条 op 请求并等回复。返回 data | nil,"offline" | nil,其他错误
 local function send_op(h, req, timeout)
   if h.closed then
     return nil, "handle closed"
+  end
+  if h._stale then
+    drain_stale(h)
   end
   local comp = require("component")
   local ok_send, send_err = pcall(comp.invoke, h.modem, "send", h.addr, h.port, req)
@@ -81,6 +102,7 @@ local function send_op(h, req, timeout)
   local data = recv_reply(h, timeout)
   if data == nil then
     h._alive = false
+    h._stale = true
     return nil, "offline"
   end
   h._alive = true
@@ -153,6 +175,7 @@ function M.connect(remote_addr, opts)
     ping_timeout = opts.ping_timeout or 5,
     _alive = nil,  -- 第一次有回复后 true; 超时后 false（实例字段遮蔽同名方法
     -- → 必须带下划线前缀，否则第一次 op 后 h:alive() 变成 call boolean）
+    _stale = false,  -- 上一 op 超时后为 true → 下一个 op 前先排空滞留旧回复
     closed = false,
   }
   setmetatable(h, { __index = M_h })

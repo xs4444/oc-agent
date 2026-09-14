@@ -1,4 +1,4 @@
--- remote_debug.lua v5.2.1 — 纯文本协议 (避免 JSON 解析 bug)
+-- remote_debug.lua v5.2.2 — 纯文本协议 (避免 JSON 解析 bug)
 -- 运行在目标设备上, 通过 modem 接收主控机的调试指令并返回结果
 -- 协议格式 (纯文本, 用 | 分隔):
 --   请求: op|param1|param2
@@ -30,6 +30,9 @@
 -- v5.2.1: exec 命令体取第一个 '|' 之后的原文 —— 旧版 split_unescaped
 --   重切后只取 parts[2], 命令含 shell 管道 '|' 时第一个 '|' 之后的内容
 --   静默丢失 (ls | grep x → 只跑 ls)。read/write/delete 不受影响。
+-- v5.2.2: exec 失败时附上已捕获的输出 —— 旧版失败只回 "exec failed: nil",
+--   2>&1 已捕获的 stderr (ls 报错/脚本崩溃行) 被丢弃。对照 ssh: 流数据
+--   先于 exit-status 帧到达 (session.c:2344)。
 
 local component = require("component")
 local event = require("event")
@@ -50,7 +53,7 @@ end
 local PORT = 8001
 component.invoke(modemAddr, "open", PORT)
 local isWireless = component.invoke(modemAddr, "isWireless")
-print("Remote Debug v5.2.1: " .. (isWireless and "wireless" or "wired"))
+print("Remote Debug v5.2.2: " .. (isWireless and "wireless" or "wired"))
 print("Addr: " .. modemAddr)
 print("Port " .. PORT .. " open: " .. tostring(component.invoke(modemAddr, "isOpen", PORT)))
 print("Waiting for commands... (Ctrl+C to stop)")
@@ -85,14 +88,22 @@ local function exec_cmd(cmd)
       error("exec failed: " .. tostring(err2))
     end
     local f = io.open(outpath, "r")
-    if not f then
-      -- 重定向文件打不开 (如目录文件数上限) —— 与"命令无输出"区分
-      error("exec redirect failed: cannot open " .. outpath)
-    end
-    local content = f:read("*a")
-    f:close()
+    local content = f and f:read("*a") or ""
+    if f then f:close() end
     local fs = require("filesystem")
     pcall(fs.remove or fs.delete, outpath)  -- 新版 OpenOS 是 fs.remove (旧版 fs.delete)
+    if not ok2 then
+      -- v5.2.2: 失败时附上已捕获的输出 (对照 ssh: 流数据先于 exit-status
+      -- 帧到达, session.c:2344 —— 旧版只回 "exec failed: nil", 已捕获的
+      -- stderr (ls 报错/脚本崩溃行) 被丢弃, 主控侧仍看不到失败原因。
+      -- 实测: T2_EXEC_FAIL ls 不存在的目录 → "exec failed: nil")
+      error("exec failed: " .. tostring(err2)
+        .. (content ~= "" and (" | output: " .. content) or ""))
+    end
+    if not f then
+      -- 命令成功但重定向文件打不开 (如目录文件数上限) —— 与"命令无输出"区分
+      error("exec redirect failed: cannot open " .. outpath)
+    end
     if #content == 0 then
       return "(no output)"
     end

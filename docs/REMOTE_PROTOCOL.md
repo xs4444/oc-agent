@@ -79,6 +79,10 @@
     `v6|id|write_done|ok|remote: <n> bytes written to <path>`；缺口/超时 →
     删临时文件 + `v6|id|write_done|err|write aborted (incomplete)`
   - `delete|<path>` → `v6|id|delete|ok|remote: deleted <path>`
+  - `cancel|<id>` → 服务器杀掉指定 id 的 exec 线程（thread.kill）+ 清理
+    临时文件，回 `v6|<id>|cancel|ok|cancelled`（对照 ssh `signal` 通道
+    请求 + `exit-signal` 帧，`session.c:2350`——Phase 1 无 cancel，超时
+    的 exec 会占住机器人单核继续跑）
 - **并发上限**：同时 4 个文件传输（1MB RAM 约束）。
 - **auth（v6.1）**：连接后首条 `v6|0|auth|<token>`；token 存服务器文件头部
   常量（空=关闭，启动时打印告警）。当前协议零认证——modem 覆盖范围内任何
@@ -112,8 +116,30 @@ h:close()
 规则：所有等待 = `event.pull(0.25)` 循环 + `computer.uptime()` deadline
 （**禁用 `os.clock()`**）；无回复 → `offline=true`（显式，不是 nil）；
 回复尾部 `...[TRUNCATED]`（v5.2 REPLY_MAX 标记）→ `truncated=true`。
+超时后的下一个 op 先排空 2s 内滞留的旧回复（`drain_stale`——一次性协议
+无消息 ID，迟到的旧回复会被误配给新 op；ssh 用通道 ID 序号根治，v6
+同理）。
 
-## 6. 端口与部署
+## 6. Phase 1 已知限制（2026-09-14 对照 OpenSSH 源码逐条核对）
+
+核对基准：`repos/openssh-portable`（openssh/openssh-portable 浅克隆，
+2026-09-14）。
+
+| Phase 1 行为 | ssh 对应（源码位置） | 结论 |
+|---|---|---|
+| exec 终态 `code=0|1` | `session.c:2344` `exit-status` 通道请求（u32 exit code）；信号终止走独立 `exit-signal` 帧（`session.c:2350`，含信号名/coredump/备注） | ✓ 正确简化：OC 无真 exit code/信号，0/1 + err 终帧覆盖 exit-status 与 exit-signal 两帧的语义 |
+| exec 失败附已捕获输出（v5.2.2 服务器，待软盘摆渡） | ssh 流数据先于 exit-status 帧到达（`session.c:2344` 之前的 channel data 帧） | ✓ `err\|exec failed: <err> \| output: <2>&1 捕获内容>`，客户端透传为 `r.err`——此前失败只回 `exec failed: nil`，崩溃行被丢弃 |
+| 无回复 → 显式 `offline=true` | `serverloop.c:112` `client_alive_check()`：alive 超时次数 > `client_alive_count_max` → 断连；探测=全局请求 `keepalive@openssh.com`（server→client 方向） | ✓ 语义一致；方向相反（client→server）——OC 里两台机器都可能断电，需要的方向恰是客户端探服务器 |
+| `truncated=true`（服务器 7680B 截断） | ssh 全量流式，无截断 | OC 8192B 单包约束下的文档化扩展 |
+| write ≤6000B + 服务端解码校验 | scp/sarchive：按文件 size 校验（`scp.c` 进度/汇总按 `st_size` 计） | ✓ 同构（先声明 size、收满才落盘；坏载荷 → `err|decode failed`） |
+| 串行 request/response（无多路复用） | `channels.c` 单连接多通道（window/maxpack 按通道独立） | 已知限制 → v6 消息 ID（Phase 2） |
+| 运行中 exec 无 cancel | `signal` 通道请求 + `exit-signal`（`session.c:2350`） | 已知限制 → v6 `cancel|<id>`（§4）；Phase 1 超时的 exec 继续占机器人单核 |
+| 零认证 | `auth2.c` 恒认证 | 已知限制 → v6.1 auth token（当前按可信域使用，§4 已注） |
+| 迟到旧回复可能错配新 op | 通道 ID + 序号 | Phase 1 缓解：`drain_stale`（超时后下个 op 前排空 2s）；超 grace 仍会错配 → v6 根治 |
+| exec 输出合流（`2>&1`） | ssh stdout/stderr 双流独立传回 | Phase 1 目的是捕获崩溃信息（v5.2.1 `2>&1`）；真流分离 = v6 `2> file` 双文件 |
+| 大输出截断而非流式回传 | ssh 边产生边传（窗口流控） | v6 `exec_chunk*` 流式（§4） |
+
+## 7. 端口与部署
 
 | 端口 | 用途 |
 |---|---|
@@ -125,7 +151,7 @@ h:close()
 主控侧文件可直接经 `tools/remote_server.py --lua` 写入（hex 分块 + 回读校验 +
 现场 `loadfile`）。推真机的文件必须提交本仓库（AGENTS.md）。
 
-## 7. OC 实测坑清单（append-only，写探针/客户端代码前过一遍）
+## 8. OC 实测坑清单（append-only，写探针/客户端代码前过一遍）
 
 1. `os.clock()` 做 deadline → 等待期间 CPU 时间不走 → 永不触发。用
    `computer.uptime()`（墙钟）。
