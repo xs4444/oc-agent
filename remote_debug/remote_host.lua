@@ -57,7 +57,17 @@ local isWireless = component.invoke(modemAddr, "isWireless")
 -- v6.1 auth: 对端首帧必须 auth|<token>; 空 = 关闭认证 (启动时打印告警)
 local AUTH_TOKEN = ""
 
-local CHUNK = 7000            -- 单帧载荷上限 (8192B 单包 - 信封余量)
+-- 分块上限 —— 必须按**转义后**的线长算, 不是原始字节数!
+--   escape() 最坏膨胀 2x (每个字节都可能是 | 或 \), 故:
+--     线上长度 = 2*CHUNK + 信封(约 34B) <= 8192 (modem 单包)
+--     -> CHUNK <= (8192-34)/2 ≈ 4079, 取 4000 留余量。
+--   实证 (2026-09-15): CHUNK=7000 时, 一个 7000 字节的 '|' 文件 read 回来
+--   只剩 3991 字节 (服务端仍报 size=7000) —— 转义后 14024B 超单包被静默截断;
+--   同一文件的纯 'a' 版本 7000B 完好。**纯 ASCII 也不例外**, 只要含 | 或 \。
+--   这与"非二进制模式"是两个独立成因, 症状相同(静默截断)。
+local CHUNK = 3800            -- 走线块的原始**字节**上限
+                              -- (escape 最坏 2x -> 线上 <= 7600 码元 + 信封,
+                              --  实测安全边界: 转义后 8001 码元 OK / 8021 截断)
 
 -- ⚠ 二进制安全 (2026-09-15 实证修复): 所有 io.open 一律带 "b" (rb/wb/ab)。
 --   OpenOS 的 buffer 按 mode.b 决定 f:read(n) 的 n 是**字节**还是**字符**
@@ -155,13 +165,21 @@ local function cleanup_file(path)
 end
 
 -- 无 fs.move 的流式 move (块拷贝 + 删源, RAM 峰值 ~14KB)
+-- 本地操作, 不走线, 故可继续用较大块 (转义约束不适用)
+local LOCAL_COPY_CHUNK = 7000
 local function move_file(src, dst)
   local inf = assert(io.open(src, "rb"))
   local outf = assert(io.open(dst, "wb"))
   while true do
-    local chunk = inf:read(CHUNK)
+    local chunk = inf:read(LOCAL_COPY_CHUNK)
     if not chunk then break end
-    outf:write(chunk)
+    -- 坑 #12: OpenOS 容量层空间不足时 f:write 返回 (nil,"not enough space")
+    -- **不抛错**; 不检查返回值 = 静默丢数据却报成功(实测 50400B 只落 42000B)。
+    local wr, werr = outf:write(chunk)
+    if wr == nil then
+      inf:close(); outf:close()
+      error("no space: " .. tostring(werr))
+    end
   end
   inf:close()
   outf:close()
@@ -314,8 +332,14 @@ local function handle_write_chunk(sender, id, payload)
     abort_write(key, w, "write aborted (cannot append to temp)")
     return
   end
-  f:write(data)
+  -- 坑 #12: 空间不足时 f:write 返回 (nil, "not enough space") 而不抛错。
+  -- 旧代码忽略返回值 -> 临时文件短于 w.size 却仍走到 move 并报成功。
+  local wr, werr = f:write(data)
   f:close()
+  if wr == nil then
+    abort_write(key, w, "write aborted (no space: " .. tostring(werr) .. ")")
+    return
+  end
   w.received = w.received + #data
   w.last_wall = computer_uptime()
   if w.received == w.size then

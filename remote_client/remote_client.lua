@@ -52,7 +52,11 @@
 local M = {}
 local M_h = {}  -- handle 方法表（__index）
 
-local V6_CHUNK = 7000           -- v6 单帧载荷 (modem 8192B 单包 - 信封余量)
+-- 分块上限必须按**转义后**线长算 (escape 最坏膨胀 2x):
+--   2*V6_CHUNK + 信封(约 34B) <= 8192  ->  V6_CHUNK <= 4079, 取 4000 留余量。
+-- 实证 (2026-09-15): 7000 字节的 '|' 经 write_chunk 发送, 服务端只收到 3991B。
+local V6_CHUNK = 3800           -- 原始**字节**上限; escape 最坏 2x -> 线上 <=7600 码元
+                               -- 实测安全边界: 转义后 8001 码元 OK / 8021 截断
 local V6_WRITE_MAX = 1048576    -- v6 单文件上限 (对齐服务器 MAX_WRITE_SIZE)
 local KEEPALIVE_INTERVAL = 10   -- s, 后台心跳周期
 local KEEPALIVE_MAX_MISSES = 3  -- 连续失帧 → _alive=false

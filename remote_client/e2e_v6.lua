@@ -150,6 +150,66 @@ do
   end
 end
 
+-- T12 转义透明: 全 '|' 文件 (escape 膨胀 -> 曾超单包被静默截断)
+do
+  local n = 7000
+  local mysum = 0
+  for i = 1, n do mysum = (mysum * 31 + 124) % 4294967296 end  -- 0x7C = '|'
+  local w = h:write("/home/e2e_pipes.txt", string.rep("|", n), 60)
+  local r = h:read("/home/e2e_pipes.txt", 60)
+  local got = r.ok and r.content or nil
+  local gsum = 0
+  if got then for i = 1, #got do gsum = (gsum * 31 + got:byte(i)) % 4294967296 end end
+  record("T12 escape-pipe", w.ok and r.ok and #got == n and gsum == mysum,
+    string.format("sent=%d got=%s sum_ok=%s", n, got and #got or "nil", tostring(gsum == mysum)))
+  h:delete("/home/e2e_pipes.txt", 20)
+end
+
+-- T13 二进制安全: 多字节 UTF-8 (文本模式读按"字符"计数 -> 曾超单包被截断)
+do
+  -- 用机器人的 write 造文件 (客户端 write 本身就是字节安全的发送侧)
+  local unit = "-- " .. string.rep("\226\148\128", 14) .. " 中文 " .. string.rep("\226\148\128", 14) .. "\n"
+  local content = string.rep(unit, 300)   -- ~31.5KB, 3 字节/字
+  local w = h:write("/home/e2e_utf8.txt", content, 90)
+  local r = h:read("/home/e2e_utf8.txt", 90)
+  local got = r.ok and r.content or ""
+  local gs, ws2 = 0, 0
+  for i = 1, #got do gs = (gs * 31 + got:byte(i)) % 4294967296 end
+  for i = 1, #content do ws2 = (ws2 * 31 + content:byte(i)) % 4294967296 end
+  local fffd = 0
+  for i = 1, #got - 2 do
+    if got:byte(i) == 0xEF and got:byte(i + 1) == 0xBF and got:byte(i + 2) == 0xBD then fffd = fffd + 1 end
+  end
+  record("T13 utf8-binary", w.ok and r.ok and got == content and fffd == 0,
+    string.format("sent=%d got=%d sum_ok=%s fffd=%d", #content, #got, tostring(gs == ws2), fffd))
+  h:delete("/home/e2e_utf8.txt", 20)
+end
+
+-- T14 超时语义: 慢命令超时须报 REMOTE_TIMEOUT (对端在线), 不是 REMOTE_OFFLINE
+do
+  local ws = h:write("/home/e2e_slow.lua",
+    'local c=require("computer") local t=c.uptime() while c.uptime()-t<8 do os.sleep(0.2) end io.stdout:write("done")', 20)
+  if not ws.ok then
+    record("T14 timeout-vs-offline", false, "write slow script failed")
+  else
+    local r = h:exec("lua /home/e2e_slow.lua", 2)
+    record("T14 timeout-vs-offline",
+      (not r.ok) and r.timeout == true and not r.offline
+        and tostring(r.err):find("REMOTE_TIMEOUT", 1, true) ~= nil,
+      string.format("timeout=%s offline=%s err=%s", tostring(r.timeout), tostring(r.offline), tostring(r.err):sub(1, 40)))
+    -- 超时后客户端应已回收槽位: 连续多次仍可用
+    local ok_after = true
+    for i = 1, 4 do
+      local rr = h:exec("lua /home/e2e_slow.lua", 2)
+      if not rr.timeout then ok_after = false end
+    end
+    local probe = h:exec("echo SLOT_OK", 15)
+    record("T15 slot-reclaim", ok_after and probe.ok and tostring(probe.out):find("SLOT_OK", 1, true) ~= nil,
+      string.format("4x超时后仍可 exec=%s out=%s", tostring(probe.ok), tostring(probe.out):gsub("\n", "")))
+    h:delete("/home/e2e_slow.lua", 20)
+  end
+end
+
 h:close()
 
 local pass, fail, fails, statuses = 0, 0, {}, {}
