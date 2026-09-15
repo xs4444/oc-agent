@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════
--- remote_client.lua v1.2 — 主控侧远控客户端库（仅 v6 协议）
+-- remote_client.lua v1.3 — 主控侧远控客户端库（仅 v6 协议）
 --
 -- 服务器:
 --   - remote_host v6.0 (消息 ID 多路复用, 流式 exec, 分块读写, cancel)
@@ -38,7 +38,15 @@
 -- 结果形状 (全部 table, ok 字段必有):
 --   {ok=true, ...}            成功
 --   {ok=false, err=...}       失败 (含服务器 err 信封)
---   {ok=false, offline=true, err="REMOTE_OFFLINE (...)"}  超时无回复
+--   {ok=false, offline=true, err="REMOTE_OFFLINE (...)"}
+--                             超时**且探活 ping 也无回复** = 对端真离线
+--   {ok=false, timeout=true, err="REMOTE_TIMEOUT (...)"}
+--                             超时但探活 ping 有回复 = 对端在线, 只是这次操作
+--                             比 timeout 慢。**不要**把它当成离线处理。
+--                             此时客户端会自动 cancel 该 op 以回收远端并发槽位
+--                             (服务器 MAX_EXECS=4; 不回收则 4 条慢命令即打满通道)。
+--                             v1.3 起区分: 旧版把这两种情形都报 REMOTE_OFFLINE,
+--                             导致调用方误判"对端掉线/断电"。
 -- ═══════════════════════════════════════════════════════════════
 
 local M = {}
@@ -69,6 +77,22 @@ local function offline_result(timeout)
     offline = true,
     err = "REMOTE_OFFLINE (no reply within " .. tostring(timeout)
       .. "s — host may be powered off / out of modem range)",
+  }
+end
+
+-- 操作超时(但通道其实还活着)的专用结果 —— 与 REMOTE_OFFLINE 严格区分。
+-- 为什么必须区分: 二者对调用方的含义完全相反, 而旧版一律报 REMOTE_OFFLINE。
+-- 实证(2026-09-15): 一个需 8s 的脚本用 exec(timeout=3) 调用 → 旧版报
+--   "REMOTE_OFFLINE (host may be powered off / out of modem range)",
+-- 但机器人**在线且正在执行**, 只是命令比 timeout 慢。LLM 调用方据此会误判
+-- "对端掉线/断电", 做出错误决策(重连、上报故障、重启对端)。这正是本项目
+-- 反复出问题的那类信息歧义(事故 A/B/本次混乱循环同源)。
+local function timeout_result(timeout, op)
+  return {
+    ok = false,
+    timeout = true,
+    err = "REMOTE_TIMEOUT (" .. tostring(op) .. " no reply within " .. tostring(timeout)
+      .. "s — peer may still be running the command; the channel itself is NOT known to be down)",
   }
 end
 
@@ -175,6 +199,39 @@ local function v6_wait(h, my_id, timeout, terminal_op, on_frame)
     end
   end
   return nil
+end
+
+-- 超时后回收远端资源: 杀掉该 id 的 exec 并释放并发槽位。
+-- 服务器 handle_cancel 会 `running_exec[key] = nil` + kill 线程 + 清理临时文件。
+-- 为什么必须回收(2026-09-15 实证): 客户端超时后并未撤下远端的 exec, 它继续
+-- 跑到自然结束并**占住并发槽位** —— 4 个被放弃的 exec 即撑满 MAX_EXECS=4,
+-- 第 5 个 exec 直接得 "busy (max 4 concurrent execs)", 通道暂时不可用。
+-- 尽力而为: cancel 自身也可能无回复, 失败不影响返回给调用方的结果。
+local function reclaim_slot(h, target_id)
+  if not target_id then return false end
+  local id = v6_next_id(h)
+  local ok = v6_send(h, string.format("v6|%d|cancel|%s", id, tostring(target_id)))
+  if not ok then return false end
+  local frame = v6_wait(h, id, math.min(h.ping_timeout, 5), "cancel")
+  return frame ~= nil and frame.status == "ok"
+end
+
+-- 超时裁决(所有 op 共用): 区分"真离线"与"操作慢但通道还活着"。
+-- 旧版一律报 REMOTE_OFFLINE —— 对"命令比 timeout 慢"这个常见情形是**错误
+-- 诊断**, 会把调用方(尤其 LLM)引向"对端掉线/断电"的错误结论。
+-- 做法: 先一次短 ping 探活。活 → 回收该 op 的远端槽位(exec/write 会占槽)
+-- 并报 REMOTE_TIMEOUT; 连 ping 也无回复 → 才报 REMOTE_OFFLINE。
+local function resolve_timeout(h, op, timeout, target_id)
+  local pk = v6_next_id(h)
+  local pong = v6_send(h, string.format("v6|%d|ping|", pk))
+    and v6_wait(h, pk, math.min(h.ping_timeout, 5), "pong")
+  if pong then
+    h._alive = true
+    if target_id then reclaim_slot(h, target_id) end
+    return timeout_result(timeout, op)
+  end
+  h._alive = false
+  return offline_result(timeout)
 end
 
 -- 协议探测: 发 "v6|1|ping|" 并等任意回复 (墙钟 deadline)。
@@ -380,8 +437,11 @@ function M_h:exec(cmd, timeout)
   local out = table.concat(out_buf)
   local serr = table.concat(err_buf)
   if not frame then
-    self._alive = false
-    return offline_result(timeout or self.exec_timeout)
+    -- 超时: 先判通道是否真的还活着(一次轻量 ping), 再回收远端 exec。
+    -- 顺序要紧: 若对端真离线, ping 也会无回复(→ 保持 offline 语义);
+    -- 若对端只是"命令比 timeout 慢", ping 会立刻回 → 报 REMOTE_TIMEOUT
+    -- 并 cancel 掉那个仍在跑的 exec(否则它占住并发槽位)。
+    return resolve_timeout(self, "exec", timeout or self.exec_timeout, id)
   end
   if frame.status == "ok" then
     return {
@@ -425,8 +485,7 @@ function M_h:read(path, timeout)
     end)
   self._inflight = self._inflight - 1
   if not frame then
-    self._alive = false
-    return offline_result(timeout or 60)
+    return resolve_timeout(self, "read", timeout or 60, id)
   end
   if frame.status ~= "ok" then
     return { ok = false, err = frame.payload }
@@ -458,8 +517,7 @@ function M_h:write(path, content, timeout)
   local start = v6_wait(self, id, 15, "write_start")
   if not start then
     self._inflight = self._inflight - 1
-    self._alive = false
-    return offline_result(15)
+    return resolve_timeout(self, "write(write_start)", 15, id)
   end
   if start.status ~= "ok" then
     self._inflight = self._inflight - 1
@@ -480,8 +538,7 @@ function M_h:write(path, content, timeout)
   local done = v6_wait(self, id, timeout or 300, "write_done")
   self._inflight = self._inflight - 1
   if not done then
-    self._alive = false
-    return offline_result(timeout or 300)
+    return resolve_timeout(self, "write", timeout or 300, id)
   end
   if done.status ~= "ok" then
     return { ok = false, err = done.payload }
@@ -502,8 +559,7 @@ function M_h:delete(path, timeout)
   end
   local frame = v6_wait(self, id, timeout or 15, "delete")
   if not frame then
-    self._alive = false
-    return offline_result(timeout or 15)
+    return resolve_timeout(self, "delete", timeout or 15, nil)
   end
   if frame.status ~= "ok" then
     return { ok = false, err = frame.payload }
@@ -521,8 +577,7 @@ function M_h:cancel(target_id, timeout)
   end
   local frame = v6_wait(self, id, timeout or self.ping_timeout, "cancel")
   if not frame then
-    self._alive = false
-    return offline_result(timeout or self.ping_timeout)
+    return resolve_timeout(self, "cancel", timeout or self.ping_timeout, nil)
   end
   if frame.status ~= "ok" then
     return { ok = false, err = frame.payload }

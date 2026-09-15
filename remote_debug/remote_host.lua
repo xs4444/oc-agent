@@ -58,6 +58,16 @@ local isWireless = component.invoke(modemAddr, "isWireless")
 local AUTH_TOKEN = ""
 
 local CHUNK = 7000            -- 单帧载荷上限 (8192B 单包 - 信封余量)
+
+-- ⚠ 二进制安全 (2026-09-15 实证修复): 所有 io.open 一律带 "b" (rb/wb/ab)。
+--   OpenOS 的 buffer 按 mode.b 决定 f:read(n) 的 n 是**字节**还是**字符**
+--   (lib/core/full_buffer.lua:134-143 readBytesOrChars: mode.b → rawlen/string.sub,
+--    否则 unicode.len/unicode.sub)。文本模式下 f:read(7000) 读 7000 个*字符*,
+--   含中文时单块可达 ~21KB > modem 8192B 单包 → 静默截断。
+--   实测: 31500B 的中文文件 io.open(path,"r") 读回只剩 15962B (而机器上文件
+--   完好, 机器人自校验 len=31500)。write 侧同理会劈开多字节字符 → U+FFFD。
+--   这正是本文件自身的注释被写坏(─ e29480 → efbfbd, 等长替换, size 校验查不出)
+--   的原因 —— 非 ASCII 内容经 v6 read/write 必损坏, 而本项目文件满是中文。
 local MAX_TRANSFERS = 4       -- 并发文件传输 (write 在飞)
 local MAX_EXECS = 4           -- 并发 exec
 local WRITE_GAP_TIMEOUT = 120 -- s, write_chunk 间隙超时 (墙钟)
@@ -146,8 +156,8 @@ end
 
 -- 无 fs.move 的流式 move (块拷贝 + 删源, RAM 峰值 ~14KB)
 local function move_file(src, dst)
-  local inf = assert(io.open(src, "r"))
-  local outf = assert(io.open(dst, "w"))
+  local inf = assert(io.open(src, "rb"))
+  local outf = assert(io.open(dst, "wb"))
   while true do
     local chunk = inf:read(CHUNK)
     if not chunk then break end
@@ -200,7 +210,7 @@ local function handle_exec(sender, id, payload)
       -- 真流分离 (2> 单独重定向 stderr; OpenOS sh 支持, full_sh.lua:42)
       local ok2, err2 = shell.execute(cmd .. " > " .. outpath .. " 2> " .. errpath)
       local function stream(path, tag)
-        local f = io.open(path, "r")
+        local f = io.open(path, "rb")
         if not f then return end
         while true do
           local chunk = f:read(CHUNK)
@@ -237,7 +247,7 @@ local function handle_read(sender, id, payload)
     send_reply(sender, string.format("v6|%s|file_done|err|busy (max %d concurrent transfers)", id, MAX_TRANSFERS))
     return
   end
-  local f = io.open(path, "r")
+  local f = io.open(path, "rb")
   if not f then
     send_reply(sender, string.format("v6|%s|file_done|err|cannot open %s", id, escape(path)))
     return
@@ -271,7 +281,7 @@ local function handle_write(sender, id, payload)
     return
   end
   local temp = "/home/rh_wt_" .. sender .. "_" .. id
-  local f = io.open(temp, "w")
+  local f = io.open(temp, "wb")
   if not f then
     send_reply(sender, string.format("v6|%s|write_done|err|cannot create temp %s", id, escape(temp)))
     return
@@ -299,7 +309,7 @@ local function handle_write_chunk(sender, id, payload)
     abort_write(key, w, "write aborted (oversize: got more than declared size)")
     return
   end
-  local f = io.open(w.temp, "a")
+  local f = io.open(w.temp, "ab")
   if not f then
     abort_write(key, w, "write aborted (cannot append to temp)")
     return
@@ -339,17 +349,28 @@ end
 local function handle_cancel(sender, id, payload)
   local target_id = payload or ""
   local r = running_exec[sender .. ":" .. target_id]
-  if not r then
-    send_reply(sender, string.format("v6|%s|cancel|err|no running exec %s", id, escape(target_id)))
+  if r then
+    running_exec[sender .. ":" .. target_id] = nil
+    pcall(r.thread.kill, r.thread)
+    cleanup_file(r.outpath)
+    cleanup_file(r.errpath)
+    -- exec 侧终帧 (客户端 exec 收集器等待它, 不必干等超时)
+    send_reply(sender, string.format("v6|%s|exec_done|err|cancelled", target_id))
+    send_reply(sender, string.format("v6|%s|cancel|ok|cancelled", id))
     return
   end
-  running_exec[sender .. ":" .. target_id] = nil
-  pcall(r.thread.kill, r.thread)
-  cleanup_file(r.outpath)
-  cleanup_file(r.errpath)
-  -- exec 侧终帧 (客户端 exec 收集器等待它, 不必干等超时)
-  send_reply(sender, string.format("v6|%s|exec_done|err|cancelled", target_id))
-  send_reply(sender, string.format("v6|%s|cancel|ok|cancelled", id))
+  -- 也可能是被客户端放弃的**文件传输**。原先只认 exec, 于是传输槽位只能等
+  -- 自然结束或 WRITE_GAP_TIMEOUT(=120s) 才释放 —— 与 exec 同类的槽位泄漏。
+  -- 客户端超时后统一用 cancel 回收, 故这里也要覆盖 write 在飞的情形。
+  local wkey = sender .. ":" .. target_id
+  local w = active_writes[wkey]
+  if w then
+    -- 复用统一的中止路径: 清 active_writes + 删临时文件 + 发 write_done(err)
+    abort_write(wkey, w, "cancelled")
+    send_reply(sender, string.format("v6|%s|cancel|ok|cancelled", id))
+    return
+  end
+  send_reply(sender, string.format("v6|%s|cancel|err|no running op %s", id, escape(target_id)))
 end
 
 local function get_info_payload()
